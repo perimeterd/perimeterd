@@ -1,0 +1,38 @@
+version: "2"
+
+# Keep the required policy explicit so adding a new default linter cannot make
+# local and CI results diverge unexpectedly.
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - revive
+    - gosec
+    - misspell
+  settings:
+    misspell:
+      locale: US
+    revive:
+      severity: error
+      rules:
+        - name: exported
+
+# gci is the golangci-lint v2 import-order formatter. gofumpt and goimports are
+# run directly by the Makefile so the local formatter sequence stays explicit.
+formatters:
+  enable:
+    - gci
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/perimeterd/perimeterd)
+      custom-order: true
+
+run:
+  timeout: 5m
+  relative-path-mode: gomod
+  tests: true

@@ -7,13 +7,16 @@ owns external resolution and compatibility; [firewall backends](firewall-backend
 owns the kernel realization.
 
 The package configuration path is `/etc/perimeterd/perimeterd.yaml`. State and
-prefix caches live under `/var/lib/perimeterd`. Parsing is strict: every mapping
-rejects unknown fields, and `version` must be exactly `1`.
+prefix caches live under `/var/lib/perimeterd`. Parsing accepts exactly one YAML
+document: every mapping rejects unknown and duplicate fields, scalar types are
+checked without coercion, and `version` must be exactly `1`. Explicit nulls,
+aliases, and merge keys are rejected rather than silently defaulted or expanded.
 
 ## Fully annotated configuration
 
 Omitted optional fields take the defaults shown here. `version` and
 `firewall.backend` are required even when their displayed values are used.
+The displayed `crowdsec.api_key_file` path is an example, not a default.
 
 ```yaml
 version: 1
@@ -107,6 +110,23 @@ strictly positive.
 CrowdSec enablement also requires the operator-verified
 [supported LAPI contract](data-sources.md#supported-lapi-contract); no YAML field
 or successful local/API validation attests that remote deployment prerequisite.
+
+### iptables attachments
+
+Omitting `firewall.iptables.attachments` retains the default `INPUT`/ingress and
+`OUTPUT`/egress attachments. An explicit `attachments: []` is accepted for either
+backend and means no managed attachment jumps; it does not restore the defaults.
+The list is unused when nftables is selected. For iptables, local validation
+does not attest that policy has a packet path; the
+[runtime attachment contract](firewall-backends.md#iptables-attachment-contract)
+defines the enforcement requirement.
+
+Local validation treats `INPUT` and `OUTPUT` as host parents. Every other parent
+requires a non-empty `input_interfaces` list for ingress or `output_interfaces`
+list for egress; this conservatively covers custom chains without inferring
+their topology. Interface lists are sorted and deduplicated before identical
+attachments are collapsed. Parent-chain existence and ownership are checked
+only during runtime reconciliation, not by `validate`.
 
 ### nftables hook priority
 

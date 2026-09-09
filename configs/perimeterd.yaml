@@ -1,0 +1,55 @@
+# perimeterd configuration example.
+#
+# `perimeterd validate` performs strict local parsing and semantic checks only:
+# it does not read credential files, contact configured services, resolve
+# selectors, bind listeners, or mutate a firewall.
+version: 1
+
+logging:
+  level: info                 # debug, info, warn, or error
+  format: json                # json or text
+
+metrics:
+  listen: 127.0.0.1:2112      # empty string disables the listener
+
+global:
+  allowlist: []               # local ranges are always included
+  blocklist: []               # direct IP/CIDR denies
+
+firewall:
+  backend: nftables           # required: nftables or iptables
+  deny_action: drop           # drop or reject
+  ipv4: true
+  ipv6: true
+  nftables:
+    table: perimeterd
+    priority: -10              # greater than -200
+  iptables:
+    attachments:
+      - chain: INPUT
+        direction: ingress
+        input_interfaces: []
+        output_interfaces: []
+        original_destination: false
+      - chain: OUTPUT
+        direction: egress
+        input_interfaces: []
+        output_interfaces: []
+        original_destination: false
+
+geo:
+  refresh_interval: 24h
+  request_timeout: 30s
+  refresh_jitter: 10m
+
+groups: {}
+
+policies: []
+
+crowdsec:
+  enabled: false
+  lapi_url: http://127.0.0.1:8080
+  # Example credential path, not a default. It is required only when enabled;
+  # local validation never opens or checks this file.
+  api_key_file: /etc/perimeterd/credentials.d/crowdsec_api_key
+  update_frequency: 10s

@@ -1,13 +1,28 @@
 # perimeterd
 
-> **Status: design phase.** No daemon, packages, or production-ready release exist
-> yet. The documents in this repository define the intended first release; they
-> are not evidence of an implemented security control.
+> **Status: implementation started.** Offline configuration validation and version
+> reporting are available. Firewall enforcement, packages, and production releases
+> are not implemented yet; this is not an operational security control.
 
 `perimeterd` is a Linux firewall policy daemon planned in Go. It will compile
 country, RIR, group, and ASN selectors into host firewall policy and combine
 that static policy with CrowdSec Local API ingress bans. One process will own
 all mutations made through either nftables or iptables/ipset.
+
+## Try the configuration validator
+
+Build with Go 1.27.1; automatic toolchain selection also works with an older Go:
+
+```sh
+GOTOOLCHAIN=auto make build
+bin/perimeterd version
+bin/perimeterd validate --config configs/perimeterd.yaml
+```
+
+Validation requires neither root nor network access. It checks local syntax and
+semantics, not source availability or kernel enforcement. `run` and `cleanup`
+are not exposed until their implementations are ready. See
+[development](docs/development.md#local-commands) for the verification commands.
 
 ## First-release contract
 

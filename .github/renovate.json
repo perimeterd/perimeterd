@@ -1,0 +1,26 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["gomod", "github-actions"],
+  "dependencyDashboard": true,
+  "rangeStrategy": "pin",
+  "packageRules": [
+    {
+      "description": "Keep GitHub Actions on immutable commit SHAs",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "rangeStrategy": "pin"
+    },
+    {
+      "description": "Keep Go development tools at exact versions",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": [
+        "github.com/golangci/golangci-lint/v2",
+        "golang.org/x/tools",
+        "golang.org/x/vuln",
+        "mvdan.cc/gofumpt"
+      ],
+      "rangeStrategy": "pin"
+    }
+  ]
+}

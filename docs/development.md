@@ -1,9 +1,10 @@
 # Development
 
-This document defines the proposed implementation layout, engineering gates,
-test boundaries, CI, and releases. It creates no implementation scaffolding.
-The design baseline is Go 1.27, the current stable major release during this
-design pass; see the official [Go release history](https://go.dev/doc/devel/release).
+This document defines the implementation layout, engineering gates, test
+boundaries, CI, and releases. The offline validator and its foundation gates are
+implemented; daemon, backend, privileged E2E, packaging, and release work remains
+planned. The Go module pins the baseline to Go 1.27.1; see the official
+[Go release history](https://go.dev/doc/devel/release).
 
 ## Proposed repository layout
 
@@ -43,16 +44,37 @@ when those artifacts are implemented, not as empty placeholders.
 
 ## Local commands
 
-The Makefile exposes small, composable targets:
+The current foundation provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`,
+`test-race`, `build`, and `verify`. Use Go 1.27.1, or enable automatic toolchain
+selection when the installed Go is older. Race tests additionally require a
+native C compiler; the target enables CGO itself.
+
+```sh
+export GOTOOLCHAIN=auto
+make fmt
+make verify
+make test-race
+bin/perimeterd validate --config configs/perimeterd.yaml
+```
+
+`make build` writes `bin/perimeterd` for the native Linux architecture by default;
+`GOARCH=arm64 make build` cross-compiles it. Version metadata defaults to
+`dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and `BUILD_TIME` at build
+time. CI supplies its revision and UTC build timestamp.
+
+The complete first-release target inventory follows. `test-e2e` and `package`
+will be added with their implementations, not as successful no-op targets.
 
 | Target | Contract |
 | --- | --- |
 | `fmt` | Run pinned `gofumpt` and `goimports`; fail on a remaining diff in CI |
+| `fmt-check` | Check pinned formatting without modifying files |
 | `lint` | Run the pinned golangci-lint policy and spelling/import checks |
+| `vuln` | Run pinned `govulncheck` on application packages |
 | `test` | Run shuffled unit tests and write coverage output |
 | `test-race` | Run unit tests with the race detector |
 | `test-e2e` | Run explicitly privileged network-namespace/backend scenarios |
-| `build` | Build the local daemon with version metadata |
+| `build` | Build the current CLI with version metadata |
 | `package` | Create local GoReleaser/nFPM snapshot packages |
 | `verify` | Run module, format, lint, vulnerability, build, and test gates |
 

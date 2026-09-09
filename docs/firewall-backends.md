@@ -309,8 +309,8 @@ service remains UID 0; see [operations](operations.md).
 
 ## iptables attachment contract
 
-`firewall.iptables.attachments` is the mandatory integration boundary. Each
-entry contains:
+`firewall.iptables.attachments` defines the managed integration boundary. Each
+configured entry contains:
 
 | Field | Meaning |
 | --- | --- |
@@ -325,6 +325,14 @@ exactly one jump per normalized attachment, with its interface match and an
 exact ownership comment. Only that comment-tagged jump may later be replaced
 or deleted. A missing chain is a reconcile error and preserves the prior
 state.
+
+An explicitly empty attachment list is valid local configuration. When iptables
+is selected and the desired policy is not the
+[canonical empty state](configuration.md#empty-desired-state), startup or reload
+must reject a candidate with no managed attachments before firewall mutation.
+Do not report active enforcement or assume administrator-managed jumps exist.
+A genuinely empty desired state may reconcile to no owned artifacts without
+attachments; nftables does not use this list.
 
 The default host attachments are:
 
@@ -344,6 +352,8 @@ attachments. Every forwarding-chain attachment must constrain an input or
 output interface appropriate to its direction. This prevents a new container
 egress flow traversing the forwarding path from being interpreted as external
 ingress.
+The [local attachment checks](configuration.md#iptables-attachments) apply this
+conservative constraint to every non-host parent, including custom chains.
 
 These are attachment matching requirements, not topology validation. Perimeterd
 verifies configured chains and ownership but does not inspect the host's
