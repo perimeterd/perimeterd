@@ -86,7 +86,10 @@ func TestRunRejectsUnsupportedAndMalformedCommands(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "unsupported command", args: []string{"run"}},
+		{name: "unknown command", args: []string{"not-a-command"}},
+		{name: "run positional", args: []string{"run", "extra"}},
+		{name: "run unsupported flag", args: []string{"run", "--state-dir", "/tmp/state"}},
+		{name: "cleanup unsupported flag", args: []string{"cleanup", "--config", "config.yaml"}},
 		{name: "validate positional", args: []string{"validate", "extra"}},
 		{name: "version positional", args: []string{"version", "extra"}},
 		{name: "unknown validate flag", args: []string{"validate", "--nope"}},
@@ -102,6 +105,53 @@ func TestRunRejectsUnsupportedAndMalformedCommands(t *testing.T) {
 			}
 			if stderr.Len() == 0 {
 				t.Error("failure wrote no actionable stderr output")
+			}
+		})
+	}
+}
+
+func TestRunRuntimeHelpUsesStdoutWithoutStartingDaemon(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"run", "--help"}, want: "Usage: perimeterd run [--config PATH]"},
+		{args: []string{"cleanup", "--help"}, want: "Usage: perimeterd cleanup"},
+	}
+	for _, test := range tests {
+		t.Run(test.args[0], func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := Run(test.args, &stdout, &stderr); code != 0 {
+				t.Fatalf("Run(%v) exit code = %d; stderr = %q", test.args, code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), test.want) {
+				t.Errorf("help output = %q, want %q", stdout.String(), test.want)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("help wrote to stderr: %q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestRunRuntimeCommandsRequireRootBeforeOpeningConfig(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root cannot exercise the non-root guard without starting the real daemon")
+	}
+	for _, args := range [][]string{
+		{"run", "--config", filepath.Join(t.TempDir(), "missing.yaml")},
+		{"cleanup"},
+	} {
+		t.Run(args[0], func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if code := Run(args, &stdout, &stderr); code == 0 {
+				t.Fatalf("Run(%v) exit code = 0, want privilege failure", args)
+			}
+			if !strings.Contains(stderr.String(), "requires root privileges") {
+				t.Errorf("stderr = %q, want root privilege error", stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("privilege failure wrote to stdout: %q", stdout.String())
 			}
 		})
 	}

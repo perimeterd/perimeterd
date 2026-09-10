@@ -73,3 +73,23 @@ jobs:
         run: echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Build Linux binary
         run: make build
+
+  e2e:
+    name: privileged nftables E2E
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+      - name: Install namespace test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nftables iproute2
+      - name: Run isolated kernel E2E
+        run: E2E_SUDO=sudo make test-e2e

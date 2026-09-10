@@ -1,10 +1,10 @@
 # Development
 
 This document defines the implementation layout, engineering gates, test
-boundaries, CI, and releases. The offline validator, pure policy compiler, and
-foundation gates are implemented; source fetching, daemon/backend integration,
-privileged E2E, packaging, and release work remain planned. The Go module pins the
-baseline to Go 1.27.1; see the official
+boundaries, CI, and releases. The offline validator, pure policy compiler, durable
+nftables runtime for direct global IP/CIDR rules, and isolated IPv4/IPv6 E2E gate
+are implemented. Source fetching, CrowdSec, iptables/ipset, packaging, and release
+work remain planned. The Go module pins the baseline to Go 1.27.1; see the official
 [Go release history](https://go.dev/doc/devel/release).
 
 ## Proposed repository layout
@@ -63,9 +63,9 @@ prefix overall after exclusions, while family-empty behavior follows
 The immutable result exposes owned inspection copies through `State.Families`:
 family-specific sets, ordered ingress/egress rules, dynamic CrowdSec references,
 and bounded accounting roles. `Return` means return to the parent firewall path,
-not accept; `Reject` is lowered by the future backend to the documented
+not accept; `Reject` is lowered by the nftables backend to the documented
 family/protocol-specific response. `State.Empty` identifies the canonical
-no-artifacts state. No new CLI command or runtime packet interpreter is exposed.
+no-artifacts state. The packet interpreter remains test-only.
 
 `internal/prefix` supplies the shared immutable normalization, membership, union,
 and difference operations used by configuration parsing and compilation. Tests
@@ -74,10 +74,10 @@ snapshots and the existing verification matrix below.
 
 ## Local commands
 
-The current foundation provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`,
-`test-race`, `build`, and `verify`. Use Go 1.27.1, or enable automatic toolchain
-selection when the installed Go is older. Race tests additionally require a
-native C compiler; the target enables CGO itself.
+The current implementation provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`,
+`test-race`, `test-e2e`, `build`, and `verify`. Use Go 1.27.1, or enable automatic
+toolchain selection when the installed Go is older. Race tests additionally
+require a native C compiler; the target enables CGO itself.
 
 ```sh
 export GOTOOLCHAIN=auto
@@ -92,8 +92,35 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 `dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and `BUILD_TIME` at build
 time. CI supplies its revision and UTC build timestamp.
 
-The complete first-release target inventory follows. `test-e2e` and `package`
-will be added with their implementations, not as successful no-op targets.
+Run the opt-in native gate separately:
+
+```sh
+make test-e2e
+# If unprivileged user namespaces are unavailable:
+make test-e2e E2E_SUDO=sudo
+```
+
+The harness requires Linux, `nft`, `ip`, `unshare`, and `nsenter`. It creates
+disposable user, mount, network, and PID namespaces, verifies isolation before
+mutation, and mounts private runtime/state directories. The fixture is PID
+namespace init, so its exit or forced timeout terminates all descendants. It
+exercises real CLI lifecycle,
+IPv4/IPv6 TCP/UDP packets, reloads, counters, ownership collisions, and interrupted
+transactions. It never applies test rules to the development host's firewall.
+Tagged E2E sources are formatted and linted by the ordinary gates but execute only
+through this explicit target. CI runs the native gate in a separate Linux job.
+Ingress and egress probes distinguish silent DROP from protocol REJECT, including
+local UDP sends that return `EPERM` for both actions: the subsequent ICMP error
+or receive timeout determines the outcome. TCP exchanges have explicit deadlines
+so lost established traffic fails promptly rather than hanging the fixture.
+Configuration files and readiness sockets use private, unique temporary
+directories rather than PID-derived shared paths, so independent PID namespaces
+cannot overwrite or unlink each other's fixtures. Table-deletion assertions
+require successful ruleset inspection and explicit absence; command failures,
+timeouts, and malformed inspection output fail the assertion.
+
+The complete first-release target inventory follows. `package` remains planned;
+there is no successful no-op packaging target.
 
 | Target | Contract |
 | --- | --- |

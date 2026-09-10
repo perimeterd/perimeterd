@@ -1,14 +1,14 @@
 # perimeterd
 
-> **Status: implementation started.** Offline configuration validation, version
-> reporting, and a pure backend-neutral policy compiler are implemented. Firewall
-> enforcement, packages, and production releases are not available yet; this is
-> not an operational security control.
+> **Status: early kernel-backed runtime.** Offline validation, the pure policy
+> compiler, and nftables enforcement for direct global IP/CIDR rules are
+> implemented, with durable recovery and isolated packet-path tests. Source-backed
+> geo policy, CrowdSec, iptables/ipset, packages, and production releases remain
+> planned. This is not yet a production-ready security control.
 
-`perimeterd` is a Linux firewall policy daemon planned in Go. It will compile
-country, RIR, group, and ASN selectors into host firewall policy and combine
-that static policy with CrowdSec Local API ingress bans. One process will own
-all mutations made through either nftables or iptables/ipset.
+`perimeterd` is a Linux firewall policy daemon written in Go. The first-release
+contract adds country, RIR, group, and ASN selectors and CrowdSec Local API ingress
+bans. One serialized writer owns firewall mutations and durable revision changes.
 
 ## Try the configuration validator
 
@@ -21,9 +21,10 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 ```
 
 Validation requires neither root nor network access. It checks local syntax and
-semantics, not source availability or kernel enforcement. `run` and `cleanup`
-are not exposed until their implementations are ready. See
-[development](docs/development.md#local-commands) for the verification commands.
+semantics, not source availability or kernel enforcement. Root-only `run` and
+`cleanup` are available for the [current nftables slice](docs/operations.md#current-source-build-runtime).
+Try enforcement only in a disposable VM or isolated network namespace. See
+[development](docs/development.md#local-commands) for verification commands.
 
 ## First-release contract
 

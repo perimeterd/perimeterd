@@ -5,6 +5,76 @@ system, systemd service, observability, and package lifecycle.
 [Configuration](configuration.md) defines operator fields; [architecture](architecture.md)
 defines readiness and cleanup safety.
 
+## Current source-build runtime
+
+The implemented runtime is limited to `firewall.backend: nftables`, direct
+`global.allowlist`/`global.blocklist` IPs and CIDRs, disabled geo policy modes,
+and `crowdsec.enabled: false`. ASN/country/RIR/group source resolution and the
+iptables/ipset backend are not wired into the runtime yet. Offline `validate`
+still checks the full configuration contract; successful validation does not
+mean an unsupported runtime integration is available.
+
+Use a disposable VM or isolated network namespace, not the development host's
+firewall. A minimal direct-rule configuration is:
+
+```yaml
+version: 1
+global:
+  allowlist: []
+  blocklist: ["8.20.0.2/32"]
+firewall:
+  backend: nftables
+  ipv4: true
+  ipv6: true
+policies: []
+crowdsec:
+  enabled: false
+```
+
+Build with `make build`, save the configuration as
+`/etc/perimeterd/perimeterd.yaml`, and run:
+
+```sh
+sudo bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
+```
+
+`run` remains in the foreground. Send `SIGHUP` to stage a reload and `SIGTERM`
+to stop without removing enforcement. After stopping, `sudo bin/perimeterd
+cleanup` removes only recorded owned artifacts; it does not read current YAML.
+Do not remove `/var/lib/perimeterd` or the stable `/run/perimeterd/owner.lock`
+to bypass recovery or ownership checks. The runtime creates its private state
+and runtime directories when needed and holds the same lock for its lifetime.
+
+Immutable revision files, the prepared journal, and durable `active.json`
+publication define recovery authority. Startup recovers persisted state before
+reading YAML. An uncertain publication fences new applies until stabilization;
+post-commit retirement failures are retried without rolling back the committed
+revision. Ownership inspection rejects unknown children. nftables sets use their
+recorded owner/generation-qualified names plus exact type, flags, and contents
+inside the marked table: nft JSON does not round-trip set comments.
+
+Encoded state records are limited to 16 MiB and rejected before publication if
+oversized. Native preflight requires each complete target to fit the 8 MiB
+installation limit and budgets inspection of both retained generations before
+preparing a transaction. The conservative inspection budget is 48 MiB per table,
+with a hard 64 MiB native-output capture limit. Oversized reloads leave the
+committed revision recoverable rather than installing unreadable state.
+
+When configured, `/metrics` currently exposes `perimeterd_enforcement_health`;
+named kernel packet/byte counters remain in nftables. The full metric suite,
+installed systemd unit, packages, and release gates below remain planned.
+Startup sends bounded systemd timeout extensions and `READY=1` only after
+reconciliation, durable commit, and required recovery complete.
+The metrics server bounds complete request reads and response writes to ten
+seconds, headers to five seconds, and idle keep-alive connections to thirty
+seconds; a client withholding a request body cannot retain a connection forever.
+During listener replacement, an expired graceful-shutdown deadline does not
+degrade enforcement health if the old listener and connections are successfully
+force-closed. Actual resource-close failures still degrade health.
+
+The following operator sequence assumes the planned package and installed unit,
+not just the current source build.
+
 ## Operator sequence
 
 ### Prerequisites

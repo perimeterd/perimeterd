@@ -3,12 +3,15 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
+	"github.com/perimeterd/perimeterd/internal/app"
 	"github.com/perimeterd/perimeterd/internal/config"
 )
 
@@ -23,8 +26,9 @@ var (
 )
 
 // Run dispatches one perimeterd command and returns a process exit status.
-// Validation is deliberately limited to config.Load: it does not read
-// credentials, resolve selectors, contact services, or mutate firewall state.
+// The validate command is deliberately limited to config.Load: it does not
+// read credentials, resolve selectors, contact services, or mutate firewall
+// state.
 func Run(args []string, stdout, stderr io.Writer) int {
 	if stdout == nil {
 		stdout = io.Discard
@@ -53,9 +57,83 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runVersion(args[1:], stdout, stderr)
 	case "validate":
 		return runValidate(args[1:], stdout, stderr)
+	case "run":
+		return runDaemon(args[1:], stdout, stderr)
+	case "cleanup":
+		return runCleanup(args[1:], stdout, stderr)
 	default:
-		return usageError(stderr, fmt.Sprintf("unsupported command %q (available commands: version, validate)", args[0]))
+		return usageError(stderr, fmt.Sprintf("unsupported command %q (available commands: version, validate, run, cleanup)", args[0]))
 	}
+}
+
+func runDaemon(args []string, stdout, stderr io.Writer) int {
+	var parseOutput bytes.Buffer
+	fs := flag.NewFlagSet("perimeterd run", flag.ContinueOnError)
+	fs.SetOutput(&parseOutput)
+	configPath := fs.String("config", defaultConfigPath, "path to the YAML configuration file")
+	fs.Usage = func() {
+		_, _ = parseOutput.WriteString("Usage: perimeterd run [--config PATH]\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			if _, copyErr := io.Copy(stdout, &parseOutput); copyErr != nil {
+				return commandError(stderr, fmt.Errorf("write run help output: %w", copyErr))
+			}
+			return 0
+		}
+		_, _ = io.Copy(stderr, &parseOutput)
+		return 2
+	}
+	if fs.NArg() != 0 {
+		return usageError(stderr, fmt.Sprintf("run does not accept positional arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if err := requireRoot("run"); err != nil {
+		return commandError(stderr, err)
+	}
+	if err := app.Run(context.Background(), app.Options{
+		ConfigPath: *configPath,
+		Stderr:     stderr,
+	}); err != nil {
+		return commandError(stderr, fmt.Errorf("run: %w", err))
+	}
+	return 0
+}
+
+func runCleanup(args []string, stdout, stderr io.Writer) int {
+	var parseOutput bytes.Buffer
+	fs := flag.NewFlagSet("perimeterd cleanup", flag.ContinueOnError)
+	fs.SetOutput(&parseOutput)
+	fs.Usage = func() {
+		_, _ = parseOutput.WriteString("Usage: perimeterd cleanup\n")
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			if _, copyErr := io.Copy(stdout, &parseOutput); copyErr != nil {
+				return commandError(stderr, fmt.Errorf("write cleanup help output: %w", copyErr))
+			}
+			return 0
+		}
+		_, _ = io.Copy(stderr, &parseOutput)
+		return 2
+	}
+	if fs.NArg() != 0 {
+		return usageError(stderr, fmt.Sprintf("cleanup does not accept positional arguments: %s", strings.Join(fs.Args(), " ")))
+	}
+	if err := requireRoot("cleanup"); err != nil {
+		return commandError(stderr, err)
+	}
+	if err := app.Cleanup(context.Background(), app.Options{Stderr: stderr}); err != nil {
+		return commandError(stderr, fmt.Errorf("cleanup: %w", err))
+	}
+	return 0
+}
+
+func requireRoot(command string) error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("%s requires root privileges", command)
+	}
+	return nil
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) int {
@@ -122,10 +200,14 @@ func runValidate(args []string, stdout, stderr io.Writer) int {
 }
 
 const usageText = `Usage:
+  perimeterd run [--config PATH]
+  perimeterd cleanup
   perimeterd version
   perimeterd validate [--config PATH]
 
 Commands:
+  run       recover state, apply configuration, and serve until stopped (root only)
+  cleanup   remove recorded owned firewall state (root only)
   version   print version, commit, and build time
   validate  parse and locally validate a YAML configuration
 
