@@ -5,6 +5,11 @@ backend reconciliation. [Configuration](configuration.md) owns fields and
 policy selection; [architecture](architecture.md) owns the writer and revision
 lifecycle.
 
+> **Version-1 backend contract.** This specification includes backend and
+> coexistence integrations beyond the current runtime. See the
+> [implementation plan](implementation-plan.md) for status and
+> [current operations](operations.md#current-source-build-runtime) for supported use.
+
 ## Common invariants
 
 Both backends obey the same safety contract:

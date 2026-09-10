@@ -1,44 +1,56 @@
 # Development
 
-This document defines the implementation layout, engineering gates, test
-boundaries, CI, and releases. The offline validator, pure policy compiler, durable
-nftables runtime for direct global IP/CIDR rules, and isolated IPv4/IPv6 E2E gate
-are implemented. Source fetching, CrowdSec, iptables/ipset, packaging, and release
-work remain planned. The Go module pins the baseline to Go 1.27.1; see the official
+This document maps the current implementation and executable verification gates,
+then defines the full version-1 verification and delivery requirements. The
+[implementation plan](implementation-plan.md) is authoritative for milestone
+status; a requirement below does not imply that its integration or CI job exists.
+
+The Go module pins Go 1.27.1; see the official
 [Go release history](https://go.dev/doc/devel/release).
 
-## Proposed repository layout
+## Current repository layout
 
 ```text
 cmd/perimeterd/main.go
-internal/app/                 process lifecycle and event orchestration
-internal/config/              YAML schema, defaults, strict validation
-internal/configsource/        local source; future remote source boundary
-internal/policy/              selectors, precedence, backend-neutral compiler
-internal/prefix/              immutable prefix normalization and set algebra
-internal/prefixsource/        source interface, cache, RIPEstat adapter
-internal/crowdsec/            LAPI stream adapter and expiring decision state
-internal/firewall/            backend contract and common reconciliation machinery
-internal/firewall/nftables/   netlink implementation
-internal/firewall/iptables/   iptables-restore/ip6tables-restore + ipset implementation
-internal/state/               atomic on-disk last-known-good snapshots
-internal/observability/       slog setup and Prometheus collectors
-configs/perimeterd.yaml       commented example configuration
-packaging/systemd/            hardened systemd unit
-packaging/tmpfiles/           boot-safe shared xtables lock provisioning
-packaging/scripts/            package lifecycle scripts
-.github/workflows/            CI, security analysis, release workflows
-test/e2e/                     privileged network-namespace and Docker scenarios
-docs/                         architecture and operator/developer contracts
-.goreleaser.yaml              static binaries and nfpm packages
+internal/app/                 lifecycle, candidates, serialized writer, HTTP and notifications
+internal/cli/                 command dispatch, validation and version reporting
+internal/config/              YAML schema, defaults and strict validation
+internal/config/catalog/      checked-in selector catalogs
+internal/policy/              immutable snapshots and backend-neutral compiler
+internal/prefix/              prefix normalization and set algebra
+internal/firewall/            typed targets, nft JSON execution and reconciliation
+internal/state/               revision store, record codec/validation and durable filesystem IO
+configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
+.github/workflows/ci.yml      quality, build, unit/race and native nftables gates
+.github/workflows/codeql.yml  Go security analysis
+tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
+docs/                         design contracts, current operations and implementation plan
 .golangci.yml                 lint/format policy
-Makefile                      small, discoverable local/CI entry points
+Makefile                      local and CI entry points
 ```
 
-Ownership follows [architecture](architecture.md): `internal/app` alone
-coordinates revisions and the serialized writer; source packages return typed
-candidates; `internal/policy` knows no backend syntax; backend packages consume
-shared immutable state and do not fetch source data.
+Ownership follows [architecture](architecture.md): `internal/app` coordinates
+revisions and the serialized writer; `internal/policy` knows no backend syntax;
+the firewall backend consumes immutable targets and does not fetch source data.
+File boundaries inside a package separate responsibilities without introducing
+new package APIs:
+
+- `internal/state/store.go`: store lifecycle and durable transaction operations.
+- `internal/state/records.go`: record types, encoding and semantic validation.
+- `internal/state/filesystem.go`: private paths, bounded reads, publication and sync helpers.
+- `tests/e2e/harness_test.go`: suite admission, namespace isolation and command execution.
+- `tests/e2e/network_test.go`: peer networking and packet probes.
+- `tests/e2e/daemon_test.go`: daemon lifecycle, readiness and configuration fixtures.
+- `tests/e2e/nftables_test.go`: native inventory and ownership assertions.
+- `tests/e2e/crash_test.go`: test-only application failure injection.
+
+### Planned additions
+
+Source resolution/cache adapters, CrowdSec, iptables/ipset, expanded
+observability, installed systemd/tmpfiles payloads, package lifecycle scripts,
+and GoReleaser/release workflows belong to later milestones. Their eventual
+package layout should follow the real integration boundaries; these directories
+and files are not present scaffolding.
 
 No `pkg/` tree exists until a real supported public Go API exists. A future
 container/Helm delivery adds `build/package/` and `charts/perimeterd/` only
@@ -119,8 +131,7 @@ cannot overwrite or unlink each other's fixtures. Table-deletion assertions
 require successful ruleset inspection and explicit absence; command failures,
 timeouts, and malformed inspection output fail the assertion.
 
-The complete first-release target inventory follows. `package` remains planned;
-there is no successful no-op packaging target.
+The executable target inventory is:
 
 | Target | Contract |
 | --- | --- |
@@ -132,8 +143,10 @@ there is no successful no-op packaging target.
 | `test-race` | Run unit tests with the race detector |
 | `test-e2e` | Run explicitly privileged network-namespace/backend scenarios |
 | `build` | Build the current CLI with version metadata |
-| `package` | Create local GoReleaser/nFPM snapshot packages |
 | `verify` | Run module, format, lint, vulnerability, build, and test gates |
+
+`package` is a planned GoReleaser/nFPM snapshot-packaging command, not an
+implemented target or a successful no-op.
 
 Tool binaries are pinned in the Go tool/module manifest or a checksummed tool
 bootstrap file. GitHub Actions are pinned to immutable commit SHAs, with a
@@ -156,11 +169,19 @@ Go modules, GitHub Actions, GoReleaser, and pinned development tools, and raises
 reviewable update pull requests. GitHub Actions updates must retain immutable
 commit SHAs and refresh their human-readable release comments.
 
+## Version 1 verification and delivery requirements
+
+The remaining sections specify the complete first-release contract, including
+source, CrowdSec, iptables/ipset, Docker, packaging and systemd-VM work that is
+not implemented yet. The [local commands](#local-commands) describe what can run
+now; the [implementation plan](implementation-plan.md) tracks progress.
+
 ## Verification matrix
 
-The tables below are the canonical verification matrix. Every row names the
-contract, a concrete behavior or failure boundary, and the layer that proves
-it. The unit and fixture layers assert behavior or typed/model output, not
+The tables below are the canonical requirements matrix, not an inventory of
+currently passing tests. Every row names a contract, a concrete behavior or
+failure boundary, and the required verification layer. Unit and fixture tests
+assert behavior or typed/model output, not
 shell-source substrings, incidental log prose, implementation call counts, or
 a specific internal function decomposition. A row may be exercised by more
 than one layer when the real boundary matters.
@@ -270,13 +291,18 @@ than one layer when the real boundary matters.
 
 ## Privileged end-to-end suite
 
-`test/e2e/` runs the built daemon in disposable Linux network namespaces with
-veth peers and local fixture HTTP/RIPEstat/CrowdSec servers. The suite executes
-for nftables and iptables/ipset, and for IPv4 and IPv6 where the scenario
-applies. The matrix above is the scenario inventory; this section records the
-shared execution contract rather than repeating those rows.
+The current `tests/e2e/` suite exercises the direct-global nftables slice in
+disposable Linux namespaces; its executable coverage and prerequisites are
+described under [local commands](#local-commands).
 
-The separate privileged Docker job executes the [Docker coexistence row](#kernel-backend-and-coexistence). The separate CrowdSec compatibility job uses a pinned real supported LAPI rather than fixtures; its deployment and required server-source review are specified in the [sources and compatibility matrix](#sources-and-compatibility).
+The version-1 suite must expand that foundation with local
+HTTP/RIPEstat/CrowdSec fixtures, iptables/ipset coverage, and IPv4/IPv6 scenarios
+where applicable. The matrix above defines those acceptance requirements.
+
+The planned separate Docker job must execute the [Docker coexistence row](#kernel-backend-and-coexistence).
+The planned CrowdSec compatibility job must use a pinned real supported LAPI
+rather than fixtures, with deployment and server-source review as specified in
+the [sources and compatibility matrix](#sources-and-compatibility).
 
 Shared namespace, mount, fixture, cleanup, host-isolation, availability, and
 iptables-family prerequisites are the [test-isolation contract in the service
@@ -284,30 +310,34 @@ and packaging matrix](#service-and-packaging).
 
 ## Pull-request and branch CI
 
-`.github/workflows/ci.yml` and `.github/workflows/codeql.yml` run on pull
-requests targeting the default branch and pushes to the default branch. They
-invoke the verification layers in the [matrix](#verification-matrix):
+The existing `.github/workflows/ci.yml` and `.github/workflows/codeql.yml` run on
+pull requests targeting the default branch and pushes to the default branch.
+Current gates cover:
 
-- static and dependency gates (format, lint, spelling/import policy, module
-  verification, vulnerability analysis, and CodeQL);
-- normal build, shuffled unit tests, race tests, and a coverage artifact;
-- privileged nftables E2E and privileged iptables/ipset E2E;
-- Docker and pinned CrowdSec compatibility; and
-- RPM/DEB package smoke installation and configuration preservation.
+- format, lint, spelling/import policy, module verification, vulnerability
+  analysis, and CodeQL;
+- Linux builds, shuffled unit tests, race tests, and a coverage artifact;
+- the isolated native nftables E2E suite.
+
+Before version 1, CI must also implement the matrix's privileged iptables/ipset,
+Docker, pinned CrowdSec compatibility, package installation/upgrade, and
+systemd-VM gates. Listing them as requirements does not mean those jobs exist.
 
 Workflow permissions default to read-only and are elevated per job only when a
 specific upload or attestation step requires it. Superseded runs for the same
-branch or pull request use concurrency cancellation. Release workflow runs are
-never cancelled by a later tag.
+branch or pull request use concurrency cancellation. The planned release
+workflow must never cancel an earlier release because a later tag arrived.
 
 ## Release workflow
 
-`.github/workflows/release.yml` triggers only on signed SemVer tags matching
-`vMAJOR.MINOR.PATCH`. Tag signature and exact pattern validation precede build.
-The workflow runs the same static-analysis, unit, race, privileged E2E, Docker,
-CrowdSec compatibility, and package gates as ordinary CI, using the verification
-layers in the [matrix](#verification-matrix), then invokes GoReleaser
-v2.
+**Planned:** `.github/workflows/release.yml` and GoReleaser configuration do not
+exist yet. The following is the release acceptance contract.
+
+The workflow must trigger only on signed SemVer tags matching
+`vMAJOR.MINOR.PATCH`. Tag signature and exact pattern validation must precede
+build. It must run the complete static-analysis, unit, race, privileged E2E,
+Docker, CrowdSec compatibility, and package gates from the
+[matrix](#verification-matrix), then invoke GoReleaser v2.
 
 The release gate executes the release-artifact, architecture-coverage,
 package-smoke, systemd-sandbox, boot-and-restart, startup-timeout, and

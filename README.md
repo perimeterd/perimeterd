@@ -6,6 +6,9 @@
 > geo policy, CrowdSec, iptables/ipset, packages, and production releases remain
 > planned. This is not yet a production-ready security control.
 
+The [implementation plan](docs/implementation-plan.md) is the authoritative
+record of completed milestones and remaining work.
+
 `perimeterd` is a Linux firewall policy daemon written in Go. The first-release
 contract adds country, RIR, group, and ASN selectors and CrowdSec Local API ingress
 bans. One serialized writer owns firewall mutations and durable revision changes.
@@ -44,14 +47,17 @@ Try enforcement only in a disposable VM or isolated network namespace. See
 
 ## Documentation
 
-For deployment, read [configuration](docs/configuration.md) and then
-[operations](docs/operations.md). For implementation, start with
-[architecture](docs/architecture.md), follow its source/backend contracts, and
-use [development](docs/development.md) for verification and delivery gates.
+For the available runtime, start with [current source-build operations](docs/operations.md#current-source-build-runtime).
+For implementation work, check the [implementation plan](docs/implementation-plan.md),
+then read [architecture](docs/architecture.md) and its source/backend contracts.
+Use [development](docs/development.md) for the current repository map and commands;
+its version-1 verification and delivery requirements also describe future work.
 
 Each document owns the contract named below. Other documents summarize and
 link to that owner rather than define a second algorithm.
 
+- [Implementation plan](docs/implementation-plan.md): completed milestones,
+  remaining work, and the next vertical slice.
 - [Architecture](docs/architecture.md): components, lifecycle ownership, static
   revision admission, durable commit/recovery, and future deployment boundaries.
 - [Configuration](docs/configuration.md): canonical YAML schema, defaults,
@@ -62,8 +68,8 @@ link to that owner rather than define a second algorithm.
   compatibility, decision admission, timed projection, and renewable leases.
 - [Operations](docs/operations.md): operator procedures, deployment prerequisites,
   installed layout, systemd, logs, metrics, upgrades, and removal.
-- [Development](docs/development.md): proposed source tree, verification coverage
-  by contract and layer, quality gates, CI, and releases.
+- [Development](docs/development.md): current source tree and executable gates,
+  followed by version-1 verification coverage, CI, and release requirements.
 
 ## Design lineage and licensing
 

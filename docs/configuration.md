@@ -1,5 +1,10 @@
 # Configuration
 
+> **Schema and policy reference.** Offline validation supports the schema below;
+> runtime support is narrower. Check the [implementation plan](implementation-plan.md)
+> and [current runtime instructions](operations.md#current-source-build-runtime)
+> before using a configuration for enforcement.
+
 This document owns the version 1 YAML schema, defaults, local validation, and
 policy semantics. Start with the annotated configuration and field table;
 policy rules, evaluation, and examples follow. [Data sources](data-sources.md)

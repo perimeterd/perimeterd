@@ -5,6 +5,10 @@ system, systemd service, observability, and package lifecycle.
 [Configuration](configuration.md) defines operator fields; [architecture](architecture.md)
 defines readiness and cleanup safety.
 
+The [implementation plan](implementation-plan.md) is authoritative for delivery
+status. The source-build instructions below are executable now; installed-system
+requirements later in this document are the version-1 deployment contract.
+
 ## Current source-build runtime
 
 The implemented runtime is limited to `firewall.backend: nftables`, direct

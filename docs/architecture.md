@@ -4,6 +4,11 @@ This document owns the components, static revision lifecycle, writer ownership,
 and durable recovery contract for the planned first release. Read the component
 boundaries and lifecycle first; admission and transaction details follow.
 
+> **Version-1 design contract.** This document includes integrations that are not
+> implemented yet. See the [implementation plan](implementation-plan.md) for
+> current milestone status and [operations](operations.md#current-source-build-runtime)
+> for the available runtime.
+
 Related contracts have one canonical home:
 
 | Contract | Owner |

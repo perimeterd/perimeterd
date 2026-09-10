@@ -1,5 +1,9 @@
 # Data Sources
 
+> **Version-1 source contract.** The adapters, caches and dynamic-ban integration
+> described here are planned requirements, not currently available runtime
+> features. The [implementation plan](implementation-plan.md) tracks delivery.
+
 Version 1 uses RIPEstat for static country/ASN prefixes and CrowdSec LAPI for
 dynamic ingress bans. [Configuration](configuration.md) defines selectors and
 defaults; [architecture](architecture.md) defines revision commit behavior and
