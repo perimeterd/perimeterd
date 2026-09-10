@@ -19,6 +19,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/perimeterd/perimeterd/internal/config/catalog"
+	"github.com/perimeterd/perimeterd/internal/prefix"
 )
 
 // Config is the fully defaulted and locally validated version 1 configuration.
@@ -340,7 +341,13 @@ func normalize(raw rawConfig) (Config, error) {
 		return Config{}, err
 	}
 	// Built-in local ranges are part of the effective allowlist and cannot be removed.
-	cfg.Global.Allowlist = normalizePrefixValues(append(cfg.Global.Allowlist, builtinLocalRanges()...))
+	locals := builtinLocalRanges()
+	allowPrefixes := make([]netip.Prefix, 0, len(cfg.Global.Allowlist)+len(locals))
+	allowPrefixes = append(allowPrefixes, cfg.Global.Allowlist...)
+	allowPrefixes = append(allowPrefixes, locals...)
+	if cfg.Global.Allowlist, err = prefix.Normalize(allowPrefixes); err != nil {
+		return Config{}, fmt.Errorf("global.allowlist: %w", err)
+	}
 
 	fw := raw.Firewall
 	if fw.DenyAction != nil {
@@ -483,57 +490,11 @@ func normalizePrefixes(values []string, field string) ([]netip.Prefix, error) {
 		}
 		prefixes = append(prefixes, prefix.Masked())
 	}
-	return normalizePrefixValues(prefixes), nil
-}
-
-func normalizePrefixValues(prefixes []netip.Prefix) []netip.Prefix {
-	if len(prefixes) == 0 {
-		return []netip.Prefix{}
+	normalized, err := prefix.Normalize(prefixes)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", field, err)
 	}
-	items := append([]netip.Prefix(nil), prefixes...)
-	sort.Slice(items, func(i, j int) bool {
-		a, b := items[i], items[j]
-		if a.Addr().Is4() != b.Addr().Is4() {
-			return a.Addr().Is4()
-		}
-		if cmp := a.Addr().Compare(b.Addr()); cmp != 0 {
-			return cmp < 0
-		}
-		return a.Bits() < b.Bits()
-	})
-	out := make([]netip.Prefix, 0, len(items))
-	var activeEnd netip.Addr
-	var activeFamily bool
-	active := false
-	for _, candidate := range items {
-		family := candidate.Addr().Is4()
-		if !active || family != activeFamily || activeEnd.Compare(candidate.Addr()) < 0 {
-			out = append(out, candidate)
-			activeEnd = prefixEnd(candidate)
-			activeFamily = family
-			active = true
-		}
-		// Canonical CIDR ranges either do not overlap or one contains the
-		// other. Since items are ordered by network address, an overlapping
-		// candidate is contained by the most recent retained range.
-	}
-	return out
-}
-
-func prefixEnd(prefix netip.Prefix) netip.Addr {
-	bits := prefix.Bits()
-	if prefix.Addr().Is4() {
-		value := prefix.Addr().As4()
-		for bit := bits; bit < 32; bit++ {
-			value[bit/8] |= 1 << (7 - bit%8)
-		}
-		return netip.AddrFrom4(value)
-	}
-	value := prefix.Addr().As16()
-	for bit := bits; bit < 128; bit++ {
-		value[bit/8] |= 1 << (7 - bit%8)
-	}
-	return netip.AddrFrom16(value)
+	return normalized, nil
 }
 
 func builtinLocalRanges() []netip.Prefix {

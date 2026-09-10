@@ -1,9 +1,10 @@
 # Development
 
 This document defines the implementation layout, engineering gates, test
-boundaries, CI, and releases. The offline validator and its foundation gates are
-implemented; daemon, backend, privileged E2E, packaging, and release work remains
-planned. The Go module pins the baseline to Go 1.27.1; see the official
+boundaries, CI, and releases. The offline validator, pure policy compiler, and
+foundation gates are implemented; source fetching, daemon/backend integration,
+privileged E2E, packaging, and release work remain planned. The Go module pins the
+baseline to Go 1.27.1; see the official
 [Go release history](https://go.dev/doc/devel/release).
 
 ## Proposed repository layout
@@ -14,9 +15,10 @@ internal/app/                 process lifecycle and event orchestration
 internal/config/              YAML schema, defaults, strict validation
 internal/configsource/        local source; future remote source boundary
 internal/policy/              selectors, precedence, backend-neutral compiler
+internal/prefix/              immutable prefix normalization and set algebra
 internal/prefixsource/        source interface, cache, RIPEstat adapter
 internal/crowdsec/            LAPI stream adapter and expiring decision state
-internal/firewall/            backend contract and shared desired-state types
+internal/firewall/            backend contract and common reconciliation machinery
 internal/firewall/nftables/   netlink implementation
 internal/firewall/iptables/   iptables-restore/ip6tables-restore + ipset implementation
 internal/state/               atomic on-disk last-known-good snapshots
@@ -41,6 +43,34 @@ shared immutable state and do not fetch source data.
 No `pkg/` tree exists until a real supported public Go API exists. A future
 container/Helm delivery adds `build/package/` and `charts/perimeterd/` only
 when those artifacts are implemented, not as empty placeholders.
+
+## Pure compiler API
+
+`internal/policy.Compile` consumes a normalized `config.Config` from
+`config.Parse` and an immutable `policy.Snapshot`. `RequiredSelectors` reports
+the enabled policies' canonical country, RIR, and ASN input identities; locally
+expanded groups contribute country identities. `NewSnapshot` accepts resolved
+IPv4/IPv6 prefix records, distinguishes missing records from valid empty ones,
+and rejects malformed, wrong-family, or duplicate canonical records.
+
+An RIR record represents its fully resolved service-region union. Resolving that
+union from country queries, validating source metadata, and materializing cache
+manifests belong to the future source layer; the compiler performs no fetching
+or filesystem/kernel operations. An enabled policy must retain at least one
+prefix overall after exclusions, while family-empty behavior follows
+[configuration semantics](configuration.md#evaluation-semantics).
+
+The immutable result exposes owned inspection copies through `State.Families`:
+family-specific sets, ordered ingress/egress rules, dynamic CrowdSec references,
+and bounded accounting roles. `Return` means return to the parent firewall path,
+not accept; `Reject` is lowered by the future backend to the documented
+family/protocol-specific response. `State.Empty` identifies the canonical
+no-artifacts state. No new CLI command or runtime packet interpreter is exposed.
+
+`internal/prefix` supplies the shared immutable normalization, membership, union,
+and difference operations used by configuration parsing and compilation. Tests
+exercise the emitted model with a test-only interpreter using deterministic
+snapshots and the existing verification matrix below.
 
 ## Local commands
 

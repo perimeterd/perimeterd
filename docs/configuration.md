@@ -381,6 +381,11 @@ is enabled, keep its dynamic path even when its current decision store is empty.
 Do not infer the no-artifacts state from a temporarily empty source response
 or from allows shadowing configured denies.
 
+When the no-artifacts predicate is false, compilation requires at least one
+enabled address family. Disabling both `firewall.ipv4` and `firewall.ipv6` does
+not silently turn requested enforcement into the canonical empty state; the
+compiler returns an error. This is separate from local YAML validation.
+
 ## Global list example
 
 ```yaml
