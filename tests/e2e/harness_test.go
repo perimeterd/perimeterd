@@ -33,7 +33,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// runIsolated re-executes one test in a fresh user, mount, network, and PID namespace.
+// runIsolated re-executes one test in fresh mount, network, and PID namespaces.
+// Unprivileged callers also create a user namespace to obtain namespace root.
 // The outer process never invokes a firewall tool; all such calls happen after
 // the child verifies that its namespace differs from the caller's namespace.
 func runIsolated(t *testing.T, testName, scenario string) {
@@ -49,8 +50,15 @@ func runIsolated(t *testing.T, testName, scenario string) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
+	args := []string{"--kill-child", "--mount", "--mount-proc", "--net", "--pid", "--fork"}
+	// Root already has the required privileges. A new user namespace would lose
+	// its ability to traverse private workspace directories owned by another UID.
+	if os.Geteuid() != 0 {
+		args = append(args, "--user", "--map-root-user")
+	}
+	args = append(args, os.Args[0], "-test.run", "^"+testName+"$", "-test.v")
 	// #nosec G204 G702 -- the namespace wrapper and test executable are controlled by this test-only harness.
-	cmd := exec.CommandContext(ctx, "unshare", "--kill-child", "--user", "--map-root-user", "--mount", "--mount-proc", "--net", "--pid", "--fork", os.Args[0], "-test.run", "^"+testName+"$", "-test.v")
+	cmd := exec.CommandContext(ctx, "unshare", args...)
 	cmd.Env = append(os.Environ(),
 		e2eEnabledEnv+"=1",
 		e2eChildEnv+"=1",

@@ -113,10 +113,13 @@ make test-e2e E2E_SUDO=sudo
 ```
 
 The harness requires Linux, `nft`, `ip`, `unshare`, and `nsenter`. It creates
-disposable user, mount, network, and PID namespaces, verifies isolation before
-mutation, and mounts private runtime/state directories. The fixture is PID
-namespace init, so its exit or forced timeout terminates all descendants. It
-exercises real CLI lifecycle,
+disposable mount, network, and PID namespaces, verifies isolation before mutation,
+and mounts private runtime/state directories. Unprivileged callers also create a
+user namespace to obtain namespace root. Root callers (including CI with `sudo`)
+retain their existing user namespace so they can execute binaries beneath private
+workspace directories owned by the checkout user. No workspace permissions need
+to be relaxed. The fixture is PID namespace init, so its exit or forced timeout
+terminates all descendants. It exercises real CLI lifecycle,
 IPv4/IPv6 TCP/UDP packets, reloads, counters, ownership collisions, and interrupted
 transactions. It never applies test rules to the development host's firewall.
 Tagged E2E sources are formatted and linted by the ordinary gates but execute only
