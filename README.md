@@ -1,5 +1,18 @@
 # perimeterd
 
+**Block unwanted traffic at your Linux perimeter.**
+
+`perimeterd` is a focused traffic-blocking layer for Linux, designed to bring
+geographic filtering, ASN restrictions, CrowdSec bans, and IP blocklists together
+without replacing your existing firewall.
+
+Give unwanted traffic fewer ways in—and out. The first-release scope combines
+inbound and outbound geographic policies, port-specific scopes, country groups,
+and explicit IP/CIDR exceptions with CrowdSec ingress bans across IPv4 and IPv6.
+Manage it through one YAML configuration, while your existing firewall stays in
+charge of services and ports. Focused protection, without another full firewall
+stack to manage.
+
 > **Status: early kernel-backed runtime.** Offline validation, the pure policy
 > compiler, and nftables enforcement for direct global IP/CIDR rules are
 > implemented, with durable recovery and isolated packet-path tests. Source-backed
@@ -8,10 +21,6 @@
 
 The [implementation plan](docs/implementation-plan.md) is the authoritative
 record of completed milestones and remaining work.
-
-`perimeterd` is a Linux firewall policy daemon written in Go. The first-release
-contract adds country, RIR, group, and ASN selectors and CrowdSec Local API ingress
-bans. One serialized writer owns firewall mutations and durable revision changes.
 
 ## Try the configuration validator
 
