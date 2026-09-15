@@ -19,6 +19,7 @@ internal/config/catalog/      checked-in selector catalogs
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, nft JSON execution and reconciliation
+internal/source/              RIPEstat resolution, immutable cache and captured HTTP fixtures
 internal/state/               revision store, record codec/validation and durable filesystem IO
 configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
 .github/workflows/ci.yml      quality, build, unit/race and native nftables gates
@@ -46,9 +47,9 @@ new package APIs:
 
 ### Planned additions
 
-Source resolution/cache adapters, CrowdSec, iptables/ipset, expanded
-observability, installed systemd/tmpfiles payloads, package lifecycle scripts,
-and GoReleaser/release workflows belong to later milestones. Their eventual
+CrowdSec, iptables/ipset, expanded observability, installed systemd/tmpfiles
+payloads, package lifecycle scripts, and GoReleaser/release workflows belong to
+later milestones. Their eventual
 package layout should follow the real integration boundaries; these directories
 and files are not present scaffolding.
 
@@ -60,16 +61,17 @@ when those artifacts are implemented, not as empty placeholders.
 
 `internal/policy.Compile` consumes a normalized `config.Config` from
 `config.Parse` and an immutable `policy.Snapshot`. `RequiredSelectors` reports
-the enabled policies' canonical country, RIR, and ASN input identities; locally
-expanded groups contribute country identities. `NewSnapshot` accepts resolved
-IPv4/IPv6 prefix records, distinguishes missing records from valid empty ones,
+the enabled policies' canonical country and ASN input identities; RIR memberships
+and built-in/custom groups expand locally into country identities. `NewSnapshot`
+accepts resolved IPv4/IPv6 prefix records, distinguishes missing records from valid empty ones,
 and rejects malformed, wrong-family, or duplicate canonical records.
 
-An RIR record represents its fully resolved service-region union. Resolving that
-union from country queries, validating source metadata, and materializing cache
-manifests belong to the future source layer; the compiler performs no fetching
-or filesystem/kernel operations. An enabled policy must retain at least one
-prefix overall after exclusions, while family-empty behavior follows
+The source resolver fetches required countries and ASNs into one immutable cache
+manifest; RIR/group unions use those country records. Source metadata validation,
+fresh reuse, and whole-committed-snapshot fallback stay in `internal/source`.
+The compiler performs no fetching or filesystem/kernel operations. An enabled
+policy must retain at least one prefix overall after exclusions, while
+family-empty behavior follows
 [configuration semantics](configuration.md#evaluation-semantics).
 
 The immutable result exposes owned inspection copies through `State.Families`:
@@ -175,9 +177,9 @@ commit SHAs and refresh their human-readable release comments.
 ## Version 1 verification and delivery requirements
 
 The remaining sections specify the complete first-release contract, including
-source, CrowdSec, iptables/ipset, Docker, packaging and systemd-VM work that is
-not implemented yet. The [local commands](#local-commands) describe what can run
-now; the [implementation plan](implementation-plan.md) tracks progress.
+CrowdSec, iptables/ipset, Docker, packaging and systemd-VM work that is not
+implemented yet. The [local commands](#local-commands) describe what can run now;
+the [implementation plan](implementation-plan.md) tracks progress.
 
 ## Verification matrix
 
@@ -294,13 +296,16 @@ than one layer when the real boundary matters.
 
 ## Privileged end-to-end suite
 
-The current `tests/e2e/` suite exercises the direct-global nftables slice in
-disposable Linux namespaces; its executable coverage and prerequisites are
-described under [local commands](#local-commands).
+The current `tests/e2e/` suite exercises direct-global and source-backed geo
+nftables policy in disposable Linux namespaces, including country/RIR/group/ASN
+selectors, exclusions, priority, family-empty behavior, and retained policy after
+source failure. Its prerequisites are described under
+[local commands](#local-commands). Unit/integration source tests use local HTTP
+servers and checked-in official RIPEstat responses with provenance metadata.
 
-The version-1 suite must expand that foundation with local
-HTTP/RIPEstat/CrowdSec fixtures, iptables/ipset coverage, and IPv4/IPv6 scenarios
-where applicable. The matrix above defines those acceptance requirements.
+The version-1 suite must expand that foundation with CrowdSec fixtures and
+iptables/ipset coverage, with IPv4/IPv6 scenarios where applicable. The matrix
+above defines those acceptance requirements.
 
 The planned separate Docker job must execute the [Docker coexistence row](#kernel-backend-and-coexistence).
 The planned CrowdSec compatibility job must use a pinned real supported LAPI

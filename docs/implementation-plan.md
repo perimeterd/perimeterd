@@ -94,6 +94,17 @@ against the development host's firewall.
 
 ## 4. Complete static source-backed policy
 
+**Status:** implemented for nftables: the RIPEstat adapter resolves countries
+and ASNs, with RIR and built-in/custom group expansion into country selectors.
+Immutable content-addressed objects and manifests are bound to durable revisions;
+scheduled refresh and reload reuse the existing serialized writer and recovery.
+
+Local HTTP fixtures cover official wire compatibility, malformed/partial
+responses, visibility intervals, request limits, and whole-snapshot fallback.
+Commit tests preserve cache/firewall selection across failed and successful
+publication. Isolated native packet tests cover all selector kinds, exclusions,
+priority, family-empty policies, and retained enforcement after source failure.
+
 Add the RIPEstat adapter and cache contract, then connect real prefix snapshots to
 the compiler and writer.
 
@@ -133,14 +144,13 @@ implemented and verified before release.
 
 ## Immediate next task
 
-Implement step 4: connect the RIPEstat adapter and its cache/publication contract
-to real immutable prefix snapshots and the existing compiler/writer lifecycle.
-Use local fixture servers to prove that incomplete or unacceptable source data
-cannot replace committed policy.
+Implement step 5 as separate milestones, starting with CrowdSec authoritative
+startup synchronization and decision lifecycle. Keep CrowdSec changes inside
+the existing serialized writer and durable revision boundaries.
 
-The direct-global nftables slice is complete. Geo source fetching, CrowdSec,
-iptables/ipset, and release integrations retain their later milestones; do not
-bypass the durable transaction and ownership boundaries to add them.
+Static source-backed nftables policy is complete. CrowdSec, iptables/ipset,
+coexistence, and operational/release integrations retain their remaining
+acceptance criteria; do not bypass ownership or transaction boundaries.
 
 Track subsequent milestones as issues with acceptance criteria drawn from the
 existing docs. Update the docs when implementation exposes a concrete

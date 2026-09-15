@@ -18,7 +18,7 @@ type metricsServer struct {
 	errCh  chan error
 }
 
-func bindMetrics(listen string, health func() bool) (*metricsServer, error) {
+func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int64) (*metricsServer, error) {
 	if listen == "" {
 		return nil, nil
 	}
@@ -41,6 +41,11 @@ func bindMetrics(listen string, health func() bool) (*metricsServer, error) {
 			value = 1
 		}
 		_, _ = fmt.Fprintf(writer, "# HELP perimeterd_enforcement_health Whether the selected firewall state is healthy.\n# TYPE perimeterd_enforcement_health gauge\nperimeterd_enforcement_health %d\n", value)
+		if snapshotTimestamp != nil {
+			if stamp := snapshotTimestamp(); stamp != 0 {
+				_, _ = fmt.Fprintf(writer, "# HELP perimeterd_prefix_snapshot_timestamp_seconds Oldest retrieval time in the committed prefix snapshot.\n# TYPE perimeterd_prefix_snapshot_timestamp_seconds gauge\nperimeterd_prefix_snapshot_timestamp_seconds{source=\"ripestat\"} %d\n", stamp)
+			}
+		}
 	})
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		http.NotFound(writer, request)

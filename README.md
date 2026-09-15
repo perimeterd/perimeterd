@@ -13,11 +13,12 @@ Manage it through one YAML configuration, while your existing firewall stays in
 charge of services and ports. Focused protection, without another full firewall
 stack to manage.
 
-> **Status: early kernel-backed runtime.** Offline validation, the pure policy
-> compiler, and nftables enforcement for direct global IP/CIDR rules are
-> implemented, with durable recovery and isolated packet-path tests. Source-backed
-> geo policy, CrowdSec, iptables/ipset, packages, and production releases remain
-> planned. This is not yet a production-ready security control.
+> **Status: static source-backed nftables runtime.** Offline validation, the pure
+> policy compiler, direct IP/CIDR rules, and RIPEstat country/RIR/group/ASN policies
+> are implemented, with immutable source caching, scheduled refresh, durable
+> recovery, and isolated packet-path tests. CrowdSec, iptables/ipset, packages,
+> and production releases remain planned. This is not yet a production-ready
+> security control.
 
 The [implementation plan](docs/implementation-plan.md) is the authoritative
 record of completed milestones and remaining work.

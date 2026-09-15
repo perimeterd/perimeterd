@@ -221,6 +221,81 @@ func TestNativePrefixAndRejectLowering(t *testing.T) {
 	}
 }
 
+func TestLongGeoSetNamesAreBoundedAndSuffixSensitive(t *testing.T) {
+	const repeated = 199
+	leftPolicy := strings.Repeat("a", repeated) + "b"
+	rightPolicy := strings.Repeat("a", repeated) + "c"
+	cfg := config.Config{
+		Version: 1,
+		Firewall: config.FirewallConfig{
+			Backend: "nftables", DenyAction: "drop", IPv4: true,
+			Nftables: config.NftablesConfig{Table: "long-geo", Priority: -10},
+		},
+		Policies: []config.Policy{
+			{Name: leftPolicy, Priority: 10, Direction: "ingress", Mode: "allowlist", Traffic: config.TrafficScope{Any: true}, Include: config.Selector{Countries: []string{"US"}}},
+			{Name: rightPolicy, Priority: 20, Direction: "ingress", Mode: "allowlist", Traffic: config.TrafficScope{Any: true}, Include: config.Selector{Countries: []string{"CA"}}},
+		},
+	}
+	snapshot, err := policy.NewSnapshot([]policy.ResolvedSelector{
+		{Selector: policy.Selector{Kind: policy.Country, Value: "US"}, IPv4: []netip.Prefix{netip.MustParsePrefix("8.0.0.0/8")}},
+		{Selector: policy.Selector{Kind: policy.Country, Value: "CA"}, IPv4: []netip.Prefix{netip.MustParsePrefix("9.0.0.0/8")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := policy.Compile(cfg, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := BuildTarget(testOwner, testGenA, cfg, model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateTarget(target); err != nil {
+		t.Fatal(err)
+	}
+
+	wantIDs := []string{"geo/" + leftPolicy, "geo/" + rightPolicy}
+	native := make(map[string]string, len(wantIDs))
+	for _, family := range target.Families {
+		for _, set := range family.Sets {
+			if set.ID != wantIDs[0] && set.ID != wantIDs[1] {
+				continue
+			}
+			name := setName(target, family.Family, set.ID)
+			if len(name) > maxNFTNameBytes {
+				t.Fatalf("long geo set %q exceeds native length limit %d: %q", set.ID, maxNFTNameBytes, name)
+			}
+			native[set.ID] = name
+		}
+	}
+	for _, id := range wantIDs {
+		if native[id] == "" {
+			t.Fatalf("compiled target omitted %s", id)
+		}
+	}
+	if native[wantIDs[0]] == native[wantIDs[1]] {
+		t.Fatalf("long geo IDs differing only in suffix collided as %q", native[wantIDs[0]])
+	}
+}
+
+func TestGeoPolicyEligibleSetNameDoesNotAliasReservedSet(t *testing.T) {
+	target := testTarget(t, testGenA)
+	target.Families = cloneFamilies(target.Families)
+	target.Families[0].Sets = append(target.Families[0].Sets,
+		policy.PrefixSet{ID: "geo_eligible", Kind: policy.StaticSet},
+		policy.PrefixSet{ID: "geo/eligible", Kind: policy.StaticSet},
+	)
+	if err := ValidateTarget(target); err != nil {
+		t.Fatal(err)
+	}
+	reserved := setName(target, target.Families[0].Family, "geo_eligible")
+	policySet := setName(target, target.Families[0].Family, "geo/eligible")
+	if reserved == policySet {
+		t.Fatalf("reserved geo set and policy set share native name %q", reserved)
+	}
+}
+
 func TestSetElementsCompareCanonicalNftIntervals(t *testing.T) {
 	observed := nftObject{Elem: json.RawMessage(`["8.20.0.2",{"range":["8.20.0.0","8.20.1.127"]}]`)}
 	expected := []netip.Prefix{
@@ -233,19 +308,148 @@ func TestSetElementsCompareCanonicalNftIntervals(t *testing.T) {
 	}
 }
 
-func TestValidateConfigRejectsUnsupportedRuntimeFeatures(t *testing.T) {
+func TestValidateConfigSupportsStaticGeoAndRejectsDynamic(t *testing.T) {
 	cfg := config.Config{
 		Version:  1,
 		Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", Nftables: config.NftablesConfig{Table: "perimeterd", Priority: -10}},
 		Policies: []config.Policy{{Name: "geo", Mode: "allowlist"}},
 	}
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("static geo policy was rejected: %v", err)
+	}
+	cfg.Policies[0].Mode = "unexpected"
 	if err := ValidateConfig(cfg); err == nil {
-		t.Fatal("enabled geo policy was accepted by global-only runtime")
+		t.Fatal("unsupported policy mode was accepted")
 	}
 	cfg.Policies = nil
 	cfg.CrowdSec.Enabled = true
 	if err := ValidateConfig(cfg); err == nil {
 		t.Fatal("crowdsec was accepted by initial runtime")
+	}
+}
+
+func TestValidateTargetAcceptsStaticGeoRulesAndCounters(t *testing.T) {
+	cfg := config.Config{
+		Version: 1,
+		Firewall: config.FirewallConfig{
+			Backend: "nftables", DenyAction: "reject", IPv4: true, IPv6: true,
+			Nftables: config.NftablesConfig{Table: "geo-test", Priority: -10},
+		},
+		Policies: []config.Policy{{
+			Name: "geo", Priority: 10, Direction: "ingress", Mode: "allowlist",
+			Traffic: config.TrafficScope{TCP: []config.PortRange{{Start: 443, End: 443}}, UDP: []config.PortRange{{Start: 53, End: 53}}},
+			Include: config.Selector{Countries: []string{"US"}},
+		}},
+	}
+	snapshot, err := policy.NewSnapshot([]policy.ResolvedSelector{{
+		Selector: policy.Selector{Kind: policy.Country, Value: "US"},
+		IPv4:     []netip.Prefix{netip.MustParsePrefix("8.0.0.0/8")},
+		IPv6:     []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := policy.Compile(cfg, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := BuildTarget(testOwner, testGenA, cfg, model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateTarget(target); err != nil {
+		t.Fatalf("compiled static geo target was rejected: %v", err)
+	}
+	var geoCounter, negated bool
+	for _, family := range target.Families {
+		for _, set := range family.Sets {
+			if strings.HasPrefix(set.ID, "geo/") && set.Kind != policy.StaticSet {
+				t.Fatalf("geo policy set is not static: %#v", set)
+			}
+		}
+		for _, path := range family.Paths {
+			for _, rule := range path.Rules {
+				negated = negated || rule.Match.SetID == "geo_eligible" && rule.Match.NegateSet
+				geoCounter = geoCounter || rule.Counter.Reason == policy.GeoPolicy
+			}
+		}
+	}
+	if !negated || !geoCounter {
+		t.Fatalf("compiled geo target omitted bypass or denial counter: negated=%t counter=%t", negated, geoCounter)
+	}
+}
+
+func TestEmptyGeoFamilySetIsMaterialized(t *testing.T) {
+	cfg := config.Config{
+		Version: 1,
+		Firewall: config.FirewallConfig{
+			Backend: "nftables", DenyAction: "drop", IPv4: true, IPv6: true,
+			Nftables: config.NftablesConfig{Table: "geo-empty", Priority: -10},
+		},
+		Policies: []config.Policy{{
+			Name: "geo", Priority: 10, Direction: "ingress", Mode: "allowlist",
+			Traffic: config.TrafficScope{Any: true}, Include: config.Selector{Countries: []string{"US"}},
+		}},
+	}
+	snapshot, err := policy.NewSnapshot([]policy.ResolvedSelector{{
+		Selector: policy.Selector{Kind: policy.Country, Value: "US"},
+		IPv6:     []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := policy.Compile(cfg, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := BuildTarget(testOwner, testGenA, cfg, model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var emptyName string
+	for _, family := range target.Families {
+		if family.Family != policy.IPv4 {
+			continue
+		}
+		for _, set := range family.Sets {
+			if strings.HasPrefix(set.ID, "geo/") {
+				emptyName = setName(target, family.Family, set.ID)
+				if len(set.Prefixes) != 0 {
+					t.Fatalf("expected empty IPv4 geo set, got %v", set.Prefixes)
+				}
+			}
+		}
+	}
+	if emptyName == "" {
+		t.Fatal("compiled target omitted empty geo family set")
+	}
+	batch, err := commandBatch(target, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, command := range batch.Nftables {
+		value, ok := command.Add.(map[string]any)
+		if !ok {
+			continue
+		}
+		set, ok := value["set"].(map[string]any)
+		if !ok || set["name"] != emptyName {
+			continue
+		}
+		found = true
+		if _, exists := set["elem"]; exists {
+			t.Fatalf("empty set unexpectedly supplied elements: %#v", set)
+		}
+	}
+	if !found {
+		t.Fatalf("empty geo set %q was omitted from nftables batch", emptyName)
+	}
+	if !setElementsComplete(nftObject{}, policy.IPv4, nil) {
+		t.Fatal("missing element field was not accepted for an empty set")
+	}
+	if !setElementsComplete(nftObject{Elem: json.RawMessage(`[]`)}, policy.IPv4, nil) {
+		t.Fatal("empty element array was not accepted for an empty set")
 	}
 }
 

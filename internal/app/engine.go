@@ -38,9 +38,11 @@ type Engine struct {
 	backend    firewall.Backend
 	checkpoint func(string) error
 
-	admitted uint64
-	closing  atomic.Bool
-	healthy  atomic.Bool
+	admitted        uint64
+	activeEpoch     uint64
+	refreshSequence uint64
+	closing         atomic.Bool
+	healthy         atomic.Bool
 }
 
 // NewEngine constructs a fenced engine. Recovery must be called before normal
@@ -69,6 +71,42 @@ func (e *Engine) Admit() (uint64, error) {
 	return e.admitted, nil
 }
 
+// AdmitRefresh reserves a sequence for the active configuration independently
+// of reload admission. A rejected reload cannot fence its active refreshes.
+func (e *Engine) AdmitRefresh(epoch uint64) (uint64, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.startErrorLocked(context.Background()); err != nil {
+		return 0, err
+	}
+	if epoch == 0 || epoch != e.activeEpoch {
+		return 0, errStaleCandidate
+	}
+	if e.refreshSequence == ^uint64(0) {
+		return 0, errors.New("refresh sequence exhausted")
+	}
+	e.refreshSequence++
+	return e.refreshSequence, nil
+}
+
+// current checks result freshness before exposing failures or binding resources.
+// Apply repeats the check while holding the mutation fence.
+func (e *Engine) current(candidate Candidate) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.currentLocked(candidate)
+}
+
+func (e *Engine) currentLocked(candidate Candidate) bool {
+	if candidate.epoch == 0 {
+		return false
+	}
+	if candidate.refresh != 0 {
+		return candidate.epoch == e.activeEpoch && candidate.refresh == e.refreshSequence
+	}
+	return candidate.epoch == e.admitted
+}
+
 // Apply admits a fully staged candidate to the backend and durable store. All
 // mutations occur only after a read-only preflight and durable preparation.
 func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error) {
@@ -77,14 +115,18 @@ func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.applyLocked(ctx, candidate)
+	outcome, err := e.applyLocked(ctx, candidate)
+	if outcome.Committed && outcome.Active != nil {
+		e.adoptActiveEpochLocked(outcome.Active)
+	}
+	return outcome, err
 }
 
 func (e *Engine) applyLocked(ctx context.Context, candidate Candidate) (Outcome, error) {
 	if err := e.startErrorLocked(ctx); err != nil {
 		return Outcome{Degraded: e.degraded()}, err
 	}
-	if candidate.epoch == 0 || candidate.epoch != e.admitted {
+	if !e.currentLocked(candidate) {
 		return Outcome{}, errStaleCandidate
 	}
 	if e.store == nil || e.backend == nil {
@@ -118,12 +160,14 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate) (Outcome,
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
 	candidateRevision := &state.Revision{
-		Version:    1,
-		ID:         transaction,
-		Epoch:      candidate.epoch,
-		ConfigPath: candidate.path,
-		Config:     cloneConfig(candidate.cfg),
-		Target:     candidateTarget,
+		Version:         1,
+		ID:              transaction,
+		Epoch:           candidate.epoch,
+		ConfigPath:      candidate.path,
+		Config:          cloneConfig(candidate.cfg),
+		Target:          candidateTarget,
+		Manifest:        candidate.snapshot.ManifestID(),
+		RefreshSequence: candidate.refresh,
 	}
 	if err := e.store.Prepare(previous, candidateRevision); err != nil {
 		return e.failLocked(err)
@@ -310,6 +354,7 @@ func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		e.healthy.Store(true)
+		e.adoptActiveEpochLocked(nil)
 		return nil, nil
 	}
 	if journal.Operation != "apply" {
@@ -479,7 +524,18 @@ func targetOf(revision *state.Revision) *firewall.Target {
 }
 
 func (e *Engine) adoptActiveEpochLocked(revision *state.Revision) {
-	if revision != nil && revision.Epoch > e.admitted {
+	if revision == nil {
+		e.activeEpoch = 0
+		e.refreshSequence = 0
+		return
+	}
+	if revision.Epoch != e.activeEpoch {
+		e.refreshSequence = revision.RefreshSequence
+	} else if revision.RefreshSequence > e.refreshSequence {
+		e.refreshSequence = revision.RefreshSequence
+	}
+	e.activeEpoch = revision.Epoch
+	if revision.Epoch > e.admitted {
 		e.admitted = revision.Epoch
 	}
 }

@@ -27,23 +27,27 @@ const (
 
 // Revision is an immutable, validated desired firewall revision.
 type Revision struct {
-	Version    int              `json:"version"`
-	ID         string           `json:"id"`
-	Epoch      uint64           `json:"epoch"`
-	ConfigPath string           `json:"config_path"`
-	Config     config.Config    `json:"config"`
-	Target     *firewall.Target `json:"target"`
+	Version         int              `json:"version"`
+	ID              string           `json:"id"`
+	Epoch           uint64           `json:"epoch"`
+	RefreshSequence uint64           `json:"refresh_sequence,omitempty"`
+	Manifest        string           `json:"manifest,omitempty"`
+	ConfigPath      string           `json:"config_path"`
+	Config          config.Config    `json:"config"`
+	Target          *firewall.Target `json:"target"`
 }
 
 // Journal describes an in-flight apply or explicit cleanup operation.
 type Journal struct {
-	Version   int      `json:"version"`
-	ID        string   `json:"id"`
-	Operation string   `json:"operation"`
-	Phase     string   `json:"phase"`
-	Previous  string   `json:"previous"`
-	Candidate string   `json:"candidate"`
-	Revisions []string `json:"revisions"`
+	Version           int      `json:"version"`
+	ID                string   `json:"id"`
+	Operation         string   `json:"operation"`
+	Phase             string   `json:"phase"`
+	Previous          string   `json:"previous"`
+	Candidate         string   `json:"candidate"`
+	PreviousManifest  string   `json:"previous_manifest,omitempty"`
+	CandidateManifest string   `json:"candidate_manifest,omitempty"`
+	Revisions         []string `json:"revisions"`
 }
 
 // View is a consistent snapshot of all durable records referenced by active or journal state.
@@ -84,11 +88,42 @@ func (s *Store) validateRevision(revision *Revision) error {
 	if err := firewall.ValidateConfig(revision.Config); err != nil {
 		return fmt.Errorf("state: revision %s configuration: %w", revision.ID, err)
 	}
-	compiled, err := policy.Compile(revision.Config, policy.Snapshot{})
+	required, err := policy.RequiredSelectors(revision.Config)
+	if err != nil {
+		return fmt.Errorf("state: revision %s selectors: %w", revision.ID, err)
+	}
+	var snapshot policy.Snapshot
+	if revision.Manifest == "" {
+		if len(required) != 0 {
+			return fmt.Errorf("state: revision %s has no manifest for required selectors", revision.ID)
+		}
+	} else {
+		if err := validateCacheManifestID(revision.Manifest); err != nil {
+			return fmt.Errorf("state: revision %s manifest: %w", revision.ID, err)
+		}
+		if len(required) == 0 {
+			return fmt.Errorf("state: revision %s has a manifest with no required selectors", revision.ID)
+		}
+		if s.prefixes == nil {
+			return errors.New("state: source cache is unavailable")
+		}
+		cached, err := s.prefixes.Load(revision.Manifest)
+		if err != nil {
+			return fmt.Errorf("state: revision %s manifest: %w", revision.ID, err)
+		}
+		snapshot = cached.Policy()
+		if !reflect.DeepEqual(cached.Policy().Selectors(), required) {
+			return fmt.Errorf("state: revision %s manifest selector coverage mismatch", revision.ID)
+		}
+	}
+	compiled, err := policy.Compile(revision.Config, snapshot)
 	if err != nil {
 		return fmt.Errorf("state: revision %s compiled model: %w", revision.ID, err)
 	}
 	if revision.Target == nil {
+		if !compiled.Empty() {
+			return fmt.Errorf("state: revision %s has no target for active policy", revision.ID)
+		}
 		return nil
 	}
 	if err := firewall.ValidateTarget(revision.Target); err != nil {
@@ -225,6 +260,18 @@ func ensureEOF(decoder *json.Decoder) error {
 	return nil
 }
 
+func validateCacheManifestID(value string) error {
+	if len(value) != sha256.Size*2 {
+		return fmt.Errorf("manifest identity must be %d lowercase hex characters", sha256.Size*2)
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return errors.New("manifest identity is not lowercase hexadecimal")
+		}
+	}
+	return nil
+}
+
 func makeID() string {
 	var raw [idLength / 2]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -270,6 +317,20 @@ func validateJournal(journal *Journal) error {
 			if err := validateID(id, "journal revision"); err != nil {
 				return err
 			}
+		}
+	}
+	for _, reference := range []struct{ revision, manifest string }{
+		{journal.Previous, journal.PreviousManifest},
+		{journal.Candidate, journal.CandidateManifest},
+	} {
+		if reference.manifest == "" {
+			continue
+		}
+		if reference.revision == "" {
+			return errors.New("state: journal manifest has no owning revision")
+		}
+		if err := validateCacheManifestID(reference.manifest); err != nil {
+			return fmt.Errorf("state: journal manifest: %w", err)
 		}
 	}
 	seen := make(map[string]struct{}, len(journal.Revisions))

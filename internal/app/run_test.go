@@ -60,7 +60,7 @@ func TestSystemdNotifyUsesUnixDatagram(t *testing.T) {
 func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 	var health atomic.Bool
 	health.Store(true)
-	metrics, err := bindMetrics("127.0.0.1:0", health.Load)
+	metrics, err := bindMetrics("127.0.0.1:0", health.Load, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 		t.Fatalf("metrics body = %q", body)
 	}
 
-	other, err := bindMetrics("127.0.0.1:0", health.Load)
+	other, err := bindMetrics("127.0.0.1:0", health.Load, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 func TestMetricsCloseAfterServeIgnoresExpectedClosedListener(t *testing.T) {
 	var health atomic.Bool
 	health.Store(true)
-	metrics, err := bindMetrics("127.0.0.1:0", health.Load)
+	metrics, err := bindMetrics("127.0.0.1:0", health.Load, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestMetricsCloseAfterServeIgnoresExpectedClosedListener(t *testing.T) {
 }
 
 func TestMetricsClosesRequestsWithWithheldBodies(t *testing.T) {
-	metrics, err := bindMetrics("127.0.0.1:0", func() bool { return true })
+	metrics, err := bindMetrics("127.0.0.1:0", func() bool { return true }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestMetricsClosesRequestsWithWithheldBodies(t *testing.T) {
 }
 
 func TestMetricsForcedRetirementClosesActiveRequests(t *testing.T) {
-	metrics, err := bindMetrics("127.0.0.1:0", func() bool { return true })
+	metrics, err := bindMetrics("127.0.0.1:0", func() bool { return true }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

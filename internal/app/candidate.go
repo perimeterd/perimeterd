@@ -7,6 +7,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/policy"
+	"github.com/perimeterd/perimeterd/internal/source"
 )
 
 // Candidate is an immutable, completely compiled configuration awaiting the
@@ -14,25 +15,27 @@ import (
 // construct one through NewCandidate, and all mutable configuration containers
 // are owned by the candidate.
 type Candidate struct {
-	epoch uint64
-	path  string
-	cfg   config.Config
-	model policy.State
+	epoch    uint64
+	refresh  uint64
+	path     string
+	cfg      config.Config
+	model    policy.State
+	snapshot source.Snapshot
 }
 
 // NewCandidate validates and compiles cfg without reading sources or touching
 // the kernel. The candidate owns independent copies of cfg and its compiled
 // model, so later caller mutations cannot alter the desired revision.
-func NewCandidate(epoch uint64, path string, cfg config.Config) (Candidate, error) {
+func NewCandidate(epoch uint64, path string, cfg config.Config, snapshot source.Snapshot) (Candidate, error) {
 	owned := cloneConfig(cfg)
 	if err := firewall.ValidateConfig(owned); err != nil {
 		return Candidate{}, err
 	}
-	model, err := policy.Compile(owned, policy.Snapshot{})
+	model, err := policy.Compile(owned, snapshot.Policy())
 	if err != nil {
 		return Candidate{}, err
 	}
-	return Candidate{epoch: epoch, path: path, cfg: owned, model: model}, nil
+	return Candidate{epoch: epoch, path: path, cfg: owned, model: model, snapshot: snapshot}, nil
 }
 
 func cloneConfig(value config.Config) config.Config {

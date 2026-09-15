@@ -1,7 +1,9 @@
 package firewall
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,8 +18,9 @@ import (
 )
 
 const (
-	stableToken = "stable"
-	tableRole   = "table"
+	stableToken     = "stable"
+	tableRole       = "table"
+	maxNFTNameBytes = 255
 )
 
 // BuildTarget lowers a compiled policy state into an owned immutable target.
@@ -170,7 +173,27 @@ func generationChainName(target *Target, family policy.Family, direction policy.
 }
 
 func setName(target *Target, family policy.Family, setID string) string {
-	return artifactName(target.Owner, target.Generation, "set_"+familyToken(family)+"_"+setID)
+	prefix := artifactName(target.Owner, target.Generation, "set_"+familyToken(family)+"_")
+	readable := sanitizeRole(setID)
+	// geo/eligible and the fixed geo_eligible set are distinct logical sets;
+	// retain a readable name while keeping their native identifiers distinct.
+	if setID == "geo/eligible" {
+		readable = "geo_policy_eligible"
+	}
+	name := prefix + readable
+	if len(name) <= maxNFTNameBytes {
+		return name
+	}
+
+	// Policy names are intentionally not bounded by nftables' identifier limit.
+	// Keep a readable prefix, then append a digest of the complete logical set
+	// ID so names differing only after the native limit remain distinct.
+	digest := sha256.Sum256([]byte(setID))
+	suffix := "_h" + hex.EncodeToString(digest[:])
+	// Validated owner/generation IDs fix the prefix length, leaving room for
+	// both a readable ASCII prefix and the complete digest.
+	available := maxNFTNameBytes - len(prefix) - len(suffix)
+	return prefix + readable[:available] + suffix
 }
 
 func chainRole(family policy.Family, direction policy.Direction) string {
@@ -402,11 +425,17 @@ func parseObservedInterval(raw json.RawMessage, family policy.Family) (addressIn
 }
 
 func setElementsComplete(observed nftObject, family policy.Family, expected []netip.Prefix) bool {
-	if len(expected) == 0 || len(observed.Elem) == 0 {
-		return false
+	if len(observed.Elem) == 0 {
+		return len(expected) == 0
 	}
 	var rawElements []json.RawMessage
-	if err := json.Unmarshal(observed.Elem, &rawElements); err != nil || len(rawElements) == 0 {
+	if err := json.Unmarshal(observed.Elem, &rawElements); err != nil || rawElements == nil {
+		return false
+	}
+	if len(expected) == 0 {
+		return len(rawElements) == 0
+	}
+	if len(rawElements) == 0 {
 		return false
 	}
 	actual := make([]addressInterval, 0, len(rawElements))
@@ -466,18 +495,21 @@ func commandBatch(target *Target, inventory *nftInventory, old *Target) (nftBatc
 				}
 				continue
 			}
-			if len(elems) == 0 {
-				continue
-			}
 			typeName := "ipv4_addr"
 			if family.Family == policy.IPv6 {
 				typeName = "ipv6_addr"
 			}
-			batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"set": map[string]any{
+			definition := map[string]any{
 				"family": "inet", "table": target.Table, "name": name,
 				"type": typeName, "flags": []string{"constant", "interval"}, "auto-merge": true,
-				"elem": elems,
-			}}})
+			}
+			// Empty static sets are still materialized. Geo allowlists use an
+			// explicitly empty family to deny every globally routable address;
+			// omitting the set would make the generated reference invalid.
+			if len(elems) != 0 {
+				definition["elem"] = elems
+			}
+			batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"set": definition}})
 		}
 	}
 	keepGeneration := generationRulesComplete(inventory, target)

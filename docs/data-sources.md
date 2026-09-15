@@ -1,8 +1,9 @@
 # Data Sources
 
-> **Version-1 source contract.** The adapters, caches and dynamic-ban integration
-> described here are planned requirements, not currently available runtime
-> features. The [implementation plan](implementation-plan.md) tracks delivery.
+> **Version-1 source contract.** The RIPEstat adapter, immutable cache, and static
+> policy refresh/recovery integration are implemented for nftables. CrowdSec
+> dynamic-ban integration remains planned. The
+> [implementation plan](implementation-plan.md) tracks delivery.
 
 Version 1 uses RIPEstat for static country/ASN prefixes and CrowdSec LAPI for
 dynamic ingress bans. [Configuration](configuration.md) defines selectors and
@@ -82,6 +83,14 @@ added until such an implementation exists.
 Every resolution is a complete candidate, not a stream of independently
 publishable selector updates.
 
+RIR service regions use a release-pinned, explicit country assignment from the
+[RIPE NCC country/RIR table](https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/),
+reviewed on 2026-09-15 and cross-checked against the
+[NRO table](https://www.nro.net/list-of-country-codes-and-rirs-ordered-by-country-code/).
+These are not M49 geographic groups: for example, Taiwan belongs to APNIC,
+Iran and Cyprus to RIPE, and the Dominican Republic to LACNIC. The embedded
+assignments cover all 249 supported ISO country codes exactly once.
+
 ### Normative resolution steps
 
 1. Expand configured countries, RIR service regions, and groups to unique
@@ -120,6 +129,11 @@ The snapshot is all-or-nothing. A failed, truncated, malformed, mismatched, or
 partial response never becomes an empty valid selector. A candidate revision is
 publishable only when every required selector has a valid result and each
 enabled policy resolves at least one prefix overall.
+
+Reject duplicate object keys at every nesting level, including Unicode
+case-fold-equivalent keys such as `status` and `STATUS`. Such aliases must not
+overwrite status, identity, prefix, or visibility fields during decoding.
+Unrelated, unambiguous provider metadata remains permitted.
 
 A family-specific empty result has mode-dependent behavior, defined
 canonically in [configuration](configuration.md): blocklist does nothing for
@@ -234,6 +248,10 @@ when refresh fails. A reload may reuse that manifest's selector results when it
 covers every candidate selector; if the selector set shrinks, write a new
 complete manifest referencing only that subset, preserving every retrieval
 timestamp. No fetched partial results enter this fallback manifest.
+Refresh failure includes a successfully fetched snapshot that cannot compile
+into a usable policy, such as one emptied by exclusions. Before fallback or
+fresh-cache reuse, the committed snapshot must still satisfy the candidate
+configuration; coverage alone does not make an invalid policy acceptable.
 
 A reload requiring a selector absent from the active manifest must fetch it
 successfully; stale data cannot satisfy a newly introduced selector. On first

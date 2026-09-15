@@ -55,13 +55,55 @@ func validRole(role policy.CounterRole) bool {
 	if role.Kind == policy.Processed {
 		return role.Reason == "" && role.Action == ""
 	}
-	return role.Kind == policy.Denied && role.Reason == policy.GlobalBlocklist &&
+	return role.Kind == policy.Denied &&
+		(role.Reason == policy.GlobalBlocklist || role.Reason == policy.GeoPolicy) &&
 		(role.Action == policy.Drop || role.Action == policy.Reject)
 }
 
-// ValidateConfig validates the runtime subset implemented by this backend.
-// Offline configuration validation intentionally remains broader than this
-// first kernel-backed vertical slice.
+func validGeoSetID(value string) bool {
+	if !strings.HasPrefix(value, "geo/") || len(value) == len("geo/") {
+		return false
+	}
+	name := value[len("geo/"):]
+	if name[0] == '-' || name[len(name)-1] == '-' {
+		return false
+	}
+	for _, char := range name {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validNFTName(value string) bool {
+	return value != "" && len([]byte(value)) <= maxNFTNameBytes && strings.IndexByte(value, 0) < 0
+}
+
+func validStaticSetID(value string) bool {
+	return value == "global_allowlist" || value == "global_blocklist" ||
+		value == "geo_eligible" || validGeoSetID(value)
+}
+
+func validTrafficScope(scope policy.Scope) bool {
+	if scope.Any {
+		return len(scope.TCP) == 0 && len(scope.UDP) == 0 && !scope.ICMP
+	}
+	if len(scope.TCP) == 0 && len(scope.UDP) == 0 && !scope.ICMP {
+		return false
+	}
+	for _, values := range [][]policy.PortRange{scope.TCP, scope.UDP} {
+		for _, value := range values {
+			if value.Start == 0 || value.Start > value.End {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ValidateConfig validates the implemented static nftables runtime. Offline
+// validation also accepts integrations that are not yet available here.
 func ValidateConfig(value config.Config) error {
 	if value.Version != 1 {
 		return fmt.Errorf("firewall runtime: unsupported config version %d", value.Version)
@@ -70,22 +112,22 @@ func ValidateConfig(value config.Config) error {
 		return fmt.Errorf("firewall runtime: backend %q is unsupported; only nftables is available", value.Firewall.Backend)
 	}
 	if value.CrowdSec.Enabled {
-		return fmt.Errorf("firewall runtime: crowdsec is not supported in the initial nftables slice")
+		return fmt.Errorf("firewall runtime: crowdsec is not supported")
 	}
 	if value.Firewall.DenyAction != "drop" && value.Firewall.DenyAction != "reject" {
 		return fmt.Errorf("firewall runtime: unsupported deny action %q", value.Firewall.DenyAction)
 	}
 	for _, item := range value.Policies {
-		if item.Mode != "disabled" {
-			return fmt.Errorf("firewall runtime: policy %q is enabled; geo policy is not supported in the initial nftables slice", item.Name)
+		if item.Mode != "disabled" && item.Mode != "allowlist" && item.Mode != "blocklist" {
+			return fmt.Errorf("firewall runtime: policy %q has unsupported mode %q", item.Name, item.Mode)
 		}
 	}
 	table := value.Firewall.Nftables.Table
 	if table == "" {
 		return fmt.Errorf("firewall runtime: nftables table must not be empty")
 	}
-	if len([]byte(table)) > 255 {
-		return fmt.Errorf("firewall runtime: nftables table exceeds 255 bytes")
+	if len([]byte(table)) > maxNFTNameBytes {
+		return fmt.Errorf("firewall runtime: nftables table exceeds %d bytes", maxNFTNameBytes)
 	}
 	if strings.IndexByte(table, 0) >= 0 {
 		return fmt.Errorf("firewall runtime: nftables table contains NUL")
@@ -97,8 +139,8 @@ func ValidateConfig(value config.Config) error {
 }
 
 // ValidateTarget checks the complete typed target before it can become
-// mutation authority. Raw nft syntax, geo policy, and dynamic models are not
-// representable in a Target in this runtime slice.
+// mutation authority. Dynamic models remain intentionally unrepresentable in
+// a Target; static global and geo sets are the only accepted sets.
 func ValidateTarget(value *Target) error {
 	if value == nil {
 		return nil
@@ -109,7 +151,7 @@ func ValidateTarget(value *Target) error {
 	if !validTargetID(value.Generation) {
 		return fmt.Errorf("firewall target: generation must be 32 lowercase hexadecimal characters")
 	}
-	if value.Table == "" || len([]byte(value.Table)) > 255 || strings.IndexByte(value.Table, 0) >= 0 {
+	if value.Table == "" || len([]byte(value.Table)) > maxNFTNameBytes || strings.IndexByte(value.Table, 0) >= 0 {
 		return fmt.Errorf("firewall target: invalid table name")
 	}
 	if value.Priority <= -200 {
@@ -120,6 +162,7 @@ func ValidateTarget(value *Target) error {
 	}
 	seenFamilies := make(map[policy.Family]struct{}, len(value.Families))
 	expectedCounters := make(map[string]CounterSpec)
+	nativeSets := make(map[string]string)
 	for _, family := range value.Families {
 		if !validFamily(family.Family) {
 			return fmt.Errorf("firewall target: unsupported family %d", family.Family)
@@ -130,13 +173,21 @@ func ValidateTarget(value *Target) error {
 		seenFamilies[family.Family] = struct{}{}
 		setIDs := make(map[string]struct{}, len(family.Sets))
 		for _, set := range family.Sets {
-			if set.Kind != policy.StaticSet || (set.ID != "global_allowlist" && set.ID != "global_blocklist") {
+			if set.Kind != policy.StaticSet || !validStaticSetID(set.ID) {
 				return fmt.Errorf("firewall target: unsupported set %q", set.ID)
 			}
 			if _, ok := setIDs[set.ID]; ok {
 				return fmt.Errorf("firewall target: duplicate set %q", set.ID)
 			}
 			setIDs[set.ID] = struct{}{}
+			nativeName := setName(value, family.Family, set.ID)
+			if !validNFTName(nativeName) {
+				return fmt.Errorf("firewall target: set %q has invalid native name", set.ID)
+			}
+			if previous, exists := nativeSets[nativeName]; exists {
+				return fmt.Errorf("firewall target: sets %q and %q collide as native name %q", previous, set.ID, nativeName)
+			}
+			nativeSets[nativeName] = set.ID
 			for _, prefix := range set.Prefixes {
 				if err := validatePrefix(prefix, family.Family); err != nil {
 					return fmt.Errorf("firewall target: set %s: %w", set.ID, err)
@@ -223,22 +274,30 @@ func validatePrefix(value netip.Prefix, family policy.Family) error {
 }
 
 func validateRuntimeRule(rule policy.Rule, setIDs map[string]struct{}) error {
-	if rule.Policy != "" || rule.Action == "" {
-		return fmt.Errorf("geo policy metadata/action is not supported")
+	if rule.Action == "" {
+		return fmt.Errorf("rule action is required")
 	}
 	if rule.Action != policy.Return && rule.Action != policy.Drop && rule.Action != policy.Reject {
 		return fmt.Errorf("unsupported action %q", rule.Action)
 	}
+	if !validTrafficScope(rule.Match.Traffic) {
+		return fmt.Errorf("invalid traffic scope")
+	}
 	if rule.Match.SetID != "" {
-		if _, ok := setIDs[rule.Match.SetID]; !ok || rule.Match.NegateSet {
+		if _, ok := setIDs[rule.Match.SetID]; !ok {
 			return fmt.Errorf("unsupported set reference %q", rule.Match.SetID)
 		}
-	}
-	if !rule.Match.Traffic.Any || len(rule.Match.Traffic.TCP) != 0 || len(rule.Match.Traffic.UDP) != 0 || rule.Match.Traffic.ICMP {
-		return fmt.Errorf("non-global traffic scope is not supported")
+		if rule.Match.NegateSet && rule.Match.SetID != "geo_eligible" {
+			return fmt.Errorf("unsupported negated set reference %q", rule.Match.SetID)
+		}
+	} else if rule.Match.NegateSet {
+		return fmt.Errorf("negated set requires a set reference")
 	}
 	if rule.Match.Flow != "" && rule.Match.Flow != policy.EstablishedRelated && rule.Match.Flow != policy.NotNew {
 		return fmt.Errorf("unsupported flow guard %q", rule.Match.Flow)
+	}
+	if rule.Match.Flow != "" && (!rule.Match.Traffic.Any || rule.Match.SetID != "" || rule.Policy != "") {
+		return fmt.Errorf("flow guard has unexpected match metadata")
 	}
 	if rule.Counter != (policy.CounterRole{}) {
 		if !validRole(rule.Counter) {
@@ -246,6 +305,15 @@ func validateRuntimeRule(rule policy.Rule, setIDs map[string]struct{}) error {
 		}
 		if rule.Counter.Kind == policy.Processed {
 			return fmt.Errorf("processed counter must be attached to path entry")
+		}
+		if rule.Counter.Action != rule.Action {
+			return fmt.Errorf("denial counter action does not match rule action")
+		}
+		if rule.Counter.Reason == policy.GeoPolicy && rule.Policy == "" {
+			return fmt.Errorf("geo denial counter is missing policy metadata")
+		}
+		if rule.Counter.Reason == policy.GlobalBlocklist && rule.Policy != "" {
+			return fmt.Errorf("global denial counter has policy metadata")
 		}
 	}
 	return nil

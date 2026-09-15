@@ -9,6 +9,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
@@ -120,7 +121,7 @@ func admitCandidate(t *testing.T, engine *Engine, cfg config.Config) Candidate {
 	if err != nil {
 		t.Fatalf("admit: %v", err)
 	}
-	candidate, err := NewCandidate(epoch, "invalid-current-yaml.yaml", cfg)
+	candidate, err := NewCandidate(epoch, "invalid-current-yaml.yaml", cfg, source.Snapshot{})
 	if err != nil {
 		t.Fatalf("new candidate: %v", err)
 	}
@@ -137,7 +138,7 @@ func TestEngineNewInvalidAdmissionSupersedesOlderCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit newer request: %v", err)
 	}
-	if _, err := NewCandidate(newEpoch, "new-invalid.yaml", config.Config{}); err == nil {
+	if _, err := NewCandidate(newEpoch, "new-invalid.yaml", config.Config{}, source.Snapshot{}); err == nil {
 		t.Fatal("invalid newer candidate unexpectedly compiled")
 	}
 
@@ -541,5 +542,72 @@ func TestEngineRejectsCanceledApplyBeforeMutation(t *testing.T) {
 	}
 	if got := backend.selection(); got != "" {
 		t.Fatalf("canceled apply selected %q", got)
+	}
+}
+
+func TestEngineRefreshAdmissionSurvivesFailedReloadAndFencesOldWork(t *testing.T) {
+	backend := &recordingBackend{}
+	engine, store := newTestEngine(t, backend, nil)
+	defer engine.Close()
+	initial := admitCandidate(t, engine, parseEngineConfig(t, "8.8.8.8/32"))
+	first, err := engine.Apply(context.Background(), initial)
+	if err != nil || !first.Committed {
+		t.Fatalf("initial apply: %+v, %v", first, err)
+	}
+	refresh := initial
+	refresh.refresh, err = engine.AdmitRefresh(initial.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A newly admitted but invalid YAML reload must not freeze the old
+	// configuration's independently scheduled source refresh.
+	invalidEpoch, err := engine.Admit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewCandidate(invalidEpoch, "bad.yaml", config.Config{}, source.Snapshot{}); err == nil {
+		t.Fatal("invalid reload compiled")
+	}
+	refreshed, err := engine.Apply(context.Background(), refresh)
+	if err != nil || !refreshed.Committed {
+		t.Fatalf("failed reload fenced active refresh: %+v, %v", refreshed, err)
+	}
+	older := refresh
+	older.refresh, err = engine.AdmitRefresh(initial.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newer := refresh
+	newer.refresh, err = engine.AdmitRefresh(initial.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Apply(context.Background(), older); !errors.Is(err, errStaleCandidate) {
+		t.Fatalf("superseded refresh error: %v", err)
+	}
+	view, err := store.Read()
+	if err != nil || view.Active == nil || view.Active.ID != refreshed.Transaction {
+		t.Fatalf("superseded refresh changed committed state: %+v, %v", view.Active, err)
+	}
+	latest, err := engine.Apply(context.Background(), newer)
+	if err != nil || !latest.Committed {
+		t.Fatalf("latest refresh: %+v, %v", latest, err)
+	}
+	oldConfiguration := newer
+	oldConfiguration.refresh, err = engine.AdmitRefresh(initial.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reload := admitCandidate(t, engine, parseEngineConfig(t, "9.9.9.9/32"))
+	reloaded, err := engine.Apply(context.Background(), reload)
+	if err != nil || !reloaded.Committed {
+		t.Fatalf("valid reload: %+v, %v", reloaded, err)
+	}
+	if _, err := engine.Apply(context.Background(), oldConfiguration); !errors.Is(err, errStaleCandidate) {
+		t.Fatalf("old configuration refresh error: %v", err)
+	}
+	view, err = store.Read()
+	if err != nil || view.Active == nil || view.Active.ID != reloaded.Transaction {
+		t.Fatalf("old refresh replaced reloaded policy: %+v, %v", view.Active, err)
 	}
 }

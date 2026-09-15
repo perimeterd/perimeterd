@@ -232,20 +232,18 @@ policies:
     mode: blocklist
     traffic: [any]
     include:
-      countries: [US]
-      rirs: [APNIC]
+      countries: [US, CN]
       asns: [AS64496]
     exclude:
-      countries: [CA]
-      rirs: [RIPE]
+      countries: [CA, DE]
       asns: [AS64497]
 `)
 	snapshot := mustSnapshot(t,
 		snapshotRecord{kind: policy.Country, value: "US", ipv4: []netip.Prefix{mustPrefix("8.0.0.0/8")}, ipv6: []netip.Prefix{mustPrefix("2600::/32")}},
-		snapshotRecord{kind: policy.RIR, value: "APNIC", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/8")}, ipv6: []netip.Prefix{mustPrefix("2a00::/12")}},
+		snapshotRecord{kind: policy.Country, value: "CN", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/8")}, ipv6: []netip.Prefix{mustPrefix("2a00::/12")}},
 		snapshotRecord{kind: policy.ASN, value: "AS64496", ipv4: []netip.Prefix{mustPrefix("11.0.0.0/8")}, ipv6: []netip.Prefix{mustPrefix("2800::/12")}},
 		snapshotRecord{kind: policy.Country, value: "CA", ipv4: []netip.Prefix{mustPrefix("8.0.0.0/9")}, ipv6: []netip.Prefix{mustPrefix("2600::/33")}},
-		snapshotRecord{kind: policy.RIR, value: "RIPE", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/9")}, ipv6: []netip.Prefix{mustPrefix("2a00::/13")}},
+		snapshotRecord{kind: policy.Country, value: "DE", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/9")}, ipv6: []netip.Prefix{mustPrefix("2a00::/13")}},
 		snapshotRecord{kind: policy.ASN, value: "AS64497", ipv4: []netip.Prefix{mustPrefix("11.0.0.0/9")}, ipv6: []netip.Prefix{mustPrefix("2800::/13")}},
 	)
 	state, err := policy.Compile(cfg, snapshot)

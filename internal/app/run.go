@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
@@ -26,15 +28,16 @@ const (
 	defaultStartupTimeout = 75 * time.Minute
 )
 
-// Options controls the daemon's process lifecycle. Backend, Checkpoint,
-// Signals, and Notify are programmatic injection points for tests and callers;
-// they are not configuration or command-line overrides.
+// Options controls the daemon's process lifecycle. Backend, SourceClient,
+// Checkpoint, Signals, and Notify are programmatic injection points; they are
+// not configuration or command-line overrides.
 type Options struct {
 	ConfigPath     string
 	StateDir       string
 	LockPath       string
 	Stderr         io.Writer
 	Backend        firewall.Backend
+	SourceClient   *http.Client
 	Checkpoint     func(string) error
 	Signals        <-chan os.Signal
 	Notify         func(string) error
@@ -119,10 +122,19 @@ func Run(ctx context.Context, options Options) error {
 	engine := NewEngine(store, opts.Backend, opts.Checkpoint)
 	defer engine.Close()
 
-	if _, err := recoverUntilReady(startupCtx, engine, nil); err != nil {
+	recovered, err := recoverUntilReady(startupCtx, engine, nil)
+	if err != nil {
 		return errors.Join(err, stopNotifier())
 	}
 	if err := startupCtx.Err(); err != nil {
+		return errors.Join(err, stopNotifier())
+	}
+	if err := collectPrefixes(store); err != nil {
+		return errors.Join(fmt.Errorf("collect unused prefix cache: %w", err), stopNotifier())
+	}
+	sources := newSourceRuntime(store.Prefixes(), opts.SourceClient)
+	defer sources.close()
+	if err := sources.selectRevision(recovered); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
 
@@ -146,13 +158,13 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return errors.Join(err, stopNotifier())
 	}
-	candidate, err := NewCandidate(epoch, opts.ConfigPath, cfg)
-	if err != nil {
-		return errors.Join(fmt.Errorf("compile configuration: %w", err), stopNotifier())
+	initial := stageSource(startupCtx, opts, sources.resolver, epoch, 0, cfg, sources.manifest())
+	if initial.err != nil {
+		return errors.Join(initial.err, stopNotifier())
 	}
 	staged, err := bindMetrics(cfg.Metrics.Listen, func() bool {
 		return engine.Healthy() && health.Load()
-	})
+	}, sources.timestamp.Load)
 	if err != nil {
 		return errors.Join(err, stopNotifier())
 	}
@@ -160,7 +172,7 @@ func Run(ctx context.Context, options Options) error {
 		_ = staged.closeImmediate()
 		return errors.Join(err, stopNotifier())
 	}
-	outcome, applyErr := engine.Apply(startupCtx, candidate)
+	outcome, applyErr := engine.Apply(startupCtx, initial.candidate)
 	health.Store(true)
 	if applyErr != nil && !outcome.Committed {
 		if !outcome.Degraded {
@@ -178,6 +190,7 @@ func Run(ctx context.Context, options Options) error {
 			_ = staged.closeImmediate()
 			return errors.Join(applyErr, errors.New("startup recovery did not retain candidate"), stopNotifier())
 		}
+		outcome.Active = recovered
 		health.Store(true)
 		promoteMetrics(&activeMetrics, staged, true, health, logger)
 	} else if !outcome.Committed {
@@ -195,10 +208,17 @@ func Run(ctx context.Context, options Options) error {
 			_ = staged.closeImmediate()
 			return errors.Join(applyErr, errors.New("startup recovery did not retain committed candidate"), stopNotifier())
 		}
+		outcome.Active = recovered
 		health.Store(true)
 		promoteMetrics(&activeMetrics, staged, true, health, logger)
 	} else {
 		promoteMetrics(&activeMetrics, staged, true, health, logger)
+	}
+	if err := sources.selectRevision(outcome.Active); err != nil {
+		return errors.Join(err, stopNotifier())
+	}
+	if initial.refreshErr != nil {
+		logger.Warn("using committed source snapshot after refresh failure", "error", initial.refreshErr, "snapshot_age", sources.age())
 	}
 	if err := notifier.Stop(); err != nil {
 		notifyStopped = true
@@ -230,6 +250,7 @@ func Run(ctx context.Context, options Options) error {
 	}
 	stopService := func() error {
 		cancelProducers()
+		sources.close()
 		producers.Wait()
 		if recoveryTimer != nil {
 			recoveryTimer.Stop()
@@ -259,6 +280,28 @@ func Run(ctx context.Context, options Options) error {
 		select {
 		case <-runCtx.Done():
 			return stopService()
+		case <-sources.events():
+			sources.schedule()
+			if recovering || sources.active == nil || sources.refreshCancel != nil {
+				continue
+			}
+			revision := sources.active
+			sequence, admitErr := engine.AdmitRefresh(revision.Epoch)
+			if admitErr != nil {
+				logger.Warn("source refresh admission failed", "error", admitErr)
+				continue
+			}
+			refreshCtx, cancel := context.WithCancel(producerCtx)
+			sources.refreshCancel = cancel
+			producers.Add(1)
+			go func() {
+				defer producers.Done()
+				result := stageSource(refreshCtx, opts, sources.resolver, revision.Epoch, sequence, revision.Config, revision.Manifest)
+				select {
+				case results <- result:
+				case <-producerCtx.Done():
+				}
+			}()
 		case sig, ok := <-signalEvents:
 			if !ok {
 				return stopService()
@@ -272,10 +315,16 @@ func Run(ctx context.Context, options Options) error {
 					logger.Warn("reload admission failed", "error", admitErr)
 					continue
 				}
+				if sources.reloadCancel != nil {
+					sources.reloadCancel()
+				}
+				reloadCtx, cancel := context.WithCancel(producerCtx)
+				sources.reloadCancel = cancel
+				committed := sources.manifest()
 				producers.Add(1)
 				go func(epoch uint64) {
 					defer producers.Done()
-					result := stageCandidate(producerCtx, opts, epoch)
+					result := stageCandidate(reloadCtx, opts, sources.resolver, epoch, committed)
 					select {
 					case results <- result:
 					case <-producerCtx.Done():
@@ -289,8 +338,15 @@ func Run(ctx context.Context, options Options) error {
 				return errors.Join(metricsErr, stopService())
 			}
 		case result := <-results:
+			if !engine.current(result.candidate) {
+				continue
+			}
+			if result.candidate.refresh != 0 && sources.refreshCancel != nil {
+				sources.refreshCancel()
+				sources.refreshCancel = nil
+			}
 			if result.err != nil {
-				logger.Warn("reload failed", "error", result.err)
+				logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
 				continue
 			}
 			if recovering || pending != nil {
@@ -302,7 +358,7 @@ func Run(ctx context.Context, options Options) error {
 			if !sameListen {
 				staged, bindErr = bindMetrics(result.cfg.Metrics.Listen, func() bool {
 					return engine.Healthy() && health.Load()
-				})
+				}, sources.timestamp.Load)
 				if bindErr != nil {
 					logger.Warn("reload failed", "error", bindErr)
 					continue
@@ -311,7 +367,7 @@ func Run(ctx context.Context, options Options) error {
 			outcome, applyErr := engine.Apply(runCtx, result.candidate)
 			if applyErr != nil && !outcome.Committed {
 				if outcome.Degraded && outcome.Transaction != "" {
-					pending = &recoveryReservation{transaction: outcome.Transaction, staged: staged, replace: !sameListen, logger: result.logger}
+					pending = &recoveryReservation{transaction: outcome.Transaction, staged: staged, replace: !sameListen, logger: result.logger, refreshErr: result.refreshErr}
 					scheduleRecovery()
 				} else {
 					_ = staged.closeImmediate()
@@ -329,6 +385,12 @@ func Run(ctx context.Context, options Options) error {
 			}
 			logger = result.logger
 			promoteMetrics(&activeMetrics, staged, !sameListen, health, logger)
+			if err := sources.selectRevision(outcome.Active); err != nil {
+				return errors.Join(err, stopService())
+			}
+			if result.refreshErr != nil {
+				logger.Warn("using committed source snapshot after refresh failure", "error", result.refreshErr, "snapshot_age", sources.age())
+			}
 			if outcome.Degraded || !engine.Healthy() {
 				scheduleRecovery()
 			}
@@ -348,9 +410,15 @@ func Run(ctx context.Context, options Options) error {
 				}
 				continue
 			}
+			if err := sources.selectRevision(recovered); err != nil {
+				return errors.Join(err, stopService())
+			}
 			if pending != nil {
 				if recovered != nil && recovered.ID == pending.transaction {
 					logger = pending.logger
+					if pending.refreshErr != nil {
+						logger.Warn("using committed source snapshot after refresh failure", "error", pending.refreshErr, "snapshot_age", sources.age())
+					}
 					if pending.replace {
 						promoteMetrics(&activeMetrics, pending.staged, true, health, logger)
 					}
@@ -383,7 +451,10 @@ func Cleanup(ctx context.Context, options Options) error {
 	}
 	engine := NewEngine(store, opts.Backend, opts.Checkpoint)
 	defer engine.Close()
-	return engine.Cleanup(ctx)
+	if err := engine.Cleanup(ctx); err != nil {
+		return err
+	}
+	return collectPrefixes(store)
 }
 
 type recoveryReservation struct {
@@ -391,31 +462,26 @@ type recoveryReservation struct {
 	staged      *metricsServer
 	replace     bool
 	logger      *slog.Logger
+	refreshErr  error
 }
 
 type stageResult struct {
-	candidate Candidate
-	cfg       config.Config
-	logger    *slog.Logger
-	err       error
+	candidate  Candidate
+	cfg        config.Config
+	logger     *slog.Logger
+	err        error
+	refreshErr error
 }
 
-func stageCandidate(ctx context.Context, opts Options, epoch uint64) stageResult {
+func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver, epoch uint64, committed string) stageResult {
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
-		return stageResult{err: fmt.Errorf("load configuration: %w", err)}
+		return stageResult{candidate: Candidate{epoch: epoch}, err: fmt.Errorf("load configuration: %w", err)}
 	}
 	if err := firewall.ValidateConfig(cfg); err != nil {
-		return stageResult{err: fmt.Errorf("runtime configuration: %w", err)}
+		return stageResult{candidate: Candidate{epoch: epoch}, err: fmt.Errorf("runtime configuration: %w", err)}
 	}
-	candidate, err := NewCandidate(epoch, opts.ConfigPath, cfg)
-	if err != nil {
-		return stageResult{err: fmt.Errorf("compile configuration: %w", err)}
-	}
-	if err := ctx.Err(); err != nil {
-		return stageResult{err: err}
-	}
-	return stageResult{candidate: candidate, cfg: cfg, logger: newLogger(cfg, opts.Stderr)}
+	return stageSource(ctx, opts, resolver, epoch, 0, cfg, committed)
 }
 
 func promoteMetrics(active **metricsServer, staged *metricsServer, replace bool, health *atomic.Bool, logger *slog.Logger) {

@@ -11,12 +11,15 @@ requirements later in this document are the version-1 deployment contract.
 
 ## Current source-build runtime
 
-The implemented runtime is limited to `firewall.backend: nftables`, direct
-`global.allowlist`/`global.blocklist` IPs and CIDRs, disabled geo policy modes,
-and `crowdsec.enabled: false`. ASN/country/RIR/group source resolution and the
-iptables/ipset backend are not wired into the runtime yet. Offline `validate`
-still checks the full configuration contract; successful validation does not
-mean an unsupported runtime integration is available.
+The implemented runtime supports `firewall.backend: nftables`, direct
+`global.allowlist`/`global.blocklist` IPs and CIDRs, and static geo allowlist or
+blocklist policies backed by RIPEstat countries and ASNs. RIRs and built-in/custom
+groups expand locally into country queries. Ingress/egress scopes, exclusions,
+policy priority, and IPv4/IPv6 family-empty behavior use the same policy compiler.
+CrowdSec must remain disabled; the iptables/ipset backend is not implemented.
+Offline `validate` still checks the full configuration contract without fetching
+data, so successful validation does not imply source availability or support for
+a planned runtime integration.
 
 Use a disposable VM or isolated network namespace, not the development host's
 firewall. A minimal direct-rule configuration is:
@@ -57,6 +60,22 @@ revision. Ownership inspection rejects unknown children. nftables sets use their
 recorded owner/generation-qualified names plus exact type, flags, and contents
 inside the marked table: nft JSON does not round-trip set comments.
 
+Source-backed candidates carry an immutable manifest under
+`/var/lib/perimeterd/prefixes/`; the committed revision selects it. Do not edit
+these content-addressed files or choose a manifest by its modification time.
+Startup validates referenced cache evidence before recovery mutates the firewall.
+Unreferenced cache files are collected after startup recovery or explicit cleanup,
+not while source workers may be staging candidates.
+
+Refresh defaults to every `24h` plus independently sampled `0..10m` jitter,
+with a `30s` request timeout and at most four requests in flight. Incomplete,
+malformed, or oversized source data leaves committed enforcement unchanged.
+Startup/reload can fall back only to the committed snapshot when it covers every
+required selector; newly introduced selectors must resolve successfully. Reusing
+cached data preserves its original retrieval time. Failed refreshes are logged
+with snapshot age and retried on the normal schedule. Direct-only configurations
+make no source requests.
+
 Encoded state records are limited to 16 MiB and rejected before publication if
 oversized. Native preflight requires each complete target to fit the 8 MiB
 installation limit and budgets inspection of both retained generations before
@@ -64,8 +83,11 @@ preparing a transaction. The conservative inspection budget is 48 MiB per table,
 with a hard 64 MiB native-output capture limit. Oversized reloads leave the
 committed revision recoverable rather than installing unreadable state.
 
-When configured, `/metrics` currently exposes `perimeterd_enforcement_health`;
-named kernel packet/byte counters remain in nftables. The full metric suite,
+When configured, `/metrics` exposes `perimeterd_enforcement_health` and, for an
+active source-backed revision,
+`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The timestamp
+is the oldest required selector's retrieval time, not manifest publication time.
+Named kernel packet/byte counters remain in nftables. The full metric suite,
 installed systemd unit, packages, and release gates below remain planned.
 Startup sends bounded systemd timeout extensions and `READY=1` only after
 reconciliation, durable commit, and required recovery complete.

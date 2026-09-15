@@ -147,8 +147,9 @@ func (s Snapshot) Selectors() []Selector {
 }
 
 // RequiredSelectors returns the canonical source identities needed by enabled
-// policies, including both include and exclude selectors. Groups are represented
-// only by their normalized ExpandedCountries; no source lookup is performed.
+// policies, including both include and exclude selectors. Groups and RIRs are
+// expanded to their deterministic country memberships; source lookup is not
+// performed here.
 func RequiredSelectors(cfg config.Config) ([]Selector, error) {
 	seen := make(map[Selector]struct{})
 	for i, policy := range cfg.Policies {
@@ -187,19 +188,29 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 		return nil, fmt.Errorf("groups are unresolved")
 	}
 	seen := make(map[Selector]struct{}, len(selection.Countries)+len(selection.ExpandedCountries)+len(selection.RIRs)+len(selection.ASNs))
-	for _, country := range append(append([]string{}, selection.Countries...), selection.ExpandedCountries...) {
-		selector, err := CanonicalSelector(Country, country)
+	addCountry := func(value string) error {
+		selector, err := CanonicalSelector(Country, value)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		seen[selector] = struct{}{}
+		return nil
+	}
+	for _, country := range append(append([]string{}, selection.Countries...), selection.ExpandedCountries...) {
+		if err := addCountry(country); err != nil {
+			return nil, err
+		}
 	}
 	for _, rir := range selection.RIRs {
 		selector, err := CanonicalSelector(RIR, rir)
 		if err != nil {
 			return nil, err
 		}
-		seen[selector] = struct{}{}
+		for _, country := range rirServiceRegions[selector.Value] {
+			if err := addCountry(country); err != nil {
+				return nil, fmt.Errorf("RIR %s: %w", selector.Value, err)
+			}
+		}
 	}
 	for _, asn := range selection.ASNs {
 		selector, err := CanonicalSelector(ASN, asn)
@@ -216,6 +227,48 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 	return selectors, nil
 }
 
+// rirServiceRegions is the release-pinned ISO country-to-RIR assignment, not
+// a geographic grouping. Reviewed 2026-09-15 against the RIPE NCC table:
+// https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/
+// Cross-checked with the NRO table and individual RIR service-region lists.
+// RIR selectors resolve these countries through country-resource-list; they
+// never become independent source records.
+var rirServiceRegions = map[string][]string{
+	"AFRINIC": {
+		"AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CI", "CM", "CV", "DJ",
+		"DZ", "EG", "EH", "ER", "ET", "GA", "GH", "GM", "GN", "GQ", "GW", "KE",
+		"KM", "LR", "LS", "LY", "MA", "MG", "ML", "MR", "MU", "MW", "MZ", "NA",
+		"NE", "NG", "RE", "RW", "SC", "SD", "SL", "SN", "SO", "SS", "ST", "SZ",
+		"TD", "TG", "TN", "TZ", "UG", "YT", "ZA", "ZM", "ZW",
+	},
+	"APNIC": {
+		"AF", "AS", "AU", "BD", "BN", "BT", "CC", "CK", "CN", "CX", "FJ", "FM",
+		"GU", "HK", "ID", "IN", "IO", "JP", "KH", "KI", "KP", "KR", "LA", "LK",
+		"MH", "MM", "MN", "MO", "MP", "MV", "MY", "NC", "NF", "NP", "NR", "NU",
+		"NZ", "PF", "PG", "PH", "PK", "PN", "PW", "SB", "SG", "TF", "TH", "TK",
+		"TL", "TO", "TV", "TW", "VN", "VU", "WF", "WS",
+	},
+	"ARIN": {
+		"AG", "AI", "AQ", "BB", "BL", "BM", "BS", "BV", "CA", "DM", "GD", "GP",
+		"HM", "JM", "KN", "KY", "LC", "MF", "MQ", "MS", "PM", "PR", "SH", "TC",
+		"UM", "US", "VC", "VG", "VI",
+	},
+	"LACNIC": {
+		"AR", "AW", "BO", "BQ", "BR", "BZ", "CL", "CO", "CR", "CU", "CW", "DO",
+		"EC", "FK", "GF", "GS", "GT", "GY", "HN", "HT", "MX", "NI", "PA", "PE",
+		"PY", "SR", "SV", "SX", "TT", "UY", "VE",
+	},
+	"RIPE": {
+		"AD", "AE", "AL", "AM", "AT", "AX", "AZ", "BA", "BE", "BG", "BH", "BY",
+		"CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FO", "FR", "GB", "GE",
+		"GG", "GI", "GL", "GR", "HR", "HU", "IE", "IL", "IM", "IQ", "IR", "IS",
+		"IT", "JE", "JO", "KG", "KW", "KZ", "LB", "LI", "LT", "LU", "LV", "MC",
+		"MD", "ME", "MK", "MT", "NL", "NO", "OM", "PL", "PS", "PT", "QA", "RO",
+		"RS", "RU", "SA", "SE", "SI", "SJ", "SK", "SM", "SY", "TJ", "TM", "TR",
+		"UA", "UZ", "VA", "YE",
+	},
+}
+
 func sortSelectors(selectors []Selector) {
 	sort.Slice(selectors, func(i, j int) bool {
 		if selectors[i].Kind != selectors[j].Kind {
@@ -226,12 +279,8 @@ func sortSelectors(selectors []Selector) {
 }
 
 func validRIR(value string) bool {
-	switch value {
-	case "AFRINIC", "APNIC", "ARIN", "LACNIC", "RIPE":
-		return true
-	default:
-		return false
-	}
+	_, ok := rirServiceRegions[value]
+	return ok
 }
 
 func canonicalASN(value string) bool {

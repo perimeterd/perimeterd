@@ -172,16 +172,68 @@ func TestRequiredSelectorsEnabledUnionAndDeterministicOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []policy.Selector{
+	if len(got) == 0 {
+		t.Fatal("required selector expansion was empty")
+	}
+	for _, selector := range got {
+		if selector.Kind == policy.RIR {
+			t.Fatalf("RIR selector was not expanded: %v", selector)
+		}
+	}
+	for _, want := range []policy.Selector{
 		{Kind: policy.ASN, Value: "AS3333"},
 		{Kind: policy.ASN, Value: "AS64512"},
 		{Kind: policy.Country, Value: "CA"},
 		{Kind: policy.Country, Value: "US"},
-		{Kind: policy.RIR, Value: "ARIN"},
-		{Kind: policy.RIR, Value: "RIPE"},
+		{Kind: policy.Country, Value: "DE"},
+	} {
+		if !containsSelector(got, want) {
+			t.Fatalf("required selectors missing %v: %v", want, got)
+		}
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("required selectors = %v, want %v", got, want)
+}
+
+func containsSelector(values []policy.Selector, want policy.Selector) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRequiredSelectorsRIRServiceRegionBoundaries(t *testing.T) {
+	// These assignments cross M49 geographic boundaries or split the Caribbean.
+	// Expected owners come from the RIR service-region table, not group expansion.
+	owners := map[string]string{
+		"TW": "APNIC", "IR": "RIPE", "CY": "RIPE", "KW": "RIPE",
+		"EG": "AFRINIC", "GL": "RIPE", "DO": "LACNIC", "CW": "LACNIC",
+		"AI": "ARIN", "SH": "ARIN", "IO": "APNIC", "HM": "ARIN",
+	}
+	all := make(map[policy.Selector]string)
+	for _, rir := range []string{"AFRINIC", "APNIC", "ARIN", "LACNIC", "RIPE"} {
+		cfg := config.Config{Policies: []config.Policy{{
+			Mode: "blocklist", Include: config.Selector{RIRs: []string{rir}},
+		}}}
+		selectors, err := policy.RequiredSelectors(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, selector := range selectors {
+			if previous, exists := all[selector]; exists {
+				t.Errorf("%s assigned to both %s and %s", selector.Value, previous, rir)
+			}
+			all[selector] = rir
+		}
+		for country, owner := range owners {
+			found := containsSelector(selectors, policy.Selector{Kind: policy.Country, Value: country})
+			if found != (owner == rir) {
+				t.Errorf("%s membership in %s = %t; service-region owner is %s", country, rir, found, owner)
+			}
+		}
+	}
+	if len(all) != 249 {
+		t.Fatalf("RIR service regions cover %d ISO countries, want 249", len(all))
 	}
 }
 

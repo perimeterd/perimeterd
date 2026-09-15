@@ -1,0 +1,6 @@
+{
+  "url": "https://stat.ripe.net/data/announced-prefixes/data.json?resource=3333&sourceapp=perimeterd",
+  "captured_at": "2026-09-14",
+  "api_version": "1.2",
+  "endpoint": "announced-prefixes"
+}

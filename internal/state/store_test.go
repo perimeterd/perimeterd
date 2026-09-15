@@ -375,3 +375,22 @@ func TestOversizedCandidatePreservesRecoverableActiveRevision(t *testing.T) {
 		t.Fatalf("commit replacement after rejection: %v", err)
 	}
 }
+
+func TestReadRejectsManifestWithoutOwningRevision(t *testing.T) {
+	store, dir := openTestStore(t, nil)
+	candidate := storeTestRevision(t, store, strings.Repeat("1", 32))
+	if err := store.Prepare(nil, candidate); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Journal.PreviousManifest = strings.Repeat("a", 64)
+	if err := store.publish("journal", filepath.Join(dir, "journal.json"), view.Journal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Read(); err == nil {
+		t.Fatal("recovery admitted a manifest reference without its owning revision")
+	}
+}

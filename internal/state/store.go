@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/perimeterd/perimeterd/internal/source"
 )
 
 // Store manages durable ownership, revision, active, and journal records.
@@ -15,6 +17,7 @@ type Store struct {
 	revisions  string
 	owner      string
 	checkpoint func(string) error
+	prefixes   *source.Cache
 }
 
 // Open opens or initializes a durable state directory. The caller must hold the lifecycle lock.
@@ -30,7 +33,11 @@ func Open(dir string, checkpoint func(string) error) (*Store, error) {
 		return nil, fmt.Errorf("state revisions directory: %w", err)
 	}
 
-	s := &Store{dir: dir, revisions: revisions, checkpoint: checkpoint}
+	prefixes, err := source.NewCache(dir, checkpoint)
+	if err != nil {
+		return nil, fmt.Errorf("state prefixes: %w", err)
+	}
+	s := &Store{dir: dir, revisions: revisions, checkpoint: checkpoint, prefixes: prefixes}
 	ownerPath := filepath.Join(dir, "owner.json")
 	ownerBytes, err := readOptional(ownerPath)
 	if err != nil {
@@ -58,11 +65,15 @@ func Open(dir string, checkpoint func(string) error) (*Store, error) {
 		}
 		s.owner = record.Owner
 	}
+
 	if _, err := s.read(); err != nil {
 		return nil, fmt.Errorf("state metadata: %w", err)
 	}
 	return s, nil
 }
+
+// Prefixes returns the immutable source cache owned by this state store.
+func (s *Store) Prefixes() *source.Cache { return s.prefixes }
 
 // Owner returns this state directory's stable ownership identity.
 func (s *Store) Owner() string { return s.owner }
@@ -138,6 +149,20 @@ func (s *Store) read() (View, error) {
 			}
 			view.Revisions[id] = revision
 		}
+		if journal.Operation == "apply" {
+			if journal.Previous != "" {
+				revision := view.Revisions[journal.Previous]
+				if revision == nil || revision.Manifest != journal.PreviousManifest {
+					return View{}, errors.New("state: apply journal previous manifest mismatch")
+				}
+			}
+			if journal.Candidate != "" {
+				revision := view.Revisions[journal.Candidate]
+				if revision == nil || revision.Manifest != journal.CandidateManifest {
+					return View{}, errors.New("state: apply journal candidate manifest mismatch")
+				}
+			}
+		}
 		if journal.Operation == "apply" && journal.Previous != "" && view.Active == nil {
 			return View{}, errors.New("state: apply journal has previous revision but active record is absent")
 		}
@@ -164,17 +189,30 @@ func (s *Store) Prepare(previous, candidate *Revision) error {
 			return err
 		}
 	}
-	if current, err := s.read(); err != nil {
+	current, err := s.read()
+	if err != nil {
 		return err
-	} else if current.Journal != nil {
+	}
+	if current.Journal != nil {
 		return errors.New("state: transaction already pending")
+	}
+	if previous != nil && previous.Manifest != "" {
+		if err := s.prefixes.Stabilize(previous.Manifest); err != nil {
+			return fmt.Errorf("previous prefix manifest: %w", err)
+		}
+	}
+	if candidate.Manifest != "" {
+		if err := s.prefixes.Stabilize(candidate.Manifest); err != nil {
+			return fmt.Errorf("candidate prefix manifest: %w", err)
+		}
 	}
 	if err := s.writeImmutableRevision(candidate); err != nil {
 		return fmt.Errorf("candidate revision: %w", err)
 	}
-	journal := Journal{Version: recordVersion, ID: candidate.ID, Operation: "apply", Phase: "prepared", Candidate: candidate.ID}
+	journal := Journal{Version: recordVersion, ID: candidate.ID, Operation: "apply", Phase: "prepared", Candidate: candidate.ID, CandidateManifest: candidate.Manifest}
 	if previous != nil {
 		journal.Previous = previous.ID
+		journal.PreviousManifest = previous.Manifest
 		journal.Revisions = append(journal.Revisions, previous.ID)
 	}
 	if candidate.ID != journal.Previous {
@@ -229,6 +267,13 @@ func (s *Store) Stabilize() error {
 	view, err := s.read()
 	if err != nil {
 		return err
+	}
+	for _, revision := range view.Revisions {
+		if revision.Manifest != "" {
+			if err := s.prefixes.Stabilize(revision.Manifest); err != nil {
+				return fmt.Errorf("stabilize prefix manifest %s: %w", revision.Manifest, err)
+			}
+		}
 	}
 	if err := s.checkpointCall("stabilize:before-file-sync"); err != nil {
 		return err
