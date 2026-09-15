@@ -125,6 +125,17 @@ Implement these as separate milestones:
 | iptables/ipset | Equivalent packet-policy behavior, family-by-family commit and compensation, failure recovery, and backend migration |
 | Coexistence | Documented Docker/custom-chain attachments and preservation of foreign firewall state |
 
+**iptables/ipset status:** implemented under the existing serialized writer and
+durable revision lifecycle. Native namespace tests exercise both legacy and
+nf_tables tool families: direct and source-backed IPv4/IPv6 policy, `/0`
+lowering, interface-constrained custom attachments, original-destination ports,
+stable processed accounting, and owned-only cleanup. The failure matrix covers
+second-family failure, successful and failed compensation, unhealthy enforcement,
+crashes between family switches and after commit, and bidirectional migration
+with precommit and retirement failures.
+
+CrowdSec and the separate Docker/coexistence milestone remain pending.
+
 Keep these paths under the same writer and revision lifecycle. Do not introduce
 separate mutation shortcuts for dynamic bans.
 
@@ -144,13 +155,13 @@ implemented and verified before release.
 
 ## Immediate next task
 
-Implement step 5 as separate milestones, starting with CrowdSec authoritative
-startup synchronization and decision lifecycle. Keep CrowdSec changes inside
-the existing serialized writer and durable revision boundaries.
+Continue step 5 with CrowdSec authoritative startup synchronization and decision
+lifecycle. Keep CrowdSec changes inside the existing serialized writer and durable
+revision boundaries.
 
-Static source-backed nftables policy is complete. CrowdSec, iptables/ipset,
-coexistence, and operational/release integrations retain their remaining
-acceptance criteria; do not bypass ownership or transaction boundaries.
+Static source-backed policy is complete for nftables and iptables/ipset.
+CrowdSec, Docker/coexistence, and operational/release integrations retain their
+remaining acceptance criteria; do not bypass ownership or transaction boundaries.
 
 Track subsequent milestones as issues with acceptance criteria drawn from the
 existing docs. Update the docs when implementation exposes a concrete

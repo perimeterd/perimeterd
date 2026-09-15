@@ -67,12 +67,16 @@ func TestE2EAppHelper(t *testing.T) {
 		}
 		return nil
 	}
-	backend := firewall.Backend(firewall.NewNFT())
-	if os.Getenv(e2eFailApply) == "1" {
-		backend = &failAfterApplyBackend{Backend: backend, armed: &armed}
+	var backend firewall.Backend
+	if os.Getenv("PERIMETERD_E2E_BACKEND") == "iptables" {
+		// Let app.Run bind its family-progress callback to the native router.
+		// A nil injected backend selects the production default (NewNative).
+	} else {
+		backend = firewall.NewNFT()
 	}
 	startupTimeout := 30 * time.Second
 	if os.Getenv(e2eFailApply) == "1" {
+		backend = &failAfterApplyBackend{Backend: backend, armed: &armed}
 		startupTimeout = 5 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), startupTimeout)

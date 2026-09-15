@@ -249,6 +249,11 @@ func mustUDPAddr(t *testing.T, network, address string) *net.UDPAddr {
 
 func probeIngress(t *testing.T, peer *peerNamespace, network, hostAddress, expectation string, protocol string) {
 	t.Helper()
+	probeIngressAddresses(t, peer, network, hostAddress, hostAddress, expectation, protocol)
+}
+
+func probeIngressAddresses(t *testing.T, peer *peerNamespace, network, hostAddress, dialAddress, expectation, protocol string) {
+	t.Helper()
 	var listener net.Listener
 	if protocol == "tcp" {
 		var err error
@@ -266,7 +271,7 @@ func probeIngress(t *testing.T, peer *peerNamespace, network, hostAddress, expec
 		defer func() { _ = udp.Close() }()
 		go echoUDP(udp)
 	}
-	cmd := peer.helper(t, "dial-"+protocol, network, hostAddress, expectation)
+	cmd := peer.helper(t, "dial-"+protocol, network, dialAddress, expectation)
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output

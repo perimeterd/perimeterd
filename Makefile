@@ -59,7 +59,7 @@ build:
 	$(GO) build -trimpath -ldflags "$$LDFLAGS" -o "$(BINARY)" ./cmd/perimeterd
 
 test-e2e: build
-	@for tool in nft ip unshare nsenter; do \
+	@for tool in nft ip ipset unshare nsenter iptables-nft ip6tables-nft iptables-legacy ip6tables-legacy; do \
 		command -v "$$tool" >/dev/null 2>&1 || { \
 			printf 'test-e2e requires %s in PATH\n' "$$tool" >&2; exit 1; \
 		}; \

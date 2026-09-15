@@ -75,6 +75,13 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 func (b *boundedBuffer) Bytes() []byte  { return b.buffer.Bytes() }
 func (b *boundedBuffer) String() string { return b.buffer.String() }
 
+func validateNFTTarget(target *Target) error {
+	if target != nil && target.IPTables != nil {
+		return errors.New("nft backend: iptables target is not supported")
+	}
+	return ValidateTarget(target)
+}
+
 // validateNFTCapacity bounds the complete recoverable state, not just an
 // incremental switch. Native JSON adds handles, counter values and whitespace;
 // allow twice the encoded full installation plus 1 KiB per object for that
@@ -86,6 +93,9 @@ func validateNFTCapacity(targets ...*Target) error {
 	for _, target := range targets {
 		if target == nil {
 			continue
+		}
+		if err := validateNFTTarget(target); err != nil {
+			return err
 		}
 		batch, err := commandBatch(target, nil, nil)
 		if err != nil {
@@ -595,7 +605,7 @@ func (n *NFT) applyBatch(ctx context.Context, batch nftBatch) error {
 // validated.
 func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 	for _, target := range []*Target{previous, candidate} {
-		if err := ValidateTarget(target); err != nil {
+		if err := validateNFTTarget(target); err != nil {
 			return err
 		}
 	}
@@ -720,7 +730,7 @@ func (n *NFT) Cleanup(ctx context.Context, targets []*Target) error {
 		if target == nil {
 			continue
 		}
-		if err := ValidateTarget(target); err != nil {
+		if err := validateNFTTarget(target); err != nil {
 			return err
 		}
 		byTable[target.Table] = append(byTable[target.Table], target)

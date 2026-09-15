@@ -57,9 +57,6 @@ func normalizeOptions(opts Options) Options {
 	if opts.Stderr == nil {
 		opts.Stderr = os.Stderr
 	}
-	if opts.Backend == nil {
-		opts.Backend = firewall.NewNFT()
-	}
 	if opts.StartupTimeout <= 0 || opts.StartupTimeout > defaultStartupTimeout {
 		opts.StartupTimeout = defaultStartupTimeout
 	}

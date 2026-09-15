@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -392,5 +393,97 @@ func TestReadRejectsManifestWithoutOwningRevision(t *testing.T) {
 	}
 	if _, err := store.Read(); err == nil {
 		t.Fatal("recovery admitted a manifest reference without its owning revision")
+	}
+}
+
+func iptablesStoreRevision(t *testing.T, store *Store, id, block string) *Revision {
+	t.Helper()
+	cfg := storeTestConfig(t)
+	cfg.Firewall.Backend = "iptables"
+	cfg.Global.Blocklist = []netip.Prefix{netip.MustParsePrefix(block)}
+	model, err := policy.Compile(cfg, policy.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := firewall.BuildTarget(store.Owner(), id, cfg, model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Revision{Version: 1, ID: id, Epoch: 1, ConfigPath: "/missing.yaml", Config: cfg, Target: target}
+}
+
+func TestFamilyProgressSurvivesRestartWithoutCommittingCandidate(t *testing.T) {
+	store, dir := openTestStore(t, nil)
+	previous := iptablesStoreRevision(t, store, strings.Repeat("1", 32), "8.8.8.0/24")
+	if err := store.Prepare(nil, previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(previous); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	candidate := iptablesStoreRevision(t, store, strings.Repeat("2", 32), "9.9.9.0/24")
+	if err := store.Prepare(previous, candidate); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordFamilySelection(policy.IPv4, candidate.Target.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordFamilySelection(policy.IPv6, previous.Target.Generation); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Active == nil || view.Active.ID != previous.ID || view.Journal == nil {
+		t.Fatal("partial family selection replaced durable commit authority")
+	}
+	selections := make(map[policy.Family]string)
+	for _, selection := range view.Journal.FamilySelections {
+		selections[selection.Family] = selection.Generation
+	}
+	if selections[policy.IPv4] != candidate.Target.Generation || selections[policy.IPv6] != previous.Target.Generation {
+		t.Fatalf("mixed-family progress lost on restart: %v", selections)
+	}
+	if err := reopened.RecordFamilySelection(policy.IPv4, previous.Target.Generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.RecordFamilySelection(policy.IPv6, strings.Repeat("f", 32)); err == nil {
+		t.Fatal("unrecorded generation admitted as recovery authority")
+	}
+	view, err = reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, selection := range view.Journal.FamilySelections {
+		if selection.Generation != previous.Target.Generation {
+			t.Fatalf("compensation progress was not preserved: %+v", selection)
+		}
+	}
+}
+
+func TestReadRejectsUnrecordedFamilySelection(t *testing.T) {
+	store, dir := openTestStore(t, nil)
+	candidate := iptablesStoreRevision(t, store, strings.Repeat("1", 32), "8.8.8.0/24")
+	if err := store.Prepare(nil, candidate); err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Journal.FamilySelections = []FamilySelection{{Family: policy.IPv4, Generation: strings.Repeat("f", 32)}}
+	if err := store.publish("journal", filepath.Join(dir, "journal.json"), view.Journal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Read(); err == nil {
+		t.Fatal("recovery accepted an unrecorded selected generation")
 	}
 }

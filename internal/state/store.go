@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 )
 
@@ -166,6 +168,11 @@ func (s *Store) read() (View, error) {
 		if journal.Operation == "apply" && journal.Previous != "" && view.Active == nil {
 			return View{}, errors.New("state: apply journal has previous revision but active record is absent")
 		}
+		for _, selection := range journal.FamilySelections {
+			if !recordedFamilySelection(view, selection) {
+				return View{}, errors.New("state: family selection names an unrecorded generation")
+			}
+		}
 		if journal.Operation == "apply" && view.Active != nil && view.Active.ID != journal.Previous && view.Active.ID != journal.Candidate {
 			return View{}, errors.New("state: active record does not match apply journal")
 		}
@@ -239,6 +246,60 @@ func (s *Store) MarkPhase(phase string) error {
 	journal := *view.Journal
 	journal.Phase = phase
 	return s.publish("journal", filepath.Join(s.dir, "journal.json"), journal)
+}
+
+// RecordFamilySelection durably records actual kernel selection without changing
+// commit authority. The writer calls it after each native family commit.
+func (s *Store) RecordFamilySelection(family policy.Family, generation string) error {
+	view, err := s.read()
+	if err != nil {
+		return err
+	}
+	if view.Journal == nil {
+		return errors.New("state: family commit has no prepared journal")
+	}
+	selection := FamilySelection{Family: family, Generation: generation}
+	if !recordedFamilySelection(view, selection) {
+		return errors.New("state: family commit names an unrecorded generation")
+	}
+	journal := *view.Journal
+	journal.FamilySelections = append([]FamilySelection(nil), journal.FamilySelections...)
+	replaced := false
+	for i := range journal.FamilySelections {
+		if journal.FamilySelections[i].Family == family {
+			journal.FamilySelections[i] = selection
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		journal.FamilySelections = append(journal.FamilySelections, selection)
+	}
+	sort.Slice(journal.FamilySelections, func(i, j int) bool {
+		return journal.FamilySelections[i].Family < journal.FamilySelections[j].Family
+	})
+	return s.publish("journal", filepath.Join(s.dir, "journal.json"), journal)
+}
+
+func recordedFamilySelection(view View, selection FamilySelection) bool {
+	if selection.Family != policy.IPv4 && selection.Family != policy.IPv6 {
+		return false
+	}
+	if selection.Generation == "" {
+		return true
+	}
+	for _, id := range view.Journal.Revisions {
+		target := view.Revisions[id].Target
+		if target == nil || target.IPTables == nil || target.Generation != selection.Generation {
+			continue
+		}
+		for _, family := range target.Families {
+			if family.Family == selection.Family {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Commit durably publishes candidate as the authoritative active revision.

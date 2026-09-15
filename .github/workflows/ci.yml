@@ -75,7 +75,7 @@ jobs:
         run: make build
 
   e2e:
-    name: privileged nftables E2E
+    name: privileged firewall E2E
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -90,6 +90,11 @@ jobs:
       - name: Install namespace test prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes nftables iproute2
+          sudo apt-get install --yes nftables iproute2 iptables ipset
+          sudo modprobe ip_set_hash_net
+          sudo modprobe ip_set_hash_ip
+          sudo modprobe xt_set
+          sudo modprobe iptable_filter
+          sudo modprobe ip6table_filter
       - name: Run isolated kernel E2E
         run: E2E_SUDO=sudo make test-e2e

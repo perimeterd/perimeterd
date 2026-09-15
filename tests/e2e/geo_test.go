@@ -81,7 +81,13 @@ const asnFixtureBody = `{"version":"1.2","data_call_name":"announced-prefixes","
 
 func writeGeoConfig(t *testing.T, path, table string) {
 	t.Helper()
-	config := fmt.Sprintf(`version: 1
+	if err := os.WriteFile(path, []byte(geoConfigYAML(table)), 0o600); err != nil {
+		t.Fatalf("write geo config: %v", err)
+	}
+}
+
+func geoConfigYAML(table string) string {
+	return fmt.Sprintf(`version: 1
 logging:
   level: error
   format: text
@@ -173,9 +179,6 @@ policies:
 crowdsec:
   enabled: false
 `, table, strings.Repeat("a", 200), strings.Repeat("a", 199)+"b")
-	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
-		t.Fatalf("write geo config: %v", err)
-	}
 }
 
 func TestE2EGeo(t *testing.T) {
@@ -228,6 +231,11 @@ func TestE2EGeo(t *testing.T) {
 	if !fixture.country.Load() || !fixture.asn.Load() {
 		t.Fatalf("source fixture did not receive country and ASN requests: country=%t asn=%t", fixture.country.Load(), fixture.asn.Load())
 	}
+	exerciseGeoPackets(t, peer, fixture)
+}
+
+func exerciseGeoPackets(t *testing.T, peer *peerNamespace, fixture *geoFixtureTransport) {
+	t.Helper()
 
 	// Country and group policies share a fixture prefix but have disjoint
 	// transport scopes. RIR and ASN exercise egress with the opposite actions.

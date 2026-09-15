@@ -39,15 +39,23 @@ type Revision struct {
 
 // Journal describes an in-flight apply or explicit cleanup operation.
 type Journal struct {
-	Version           int      `json:"version"`
-	ID                string   `json:"id"`
-	Operation         string   `json:"operation"`
-	Phase             string   `json:"phase"`
-	Previous          string   `json:"previous"`
-	Candidate         string   `json:"candidate"`
-	PreviousManifest  string   `json:"previous_manifest,omitempty"`
-	CandidateManifest string   `json:"candidate_manifest,omitempty"`
-	Revisions         []string `json:"revisions"`
+	Version           int               `json:"version"`
+	ID                string            `json:"id"`
+	Operation         string            `json:"operation"`
+	Phase             string            `json:"phase"`
+	Previous          string            `json:"previous"`
+	Candidate         string            `json:"candidate"`
+	PreviousManifest  string            `json:"previous_manifest,omitempty"`
+	CandidateManifest string            `json:"candidate_manifest,omitempty"`
+	Revisions         []string          `json:"revisions"`
+	FamilySelections  []FamilySelection `json:"family_selections,omitempty"`
+}
+
+// FamilySelection records the observed iptables selection after one atomic
+// family commit. Empty Generation records an unhooked family.
+type FamilySelection struct {
+	Family     policy.Family `json:"family"`
+	Generation string        `json:"generation"`
 }
 
 // View is a consistent snapshot of all durable records referenced by active or journal state.
@@ -132,7 +140,14 @@ func (s *Store) validateRevision(revision *Revision) error {
 	if revision.Target.Owner != s.owner {
 		return fmt.Errorf("state: revision %s target owner mismatch", revision.ID)
 	}
-	if revision.Target.Table != revision.Config.Firewall.Nftables.Table || revision.Target.Priority != revision.Config.Firewall.Nftables.Priority {
+	if revision.Target.Backend() != revision.Config.Firewall.Backend {
+		return fmt.Errorf("state: revision %s target/backend mismatch", revision.ID)
+	}
+	if revision.Target.IPTables != nil {
+		if !reflect.DeepEqual(revision.Target.IPTables.Attachments, revision.Config.Firewall.IPTables.Attachments) {
+			return fmt.Errorf("state: revision %s attachment/config mismatch", revision.ID)
+		}
+	} else if revision.Target.Table != revision.Config.Firewall.Nftables.Table || revision.Target.Priority != revision.Config.Firewall.Nftables.Priority {
 		return fmt.Errorf("state: revision %s target/config mismatch", revision.ID)
 	}
 	if !reflect.DeepEqual(revision.Target.Families, compiled.Families()) {
@@ -331,6 +346,21 @@ func validateJournal(journal *Journal) error {
 		}
 		if err := validateCacheManifestID(reference.manifest); err != nil {
 			return fmt.Errorf("state: journal manifest: %w", err)
+		}
+	}
+	seenFamilies := make(map[policy.Family]struct{}, len(journal.FamilySelections))
+	for _, selection := range journal.FamilySelections {
+		if selection.Family != policy.IPv4 && selection.Family != policy.IPv6 {
+			return errors.New("state: journal contains an invalid family selection")
+		}
+		if _, duplicate := seenFamilies[selection.Family]; duplicate {
+			return errors.New("state: journal repeats a family selection")
+		}
+		seenFamilies[selection.Family] = struct{}{}
+		if selection.Generation != "" {
+			if err := validateID(selection.Generation, "selected generation"); err != nil {
+				return err
+			}
 		}
 	}
 	seen := make(map[string]struct{}, len(journal.Revisions))

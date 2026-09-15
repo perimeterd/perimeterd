@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
@@ -49,6 +50,18 @@ type Engine struct {
 // admissions; health is therefore initially false.
 func NewEngine(store *state.Store, backend firewall.Backend, checkpoint func(string) error) *Engine {
 	engine := &Engine{store: store, backend: backend, checkpoint: checkpoint}
+	if backend == nil {
+		engine.backend = firewall.NewNative(func(family policy.Family, generation string) error {
+			if err := store.RecordFamilySelection(family, generation); err != nil {
+				return err
+			}
+			token := "v4"
+			if family == policy.IPv6 {
+				token = "v6"
+			}
+			return engine.check("iptables-after-switch-" + token)
+		})
+	}
 	return engine
 }
 

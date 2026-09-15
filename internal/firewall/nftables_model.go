@@ -43,7 +43,14 @@ func BuildTarget(owner, id string, cfg config.Config, model policy.State, previo
 		Owner: owner, Table: cfg.Firewall.Nftables.Table, Priority: cfg.Firewall.Nftables.Priority,
 		Generation: id, Families: families,
 	}
-	if previous != nil && previous.Owner == candidate.Owner && previous.Table == candidate.Table && sameFamilies(previous.Families, candidate.Families) {
+	if cfg.Firewall.Backend == "iptables" {
+		candidate.Table = "filter"
+		candidate.Priority = 0
+		candidate.IPTables = &IPTablesTarget{Attachments: cloneIPTablesAttachments(cfg.Firewall.IPTables.Attachments)}
+	}
+	if previous != nil && previous.Owner == candidate.Owner && previous.Backend() == candidate.Backend() &&
+		previous.Table == candidate.Table && sameFamilies(previous.Families, candidate.Families) &&
+		reflect.DeepEqual(previous.IPTables, candidate.IPTables) {
 		candidate.Generation = previous.Generation
 	}
 	candidate.Counters = desiredCounters(candidate, previous)
@@ -51,6 +58,19 @@ func BuildTarget(owner, id string, cfg config.Config, model policy.State, previo
 		return nil, err
 	}
 	return candidate, nil
+}
+
+func cloneIPTablesAttachments(values []config.Attachment) []config.Attachment {
+	if values == nil {
+		return nil
+	}
+	out := make([]config.Attachment, len(values))
+	for i, value := range values {
+		out[i] = value
+		out[i].InputInterfaces = append([]string(nil), value.InputInterfaces...)
+		out[i].OutputInterfaces = append([]string(nil), value.OutputInterfaces...)
+	}
+	return out
 }
 
 func cloneFamilies(values []policy.FamilyPlan) []policy.FamilyPlan {
@@ -111,7 +131,7 @@ func desiredCounters(target *Target, previous *Target) []CounterSpec {
 			}
 		}
 	}
-	if previous != nil && previous.Table == target.Table {
+	if previous != nil && previous.Backend() == target.Backend() && previous.Table == target.Table {
 		for _, counter := range previous.Counters {
 			if validRole(counter.Role) && validFamily(counter.Family) && validDirection(counter.Direction) &&
 				counter.Name == counterName(target.Owner, counter.Family, counter.Direction, counter.Role) {

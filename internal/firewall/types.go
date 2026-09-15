@@ -21,7 +21,7 @@ type CounterSpec struct {
 	Role      policy.CounterRole `json:"role"`
 }
 
-// Target is an immutable, serializable desired nftables state. It contains the
+// Target is an immutable, serializable desired firewall state. It contains the
 // complete model required to recover after a process or host restart.
 type Target struct {
 	Owner      string              `json:"owner"`
@@ -30,7 +30,29 @@ type Target struct {
 	Generation string              `json:"generation"`
 	Families   []policy.FamilyPlan `json:"families"`
 	Counters   []CounterSpec       `json:"counters"`
+	IPTables   *IPTablesTarget     `json:"iptables,omitempty"`
 }
+
+// IPTablesTarget records the owned integration boundary. Its presence selects
+// iptables; the absent branch is the existing nftables target representation.
+type IPTablesTarget struct {
+	Attachments []config.Attachment `json:"attachments"`
+}
+
+// Backend identifies the native implementation for this persisted target.
+func (t *Target) Backend() string {
+	if t == nil {
+		return ""
+	}
+	if t.IPTables != nil {
+		return "iptables"
+	}
+	return "nftables"
+}
+
+// FamilyProgress records an actual iptables family selection after a commit.
+// An empty generation means the family has no owned attachment selection.
+type FamilyProgress func(policy.Family, string) error
 
 // Backend applies and retires complete desired firewall targets. Every pair is
 // (previous, candidate); a nil candidate is the canonical unhook operation.
@@ -102,14 +124,14 @@ func validTrafficScope(scope policy.Scope) bool {
 	return true
 }
 
-// ValidateConfig validates the implemented static nftables runtime. Offline
-// validation also accepts integrations that are not yet available here.
+// ValidateConfig validates the implemented static runtime. Offline validation
+// also accepts integrations that are not yet available here.
 func ValidateConfig(value config.Config) error {
 	if value.Version != 1 {
 		return fmt.Errorf("firewall runtime: unsupported config version %d", value.Version)
 	}
-	if value.Firewall.Backend != "nftables" {
-		return fmt.Errorf("firewall runtime: backend %q is unsupported; only nftables is available", value.Firewall.Backend)
+	if value.Firewall.Backend != "nftables" && value.Firewall.Backend != "iptables" {
+		return fmt.Errorf("firewall runtime: unsupported backend %q", value.Firewall.Backend)
 	}
 	if value.CrowdSec.Enabled {
 		return fmt.Errorf("firewall runtime: crowdsec is not supported")
@@ -157,6 +179,14 @@ func ValidateTarget(value *Target) error {
 	if value.Priority <= -200 {
 		return fmt.Errorf("firewall target: priority %d must be greater than -200", value.Priority)
 	}
+	if value.IPTables != nil {
+		if value.Table != "filter" || value.Priority != 0 {
+			return fmt.Errorf("firewall target: iptables target must use filter table and zero native priority")
+		}
+		if err := validateIPTablesTarget(value); err != nil {
+			return err
+		}
+	}
 	if len(value.Families) == 0 {
 		return fmt.Errorf("firewall target: non-empty target requires at least one family")
 	}
@@ -180,14 +210,16 @@ func ValidateTarget(value *Target) error {
 				return fmt.Errorf("firewall target: duplicate set %q", set.ID)
 			}
 			setIDs[set.ID] = struct{}{}
-			nativeName := setName(value, family.Family, set.ID)
-			if !validNFTName(nativeName) {
-				return fmt.Errorf("firewall target: set %q has invalid native name", set.ID)
+			if value.IPTables == nil {
+				nativeName := setName(value, family.Family, set.ID)
+				if !validNFTName(nativeName) {
+					return fmt.Errorf("firewall target: set %q has invalid native name", set.ID)
+				}
+				if previous, exists := nativeSets[nativeName]; exists {
+					return fmt.Errorf("firewall target: sets %q and %q collide as native name %q", previous, set.ID, nativeName)
+				}
+				nativeSets[nativeName] = set.ID
 			}
-			if previous, exists := nativeSets[nativeName]; exists {
-				return fmt.Errorf("firewall target: sets %q and %q collide as native name %q", previous, set.ID, nativeName)
-			}
-			nativeSets[nativeName] = set.ID
 			for _, prefix := range set.Prefixes {
 				if err := validatePrefix(prefix, family.Family); err != nil {
 					return fmt.Errorf("firewall target: set %s: %w", set.ID, err)

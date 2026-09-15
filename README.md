@@ -13,12 +13,12 @@ Manage it through one YAML configuration, while your existing firewall stays in
 charge of services and ports. Focused protection, without another full firewall
 stack to manage.
 
-> **Status: static source-backed nftables runtime.** Offline validation, the pure
-> policy compiler, direct IP/CIDR rules, and RIPEstat country/RIR/group/ASN policies
-> are implemented, with immutable source caching, scheduled refresh, durable
-> recovery, and isolated packet-path tests. CrowdSec, iptables/ipset, packages,
-> and production releases remain planned. This is not yet a production-ready
-> security control.
+> **Status: static source-backed nftables and iptables/ipset runtime.** Offline
+> validation, the pure policy compiler, direct IP/CIDR rules, and RIPEstat
+> country/RIR/group/ASN policies are implemented, with immutable source caching,
+> scheduled refresh, durable recovery, backend migration, and isolated packet-path
+> tests. CrowdSec, Docker integration, packages, and production releases remain
+> planned. This is not yet a production-ready security control.
 
 The [implementation plan](docs/implementation-plan.md) is the authoritative
 record of completed milestones and remaining work.
@@ -35,7 +35,7 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 
 Validation requires neither root nor network access. It checks local syntax and
 semantics, not source availability or kernel enforcement. Root-only `run` and
-`cleanup` are available for the [current nftables slice](docs/operations.md#current-source-build-runtime).
+`cleanup` are available for the [current runtime](docs/operations.md#current-source-build-runtime).
 Try enforcement only in a disposable VM or isolated network namespace. See
 [development](docs/development.md#local-commands) for verification commands.
 

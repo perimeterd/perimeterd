@@ -11,15 +11,28 @@ requirements later in this document are the version-1 deployment contract.
 
 ## Current source-build runtime
 
-The implemented runtime supports `firewall.backend: nftables`, direct
-`global.allowlist`/`global.blocklist` IPs and CIDRs, and static geo allowlist or
+The implemented runtime supports `firewall.backend: nftables` and `iptables`,
+direct `global.allowlist`/`global.blocklist` IPs and CIDRs, and static geo allowlist or
 blocklist policies backed by RIPEstat countries and ASNs. RIRs and built-in/custom
 groups expand locally into country queries. Ingress/egress scopes, exclusions,
 policy priority, and IPv4/IPv6 family-empty behavior use the same policy compiler.
-CrowdSec must remain disabled; the iptables/ipset backend is not implemented.
+CrowdSec must remain disabled.
 Offline `validate` still checks the full configuration contract without fetching
 data, so successful validation does not imply source availability or support for
 a planned runtime integration.
+
+For iptables, install `ipset` and a matched IPv4/IPv6 frontend/save/restore tool
+family, selected through `PATH`. Both legacy and nf_tables variants are supported;
+missing or mixed tools are errors, never a fallback. Keep tool alternatives
+unchanged while owned iptables artifacts remain; switching the compatibility
+variant requires cleanup with the original tools first. Configured custom parent
+chains must already exist. See the [attachment contract](firewall-backends.md#iptables-attachment-contract).
+
+Changing `firewall.backend` on reload stages the replacement before retiring the
+old backend. iptables family switches are separate transactions: a failure can
+expose a mixed-generation window, followed by compensating rollback. Failed
+compensation retains the journal and reports unhealthy enforcement until recovery
+succeeds. A postcommit retirement failure keeps the new revision authoritative.
 
 Use a disposable VM or isolated network namespace, not the development host's
 firewall. A minimal direct-rule configuration is:
@@ -77,18 +90,26 @@ with snapshot age and retried on the normal schedule. Direct-only configurations
 make no source requests.
 
 Encoded state records are limited to 16 MiB and rejected before publication if
-oversized. Native preflight requires each complete target to fit the 8 MiB
+oversized. nftables preflight requires each complete target to fit the 8 MiB
 installation limit and budgets inspection of both retained generations before
-preparing a transaction. The conservative inspection budget is 48 MiB per table,
-with a hard 64 MiB native-output capture limit. Oversized reloads leave the
-committed revision recoverable rather than installing unreadable state.
+preparing a transaction. Its conservative inspection budget is 48 MiB per table.
+iptables and ipset command input is conservatively budgeted at 16 MiB per batch;
+preflight also reserves inspection capacity for retained generations and the full
+iptables rule inventories within a 48 MiB budget. `ipset` contents are queried only
+for exact recorded/candidate names, so unrelated foreign set data does not enter
+that budget. Both backends capture at most 64 MiB of native output per command;
+the total captured content of selected ipsets has the same limit. Oversized
+reloads leave the committed revision recoverable rather than installing
+unreadable state.
 
 When configured, `/metrics` exposes `perimeterd_enforcement_health` and, for an
 active source-backed revision,
 `perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The timestamp
 is the oldest required selector's retrieval time, not manifest publication time.
-Named kernel packet/byte counters remain in nftables. The full metric suite,
-installed systemd unit, packages, and release gates below remain planned.
+Kernel packet/byte counters remain available through nftables named counters or
+iptables ownership-tagged rules; unchanged iptables processed rules retain their
+counters across generation switches. The full metric suite, installed systemd
+unit, packages, and release gates below remain planned.
 Startup sends bounded systemd timeout extensions and `READY=1` only after
 reconciliation, durable commit, and required recovery complete.
 The metrics server bounds complete request reads and response writes to ten

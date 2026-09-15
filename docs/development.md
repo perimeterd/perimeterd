@@ -18,11 +18,11 @@ internal/config/              YAML schema, defaults and strict validation
 internal/config/catalog/      checked-in selector catalogs
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/prefix/              prefix normalization and set algebra
-internal/firewall/            typed targets, nft JSON execution and reconciliation
+internal/firewall/            typed targets, native backend routing and reconciliation
 internal/source/              RIPEstat resolution, immutable cache and captured HTTP fixtures
 internal/state/               revision store, record codec/validation and durable filesystem IO
 configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
-.github/workflows/ci.yml      quality, build, unit/race and native nftables gates
+.github/workflows/ci.yml      quality, build, unit/race and native firewall gates
 .github/workflows/codeql.yml  Go security analysis
 tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
 docs/                         design contracts, current operations and implementation plan
@@ -43,11 +43,12 @@ new package APIs:
 - `tests/e2e/network_test.go`: peer networking and packet probes.
 - `tests/e2e/daemon_test.go`: daemon lifecycle, readiness and configuration fixtures.
 - `tests/e2e/nftables_test.go`: native inventory and ownership assertions.
+- `tests/e2e/iptables_test.go`: both tool families, compensation, migration and attachment behavior.
 - `tests/e2e/crash_test.go`: test-only application failure injection.
 
 ### Planned additions
 
-CrowdSec, iptables/ipset, expanded observability, installed systemd/tmpfiles
+CrowdSec, Docker integration, expanded observability, installed systemd/tmpfiles
 payloads, package lifecycle scripts, and GoReleaser/release workflows belong to
 later milestones. Their eventual
 package layout should follow the real integration boundaries; these directories
@@ -77,7 +78,7 @@ family-empty behavior follows
 The immutable result exposes owned inspection copies through `State.Families`:
 family-specific sets, ordered ingress/egress rules, dynamic CrowdSec references,
 and bounded accounting roles. `Return` means return to the parent firewall path,
-not accept; `Reject` is lowered by the nftables backend to the documented
+not accept; `Reject` is lowered by each backend to the documented
 family/protocol-specific response. `State.Empty` identifies the canonical
 no-artifacts state. The packet interpreter remains test-only.
 
@@ -114,8 +115,13 @@ make test-e2e
 make test-e2e E2E_SUDO=sudo
 ```
 
-The harness requires Linux, `nft`, `ip`, `unshare`, and `nsenter`. It creates
-disposable mount, network, and PID namespaces, verifies isolation before mutation,
+The harness requires Linux, `nft`, `ip`, `ipset`, `unshare`, `nsenter`, and both
+legacy and nf_tables iptables/ip6tables frontend, save, and restore binaries.
+Install `iptables` and `ipset` on Debian-family systems; Fedora provides the
+variants in `iptables-nft` and `iptables-legacy`. The host kernel must support
+`hash:net`, `hash:ip`, xtables set matches, and IPv4/IPv6 filter and NAT tables.
+Load the required modules before using an unprivileged user namespace.
+It creates disposable mount, network, and PID namespaces, verifies isolation before mutation,
 and mounts private runtime/state directories. Unprivileged callers also create a
 user namespace to obtain namespace root. Root callers (including CI with `sudo`)
 retain their existing user namespace so they can execute binaries beneath private
@@ -177,7 +183,7 @@ commit SHAs and refresh their human-readable release comments.
 ## Version 1 verification and delivery requirements
 
 The remaining sections specify the complete first-release contract, including
-CrowdSec, iptables/ipset, Docker, packaging and systemd-VM work that is not
+CrowdSec, Docker, packaging and systemd-VM work that is not
 implemented yet. The [local commands](#local-commands) describe what can run now;
 the [implementation plan](implementation-plan.md) tracks progress.
 
@@ -297,15 +303,18 @@ than one layer when the real boundary matters.
 ## Privileged end-to-end suite
 
 The current `tests/e2e/` suite exercises direct-global and source-backed geo
-nftables policy in disposable Linux namespaces, including country/RIR/group/ASN
-selectors, exclusions, priority, family-empty behavior, and retained policy after
-source failure. Its prerequisites are described under
-[local commands](#local-commands). Unit/integration source tests use local HTTP
-servers and checked-in official RIPEstat responses with provenance metadata.
+policy on nftables and both iptables tool families in disposable Linux namespaces.
+The shared packet matrix covers country/RIR/group/ASN selectors, exclusions,
+priority, family-empty behavior, and retained policy after source failure.
+The iptables suite additionally verifies per-family compensation, crash recovery,
+backend migration, custom attachment/interface matching, original-destination
+ports, and preservation of foreign chains, rules, and ipsets.
+Prerequisites are described under [local commands](#local-commands).
+Unit/integration source tests use local HTTP servers and checked-in official
+RIPEstat responses with provenance metadata.
 
-The version-1 suite must expand that foundation with CrowdSec fixtures and
-iptables/ipset coverage, with IPv4/IPv6 scenarios where applicable. The matrix
-above defines those acceptance requirements.
+The version-1 suite must expand that coverage with CrowdSec and Docker scenarios.
+The matrix above defines those acceptance requirements.
 
 The planned separate Docker job must execute the [Docker coexistence row](#kernel-backend-and-coexistence).
 The planned CrowdSec compatibility job must use a pinned real supported LAPI
@@ -325,10 +334,11 @@ Current gates cover:
 - format, lint, spelling/import policy, module verification, vulnerability
   analysis, and CodeQL;
 - Linux builds, shuffled unit tests, race tests, and a coverage artifact;
-- the isolated native nftables E2E suite.
+- the isolated native nftables and iptables/ipset E2E suite, including both
+  legacy and nf_tables compatibility variants.
 
-Before version 1, CI must also implement the matrix's privileged iptables/ipset,
-Docker, pinned CrowdSec compatibility, package installation/upgrade, and
+Before version 1, CI must also implement the matrix's Docker, pinned CrowdSec
+compatibility, package installation/upgrade, and
 systemd-VM gates. Listing them as requirements does not mean those jobs exist.
 
 Workflow permissions default to read-only and are elevated per job only when a

@@ -311,6 +311,33 @@ output. `iptables-save` has no lock-wait option, so perimeterd serializes reads
 with its own `iptables-restore --wait` operations through the writer. Restore's
 `--wait` participates in the global xtables lock, which is why the systemd
 service remains UID 0; see [operations](operations.md).
+`ipset` existence checks use a bounded name-only census and exact comparisons with
+the generated 31-byte identifiers. Set contents are then queried individually by
+recorded or candidate name. Global `ipset save` is not used as a foreign-object
+inventory: names may contain unquoted spaces or newlines. A newline-containing
+foreign name cannot forge a complete generated identifier because the kernel's
+31-byte name limit leaves no room for additional characters.
+Each exact set also has a terse XML header queried with `ipset list NAME -output
+xml -terse`. Its kernel reference count must equal the references accounted for
+by recorded rules in the inspected inventory. This detects foreign `list:set`
+membership and references from the other xtables implementation without parsing
+unrelated set contents. Missing or ambiguous reference metadata, query failures,
+and count mismatches reject the operation before staging, unhooking, or deletion.
+Quoted comments may span physical lines in native save output. Inspection
+preserves them as single logical records rather than interpreting their contents
+as additional rules or table directives.
+Each protocol retains its own quoting rules: iptables uses backslash escapes,
+whereas ipset emits backslashes and apostrophes literally inside double-quoted
+comments. An ipset comment's trailing backslash must not hide the closing quote
+or consume subsequent set definitions.
+Rule inspection retains whether tokens were quoted or escaped and consumes known
+option operands as data, even when they spell flags such as `-j`. It checks all
+ownership comments and chain/set references rather than taking the first apparent
+option. Unknown extension arities are inspected conservatively so ambiguous
+operands cannot hide a foreign reference.
+Full iptables rule inventories are still inspected, so foreign references into
+recorded chains or sets remain errors. Exact candidate-name collisions are also
+rejected rather than adopted.
 
 ## iptables attachment contract
 
@@ -465,3 +492,6 @@ migration targets. It removes tagged parent jumps before owned child objects,
 attempts cleanup for both supported backends and prior targets, and finishes
 committed retirement. It never derives cleanup scope from current YAML or
 broadens ownership because an expected object is missing.
+Already-absent custom parents do not prevent removal of remaining recorded
+ownership, including retirement during migration or a transition to empty policy.
+Parent existence is still required for attachments in the desired policy.
