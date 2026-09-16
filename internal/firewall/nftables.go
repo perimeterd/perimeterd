@@ -7,10 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/policy"
@@ -35,45 +33,8 @@ type NFT struct {
 func NewNFT() *NFT { return &NFT{exec: nativeNFTExecutor} }
 
 func nativeNFTExecutor(ctx context.Context, args []string, input []byte) ([]byte, error) {
-	if len(input) > maxNFTInput {
-		return nil, fmt.Errorf("nft input exceeds %d bytes", maxNFTInput)
-	}
-	// #nosec G204 -- executable is fixed to nft; configured identifiers are marshaled as JSON, never raw nft DSL.
-	cmd := exec.CommandContext(ctx, "nft", args...)
-	cmd.Stdin = bytes.NewReader(input)
-	var stdout, stderr boundedBuffer
-	stdout.limit, stderr.limit = maxNFTOutput, maxNFTOutput
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		message := strings.TrimSpace(stderr.String())
-		if message != "" {
-			return nil, fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, message)
-		}
-		return nil, fmt.Errorf("nft %s: %w", strings.Join(args, " "), err)
-	}
-	return stdout.Bytes(), nil
+	return executeNative(ctx, "nft", args, input, maxNFTInput, maxNFTOutput)
 }
-
-type boundedBuffer struct {
-	buffer bytes.Buffer
-	limit  int
-}
-
-func (b *boundedBuffer) Write(value []byte) (int, error) {
-	if len(value) > b.limit-b.buffer.Len() {
-		return 0, fmt.Errorf("nft output exceeds %d bytes", b.limit)
-	}
-	return b.buffer.Write(value)
-}
-
-// Do not embed bytes.Buffer: its promoted ReadFrom bypasses Write when
-// os/exec copies a pipe through io.Copy.
-func (b *boundedBuffer) Bytes() []byte  { return b.buffer.Bytes() }
-func (b *boundedBuffer) String() string { return b.buffer.String() }
 
 func validateNFTTarget(target *Target) error {
 	if target != nil && target.IPTables != nil {

@@ -19,7 +19,6 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
-	"github.com/perimeterd/perimeterd/internal/prefix"
 )
 
 func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedManifest string, allowStale bool) (Resolution, error) {
@@ -509,11 +508,11 @@ func parseASN(body []byte, endpoint string, params map[string]string, selector p
 			return Record{}, fmt.Errorf("ASN prefix %d has unsupported family", i)
 		}
 	}
-	ipv4, err := normalizePrefixes(v4, true)
+	ipv4, err := normalizeFamily(v4, true)
 	if err != nil {
 		return Record{}, fmt.Errorf("ASN IPv4: %w", err)
 	}
-	ipv6, err := normalizePrefixes(v6, false)
+	ipv6, err := normalizeFamily(v6, false)
 	if err != nil {
 		return Record{}, fmt.Errorf("ASN IPv6: %w", err)
 	}
@@ -532,20 +531,7 @@ func normalizeStrings(values []string, ipv4 bool) ([]netip.Prefix, error) {
 		}
 		prefixes = append(prefixes, parsed)
 	}
-	return normalizePrefixes(prefixes, ipv4)
-}
-
-func normalizePrefixes(values []netip.Prefix, ipv4 bool) ([]netip.Prefix, error) {
-	for i, value := range values {
-		if !value.IsValid() || value.Addr().Is4() != ipv4 {
-			return nil, fmt.Errorf("prefix %d has wrong or invalid address family", i)
-		}
-	}
-	set, err := prefix.New(values)
-	if err != nil {
-		return nil, err
-	}
-	return set.Prefixes(), nil
+	return normalizeFamily(prefixes, ipv4)
 }
 
 func normalizeASN(value string) (string, bool) {

@@ -22,6 +22,16 @@ func TestRunFailsWhenVersionOutputCannotBeDelivered(t *testing.T) {
 	}
 }
 
+func TestRunFailsWhenCommandHelpCannotBeDelivered(t *testing.T) {
+	var stderr bytes.Buffer
+	if code := Run([]string{"run", "--help"}, failingWriter{}, &stderr); code != 2 {
+		t.Fatalf("Run(run --help) exit code = %d, want 2 for an output failure", code)
+	}
+	if got := stderr.String(); !strings.Contains(got, io.ErrClosedPipe.Error()) {
+		t.Fatalf("stderr = %q, want help output write failure", got)
+	}
+}
+
 func TestRunVersion(t *testing.T) {
 	oldVersion, oldCommit, oldBuildTime := Version, Commit, BuildTime
 	t.Cleanup(func() {

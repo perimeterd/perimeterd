@@ -66,27 +66,50 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-func runDaemon(args []string, stdout, stderr io.Writer) int {
-	var parseOutput bytes.Buffer
-	fs := flag.NewFlagSet("perimeterd run", flag.ContinueOnError)
-	fs.SetOutput(&parseOutput)
-	configPath := fs.String("config", defaultConfigPath, "path to the YAML configuration file")
-	fs.Usage = func() {
-		_, _ = parseOutput.WriteString("Usage: perimeterd run [--config PATH]\n")
-		fs.PrintDefaults()
+type commandFlags struct {
+	command string
+	fs      *flag.FlagSet
+	output  bytes.Buffer
+}
+
+func newCommandFlags(command string) *commandFlags {
+	flags := &commandFlags{
+		command: command,
+		fs:      flag.NewFlagSet("perimeterd "+command, flag.ContinueOnError),
 	}
-	if err := fs.Parse(args); err != nil {
+	flags.fs.SetOutput(&flags.output)
+	return flags
+}
+
+// parse handles the common result paths for command flag sets. A handled
+// result includes help, parse errors, and rejected positional arguments.
+func (f *commandFlags) parse(args []string, stdout, stderr io.Writer) (handled bool, exitCode int) {
+	if err := f.fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			if _, copyErr := io.Copy(stdout, &parseOutput); copyErr != nil {
-				return commandError(stderr, fmt.Errorf("write run help output: %w", copyErr))
+			if _, copyErr := io.Copy(stdout, &f.output); copyErr != nil {
+				return true, commandError(stderr, fmt.Errorf("write %s help output: %w", f.command, copyErr))
 			}
-			return 0
+			return true, 0
 		}
-		_, _ = io.Copy(stderr, &parseOutput)
-		return 2
+		// Parsing already failed, and stderr has no fallback stream.
+		_, _ = io.Copy(stderr, &f.output)
+		return true, 2
 	}
-	if fs.NArg() != 0 {
-		return usageError(stderr, fmt.Sprintf("run does not accept positional arguments: %s", strings.Join(fs.Args(), " ")))
+	if f.fs.NArg() != 0 {
+		return true, usageError(stderr, fmt.Sprintf("%s does not accept positional arguments: %s", f.command, strings.Join(f.fs.Args(), " ")))
+	}
+	return false, 0
+}
+
+func runDaemon(args []string, stdout, stderr io.Writer) int {
+	flags := newCommandFlags("run")
+	configPath := flags.fs.String("config", defaultConfigPath, "path to the YAML configuration file")
+	flags.fs.Usage = func() {
+		_, _ = flags.output.WriteString("Usage: perimeterd run [--config PATH]\n")
+		flags.fs.PrintDefaults()
+	}
+	if handled, exitCode := flags.parse(args, stdout, stderr); handled {
+		return exitCode
 	}
 	if err := requireRoot("run"); err != nil {
 		return commandError(stderr, err)
@@ -101,24 +124,12 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 }
 
 func runCleanup(args []string, stdout, stderr io.Writer) int {
-	var parseOutput bytes.Buffer
-	fs := flag.NewFlagSet("perimeterd cleanup", flag.ContinueOnError)
-	fs.SetOutput(&parseOutput)
-	fs.Usage = func() {
-		_, _ = parseOutput.WriteString("Usage: perimeterd cleanup\n")
+	flags := newCommandFlags("cleanup")
+	flags.fs.Usage = func() {
+		_, _ = flags.output.WriteString("Usage: perimeterd cleanup\n")
 	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			if _, copyErr := io.Copy(stdout, &parseOutput); copyErr != nil {
-				return commandError(stderr, fmt.Errorf("write cleanup help output: %w", copyErr))
-			}
-			return 0
-		}
-		_, _ = io.Copy(stderr, &parseOutput)
-		return 2
-	}
-	if fs.NArg() != 0 {
-		return usageError(stderr, fmt.Sprintf("cleanup does not accept positional arguments: %s", strings.Join(fs.Args(), " ")))
+	if handled, exitCode := flags.parse(args, stdout, stderr); handled {
+		return exitCode
 	}
 	if err := requireRoot("cleanup"); err != nil {
 		return commandError(stderr, err)
@@ -137,26 +148,13 @@ func requireRoot(command string) error {
 }
 
 func runVersion(args []string, stdout, stderr io.Writer) int {
-	var parseOutput bytes.Buffer
-	fs := flag.NewFlagSet("perimeterd version", flag.ContinueOnError)
-	fs.SetOutput(&parseOutput)
-	fs.Usage = func() {
+	flags := newCommandFlags("version")
+	flags.fs.Usage = func() {
 		// bytes.Buffer writes cannot fail.
-		_, _ = parseOutput.WriteString("Usage: perimeterd version\n")
+		_, _ = flags.output.WriteString("Usage: perimeterd version\n")
 	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			if _, copyErr := io.Copy(stdout, &parseOutput); copyErr != nil {
-				return commandError(stderr, fmt.Errorf("write version help output: %w", copyErr))
-			}
-			return 0
-		}
-		// Parsing already failed, and stderr has no fallback stream.
-		_, _ = io.Copy(stderr, &parseOutput)
-		return 2
-	}
-	if fs.NArg() != 0 {
-		return usageError(stderr, fmt.Sprintf("version does not accept positional arguments: %s", strings.Join(fs.Args(), " ")))
+	if handled, exitCode := flags.parse(args, stdout, stderr); handled {
+		return exitCode
 	}
 
 	if _, err := fmt.Fprintf(stdout, "version: %s\ncommit: %s\nbuild time: %s\n", Version, Commit, BuildTime); err != nil {
@@ -166,28 +164,15 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 }
 
 func runValidate(args []string, stdout, stderr io.Writer) int {
-	var parseOutput bytes.Buffer
-	fs := flag.NewFlagSet("perimeterd validate", flag.ContinueOnError)
-	fs.SetOutput(&parseOutput)
-	configPath := fs.String("config", defaultConfigPath, "path to the YAML configuration file")
-	fs.Usage = func() {
+	flags := newCommandFlags("validate")
+	configPath := flags.fs.String("config", defaultConfigPath, "path to the YAML configuration file")
+	flags.fs.Usage = func() {
 		// bytes.Buffer writes cannot fail.
-		_, _ = parseOutput.WriteString("Usage: perimeterd validate [--config PATH]\n")
-		fs.PrintDefaults()
+		_, _ = flags.output.WriteString("Usage: perimeterd validate [--config PATH]\n")
+		flags.fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			if _, copyErr := io.Copy(stdout, &parseOutput); copyErr != nil {
-				return commandError(stderr, fmt.Errorf("write validate help output: %w", copyErr))
-			}
-			return 0
-		}
-		// Parsing already failed, and stderr has no fallback stream.
-		_, _ = io.Copy(stderr, &parseOutput)
-		return 2
-	}
-	if fs.NArg() != 0 {
-		return usageError(stderr, fmt.Sprintf("validate does not accept positional arguments: %s", strings.Join(fs.Args(), " ")))
+	if handled, exitCode := flags.parse(args, stdout, stderr); handled {
+		return exitCode
 	}
 
 	if _, err := config.Load(*configPath); err != nil {

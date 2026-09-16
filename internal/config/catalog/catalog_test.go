@@ -100,6 +100,50 @@ func TestCountriesReturnsIndependentCopy(t *testing.T) {
 	}
 }
 
+func TestRIRCountriesReturnsIndependentCopy(t *testing.T) {
+	first := RIRCountries("RIPE")
+	if len(first) == 0 {
+		t.Fatal("RIPE service region is missing or empty")
+	}
+	original := first[0]
+	first[0] = "ZZ"
+
+	second := RIRCountries("RIPE")
+	if len(second) == 0 {
+		t.Fatal("RIPE service region became empty")
+	}
+	if second[0] != original {
+		t.Fatalf("mutating returned RIR countries changed registry: got %q, want %q", second[0], original)
+	}
+	if RIRCountries("not-a-rir") != nil {
+		t.Fatal("unknown RIR returned countries")
+	}
+}
+
+func TestSelectorVocabularyCanonicalBoundaries(t *testing.T) {
+	for _, rir := range []string{"AFRINIC", "APNIC", "ARIN", "LACNIC", "RIPE"} {
+		if !ValidRIR(rir) {
+			t.Errorf("canonical RIR %q was not recognized", rir)
+		}
+	}
+	for _, rir := range []string{"", "ripe", "IANA"} {
+		if ValidRIR(rir) {
+			t.Errorf("non-canonical or unknown RIR %q was recognized", rir)
+		}
+	}
+
+	for _, asn := range []string{"AS0", "AS1", "AS4294967295"} {
+		if !ValidASN(asn) {
+			t.Errorf("canonical ASN %q was not recognized", asn)
+		}
+	}
+	for _, asn := range []string{"", "AS", "as1", "AS01", "AS4294967296", "AS+1", "AS1 "} {
+		if ValidASN(asn) {
+			t.Errorf("non-canonical or out-of-range ASN %q was recognized", asn)
+		}
+	}
+}
+
 func assertGroupMemberships(t *testing.T, tests []struct {
 	name string
 	yes  []string

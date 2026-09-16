@@ -36,12 +36,27 @@ the firewall backend consumes immutable targets and does not fetch source data.
 File boundaries inside a package separate responsibilities without introducing
 new package APIs:
 
+- `internal/app/publication.go`: active logger/listener ownership, staged
+  reservations, source selection, and transaction-gated resource publication.
+- `internal/config/catalog/`: shared country, RIR, and ASN vocabulary; callers
+  retain contextual validation at each trust boundary.
+- `internal/firewall/exec.go`: bounded subprocess I/O shared by native backends;
+  timeout policy and transaction guarantees remain backend-specific.
+- `internal/firewall/iptables.go`: generation staging, family selection,
+  compensation, and owned retirement/cleanup.
+- `internal/firewall/iptables_inventory.go`: explicit family/table/chain
+  identities, native inspection, ownership validation, and capacity accounting.
+- `internal/firewall/iptables_codec.go` and `ipset_codec.go`: distinct native
+  grammars, tokenization, and snapshot decoding.
+- `internal/firewall/iptables_model.go`: deterministic policy lowering and
+  immutable native object identities.
 - `internal/state/store.go`: store lifecycle and durable transaction operations.
 - `internal/state/records.go`: record types, encoding and semantic validation.
 - `internal/state/filesystem.go`: private paths, bounded reads, publication and sync helpers.
 - `tests/e2e/harness_test.go`: suite admission, namespace isolation and command execution.
 - `tests/e2e/network_test.go`: peer networking and packet probes.
-- `tests/e2e/daemon_test.go`: daemon lifecycle, readiness and configuration fixtures.
+- `tests/e2e/daemon_test.go`: shared daemon process/notification lifecycle and
+  readiness waiting, with backend-specific enforcement predicates.
 - `tests/e2e/nftables_test.go`: native inventory and ownership assertions.
 - `tests/e2e/iptables_test.go`: both tool families, compensation, migration and attachment behavior.
 - `tests/e2e/crash_test.go`: test-only application failure injection.

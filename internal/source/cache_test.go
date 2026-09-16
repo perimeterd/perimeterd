@@ -100,6 +100,8 @@ func TestCacheStageLoadProvidesOneImmutableSnapshot(t *testing.T) {
 func TestCacheStageRejectsWholeCandidateWithoutManifest(t *testing.T) {
 	cache, _ := openCacheTest(t, nil)
 	bad := cacheTestRecord(time.Now().UTC())
+	bad.Selector = policy.Selector{Kind: policy.Country, Value: "CA"}
+	bad.Parameters["resource"] = "CA"
 	bad.IPv6 = []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}
 	if _, err := cache.Stage([]Record{cacheTestRecord(time.Now().UTC()), bad}); err == nil {
 		t.Fatal("stage accepted a wrong-family selector result")

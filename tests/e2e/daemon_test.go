@@ -46,12 +46,20 @@ type daemonProcess struct {
 
 func startDaemon(t *testing.T, configPath, table string) *daemonProcess {
 	t.Helper()
+	return startDaemonProcess(t, configPath, fmt.Sprintf("nft table %q", table), func() bool {
+		_, err := nftTableMayFail(table)
+		return err == nil
+	})
+}
+
+func startDaemonProcess(t *testing.T, configPath, readinessDescription string, enforcementReady func() bool) *daemonProcess {
+	t.Helper()
 	binary := e2eBinary(t)
 	output := new(lockedBuffer)
 	notifyPath := filepath.Join(t.TempDir(), "ready.sock")
 	notify, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: notifyPath, Net: "unixgram"})
 	if err != nil {
-		t.Fatalf("listen for daemon readiness: %v", err)
+		t.Fatalf("listen for %s readiness: %v", readinessDescription, err)
 	}
 	t.Cleanup(func() {
 		_ = notify.Close()
@@ -63,7 +71,7 @@ func startDaemon(t *testing.T, configPath, table string) *daemonProcess {
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start perimeterd: %v", err)
+		t.Fatalf("start perimeterd for %s: %v", readinessDescription, err)
 	}
 	d := &daemonProcess{cmd: cmd, output: output, done: make(chan struct{})}
 	go func() {
@@ -79,7 +87,7 @@ func startDaemon(t *testing.T, configPath, table string) *daemonProcess {
 	for time.Now().Before(deadline) {
 		select {
 		case <-d.done:
-			t.Fatalf("perimeterd exited during startup: %v\n%s", d.waitErr(), d.output.String())
+			t.Fatalf("perimeterd exited during startup for %s: %v\n%s", readinessDescription, d.waitErr(), d.output.String())
 		default:
 		}
 		if !ready {
@@ -88,21 +96,21 @@ func startDaemon(t *testing.T, configPath, table string) *daemonProcess {
 			n, _, readErr := notify.ReadFromUnix(packet[:])
 			if readErr != nil {
 				if netErr, ok := readErr.(net.Error); !ok || !netErr.Timeout() {
-					t.Fatalf("read perimeterd readiness: %v\n%s", readErr, d.output.String())
+					t.Fatalf("read %s readiness: %v\n%s", readinessDescription, readErr, d.output.String())
 				}
 				continue
 			}
 			ready = bytes.Contains(packet[:n], []byte("READY=1"))
 			continue
 		}
-		if _, err := nftTableMayFail(table); err == nil {
+		if enforcementReady() {
 			_ = notify.Close()
 			_ = os.Remove(notifyPath)
 			return d
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("perimeterd did not become ready for table %q\n%s", table, d.output.String())
+	t.Fatalf("perimeterd did not become ready for %s\n%s", readinessDescription, d.output.String())
 	return nil
 }
 

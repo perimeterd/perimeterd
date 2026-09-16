@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/perimeterd/perimeterd/internal/config"
@@ -44,11 +43,11 @@ func CanonicalSelector(kind SelectorKind, value string) (Selector, error) {
 		}
 	case RIR:
 		canonical.Value = strings.ToUpper(value)
-		if !validRIR(canonical.Value) {
+		if !catalog.ValidRIR(canonical.Value) {
 			return Selector{}, fmt.Errorf("unknown RIR selector %q", value)
 		}
 	case ASN:
-		if !canonicalASN(value) {
+		if !catalog.ValidASN(value) {
 			return Selector{}, fmt.Errorf("ASN selector %q must use canonical AS<number> form", value)
 		}
 	default:
@@ -206,7 +205,7 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 		if err != nil {
 			return nil, err
 		}
-		for _, country := range rirServiceRegions[selector.Value] {
+		for _, country := range catalog.RIRCountries(selector.Value) {
 			if err := addCountry(country); err != nil {
 				return nil, fmt.Errorf("RIR %s: %w", selector.Value, err)
 			}
@@ -227,48 +226,6 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 	return selectors, nil
 }
 
-// rirServiceRegions is the release-pinned ISO country-to-RIR assignment, not
-// a geographic grouping. Reviewed 2026-09-15 against the RIPE NCC table:
-// https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/
-// Cross-checked with the NRO table and individual RIR service-region lists.
-// RIR selectors resolve these countries through country-resource-list; they
-// never become independent source records.
-var rirServiceRegions = map[string][]string{
-	"AFRINIC": {
-		"AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CI", "CM", "CV", "DJ",
-		"DZ", "EG", "EH", "ER", "ET", "GA", "GH", "GM", "GN", "GQ", "GW", "KE",
-		"KM", "LR", "LS", "LY", "MA", "MG", "ML", "MR", "MU", "MW", "MZ", "NA",
-		"NE", "NG", "RE", "RW", "SC", "SD", "SL", "SN", "SO", "SS", "ST", "SZ",
-		"TD", "TG", "TN", "TZ", "UG", "YT", "ZA", "ZM", "ZW",
-	},
-	"APNIC": {
-		"AF", "AS", "AU", "BD", "BN", "BT", "CC", "CK", "CN", "CX", "FJ", "FM",
-		"GU", "HK", "ID", "IN", "IO", "JP", "KH", "KI", "KP", "KR", "LA", "LK",
-		"MH", "MM", "MN", "MO", "MP", "MV", "MY", "NC", "NF", "NP", "NR", "NU",
-		"NZ", "PF", "PG", "PH", "PK", "PN", "PW", "SB", "SG", "TF", "TH", "TK",
-		"TL", "TO", "TV", "TW", "VN", "VU", "WF", "WS",
-	},
-	"ARIN": {
-		"AG", "AI", "AQ", "BB", "BL", "BM", "BS", "BV", "CA", "DM", "GD", "GP",
-		"HM", "JM", "KN", "KY", "LC", "MF", "MQ", "MS", "PM", "PR", "SH", "TC",
-		"UM", "US", "VC", "VG", "VI",
-	},
-	"LACNIC": {
-		"AR", "AW", "BO", "BQ", "BR", "BZ", "CL", "CO", "CR", "CU", "CW", "DO",
-		"EC", "FK", "GF", "GS", "GT", "GY", "HN", "HT", "MX", "NI", "PA", "PE",
-		"PY", "SR", "SV", "SX", "TT", "UY", "VE",
-	},
-	"RIPE": {
-		"AD", "AE", "AL", "AM", "AT", "AX", "AZ", "BA", "BE", "BG", "BH", "BY",
-		"CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FO", "FR", "GB", "GE",
-		"GG", "GI", "GL", "GR", "HR", "HU", "IE", "IL", "IM", "IQ", "IR", "IS",
-		"IT", "JE", "JO", "KG", "KW", "KZ", "LB", "LI", "LT", "LU", "LV", "MC",
-		"MD", "ME", "MK", "MT", "NL", "NO", "OM", "PL", "PS", "PT", "QA", "RO",
-		"RS", "RU", "SA", "SE", "SI", "SJ", "SK", "SM", "SY", "TJ", "TM", "TR",
-		"UA", "UZ", "VA", "YE",
-	},
-}
-
 func sortSelectors(selectors []Selector) {
 	sort.Slice(selectors, func(i, j int) bool {
 		if selectors[i].Kind != selectors[j].Kind {
@@ -276,26 +233,4 @@ func sortSelectors(selectors []Selector) {
 		}
 		return selectors[i].Value < selectors[j].Value
 	})
-}
-
-func validRIR(value string) bool {
-	_, ok := rirServiceRegions[value]
-	return ok
-}
-
-func canonicalASN(value string) bool {
-	if !strings.HasPrefix(value, "AS") || len(value) <= 2 {
-		return false
-	}
-	digits := value[2:]
-	if digits[0] == '0' && len(digits) > 1 {
-		return false
-	}
-	for _, char := range digits {
-		if char < '0' || char > '9' {
-			return false
-		}
-	}
-	number, err := strconv.ParseUint(digits, 10, 32)
-	return err == nil && number <= 4294967295
 }

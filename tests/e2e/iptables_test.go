@@ -337,74 +337,14 @@ func writePrefixesYAML(yaml *strings.Builder, name string, values []string) {
 
 func startIPTablesDaemon(t *testing.T, configPath string, families ...string) *daemonProcess {
 	t.Helper()
-	binary := e2eBinary(t)
-	output := new(lockedBuffer)
-	notifyPath := filepath.Join(t.TempDir(), "ready.sock")
-	notify, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: notifyPath, Net: "unixgram"})
-	if err != nil {
-		t.Fatalf("listen for iptables daemon readiness: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = notify.Close()
-		_ = os.Remove(notifyPath)
-	})
-	// #nosec G204 -- the validated E2E binary is launched only by this harness.
-	cmd := exec.Command(binary, "run", "--config", configPath)
-	cmd.Env = append(os.Environ(), "NOTIFY_SOCKET="+notifyPath)
-	cmd.Stdout = output
-	cmd.Stderr = output
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start iptables perimeterd: %v", err)
-	}
-	d := &daemonProcess{cmd: cmd, output: output, done: make(chan struct{})}
-	go func() {
-		err := cmd.Wait()
-		d.mu.Lock()
-		d.err = err
-		d.mu.Unlock()
-		close(d.done)
-	}()
-	t.Cleanup(func() { d.stop(t) })
-	deadline := time.Now().Add(45 * time.Second)
-	ready := false
-	for time.Now().Before(deadline) {
-		select {
-		case <-d.done:
-			t.Fatalf("iptables perimeterd exited during startup: %v\n%s", d.waitErr(), d.output.String())
-		default:
-		}
-		if !ready {
-			_ = notify.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			var packet [4096]byte
-			n, _, readErr := notify.ReadFromUnix(packet[:])
-			if readErr != nil {
-				if netErr, ok := readErr.(net.Error); !ok || !netErr.Timeout() {
-					t.Fatalf("read iptables readiness: %v\n%s", readErr, d.output.String())
-				}
-				continue
-			}
-			ready = bytes.Contains(packet[:n], []byte("READY=1"))
-			continue
-		}
-		if len(families) == 0 {
-			return d
-		}
-		owned := true
+	return startDaemonProcess(t, configPath, fmt.Sprintf("iptables families %v", families), func() bool {
 		for _, family := range families {
 			if !iptablesOwned(t, family) {
-				owned = false
-				break
+				return false
 			}
 		}
-		if owned {
-			_ = notify.Close()
-			_ = os.Remove(notifyPath)
-			return d
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("iptables perimeterd did not become ready for families %v\n%s", families, d.output.String())
-	return nil
+		return true
+	})
 }
 
 func defaultIPTablesAttachments() []config.Attachment {

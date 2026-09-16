@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -145,11 +144,8 @@ func Run(ctx context.Context, options Options) error {
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
-	logger := newLogger(cfg, opts.Stderr)
-	health := &atomic.Bool{}
-	health.Store(true)
-	var activeMetrics *metricsServer
-	defer func() { _ = closeMetrics(&activeMetrics) }()
+	publication := newRuntimePublication(engine, sources, newLogger(cfg, opts.Stderr))
+	defer func() { _ = publication.close() }()
 
 	epoch, err := engine.Admit()
 	if err != nil {
@@ -159,63 +155,48 @@ func Run(ctx context.Context, options Options) error {
 	if initial.err != nil {
 		return errors.Join(initial.err, stopNotifier())
 	}
-	staged, err := bindMetrics(cfg.Metrics.Listen, func() bool {
-		return engine.Healthy() && health.Load()
-	}, sources.timestamp.Load)
-	if err != nil {
+	if err := publication.reserve(initial); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
 	if err := startupCtx.Err(); err != nil {
-		_ = staged.closeImmediate()
+		_ = publication.discard()
 		return errors.Join(err, stopNotifier())
 	}
 	outcome, applyErr := engine.Apply(startupCtx, initial.candidate)
-	health.Store(true)
-	if applyErr != nil && !outcome.Committed {
-		if !outcome.Degraded {
-			_ = staged.closeImmediate()
+	if outcome.Degraded {
+		if err := publication.retain(outcome.Transaction); err != nil {
+			_ = publication.discard()
+			return errors.Join(applyErr, err, stopNotifier())
+		}
+		expected := "startup recovery did not retain candidate"
+		if outcome.Committed {
+			expected = "startup recovery did not retain committed candidate"
+		}
+		recovered, recoverErr := recoverUntilReady(startupCtx, engine, func(recoverErr error) {
+			publication.logger.Warn("firewall recovery failed", "error", recoverErr)
+		})
+		if recoverErr != nil {
+			_ = publication.discard()
+			return errors.Join(applyErr, recoverErr, stopNotifier())
+		}
+		if recovered == nil || recovered.ID != outcome.Transaction {
+			_ = publication.discard()
+			return errors.Join(applyErr, errors.New(expected), stopNotifier())
+		}
+		outcome.Active = recovered
+		if err := publication.recover(outcome.Active); err != nil {
+			_ = publication.discard()
+			return errors.Join(applyErr, err, stopNotifier())
+		}
+	} else if !outcome.Committed {
+		_ = publication.discard()
+		if applyErr != nil {
 			return errors.Join(fmt.Errorf("apply configuration: %w", applyErr), stopNotifier())
 		}
-		recovered, recoverErr := recoverUntilReady(startupCtx, engine, func(recoverErr error) {
-			logger.Warn("firewall recovery failed", "error", recoverErr)
-		})
-		if recoverErr != nil {
-			_ = staged.closeImmediate()
-			return errors.Join(applyErr, recoverErr, stopNotifier())
-		}
-		if recovered == nil || recovered.ID != outcome.Transaction {
-			_ = staged.closeImmediate()
-			return errors.Join(applyErr, errors.New("startup recovery did not retain candidate"), stopNotifier())
-		}
-		outcome.Active = recovered
-		health.Store(true)
-		promoteMetrics(&activeMetrics, staged, true, health, logger)
-	} else if !outcome.Committed {
-		_ = staged.closeImmediate()
 		return errors.Join(errors.New("configuration apply produced no committed revision"), stopNotifier())
-	} else if outcome.Degraded {
-		recovered, recoverErr := recoverUntilReady(startupCtx, engine, func(recoverErr error) {
-			logger.Warn("firewall recovery failed", "error", recoverErr)
-		})
-		if recoverErr != nil {
-			_ = staged.closeImmediate()
-			return errors.Join(applyErr, recoverErr, stopNotifier())
-		}
-		if recovered == nil || recovered.ID != outcome.Transaction {
-			_ = staged.closeImmediate()
-			return errors.Join(applyErr, errors.New("startup recovery did not retain committed candidate"), stopNotifier())
-		}
-		outcome.Active = recovered
-		health.Store(true)
-		promoteMetrics(&activeMetrics, staged, true, health, logger)
-	} else {
-		promoteMetrics(&activeMetrics, staged, true, health, logger)
-	}
-	if err := sources.selectRevision(outcome.Active); err != nil {
-		return errors.Join(err, stopNotifier())
-	}
-	if initial.refreshErr != nil {
-		logger.Warn("using committed source snapshot after refresh failure", "error", initial.refreshErr, "snapshot_age", sources.age())
+	} else if err := publication.publish(outcome.Active); err != nil {
+		_ = publication.discard()
+		return errors.Join(applyErr, err, stopNotifier())
 	}
 	if err := notifier.Stop(); err != nil {
 		notifyStopped = true
@@ -233,7 +214,6 @@ func Run(ctx context.Context, options Options) error {
 	defer cancelProducers()
 	results := make(chan stageResult, 8)
 	var producers sync.WaitGroup
-	var pending *recoveryReservation
 	recovering := false
 	recoveryBackoff := time.Second
 	var recoveryTimer *time.Timer
@@ -251,16 +231,10 @@ func Run(ctx context.Context, options Options) error {
 		producers.Wait()
 		if recoveryTimer != nil {
 			recoveryTimer.Stop()
+			recoveryTimer = nil
 		}
-		if pending != nil {
-			err := pending.staged.closeImmediate()
-			pending = nil
-			if err != nil {
-				return errors.Join(err, closeMetrics(&activeMetrics))
-			}
-		}
-		if err := closeMetrics(&activeMetrics); err != nil {
-			logger.Error("closing metrics listener failed", "error", err)
+		if err := publication.close(); err != nil {
+			publication.logger.Error("closing metrics listener failed", "error", err)
 			return err
 		}
 		return nil
@@ -269,10 +243,6 @@ func Run(ctx context.Context, options Options) error {
 		var recoveryC <-chan time.Time
 		if recoveryTimer != nil {
 			recoveryC = recoveryTimer.C
-		}
-		var metricsErrC <-chan error
-		if activeMetrics != nil {
-			metricsErrC = activeMetrics.errCh
 		}
 		select {
 		case <-runCtx.Done():
@@ -285,7 +255,7 @@ func Run(ctx context.Context, options Options) error {
 			revision := sources.active
 			sequence, admitErr := engine.AdmitRefresh(revision.Epoch)
 			if admitErr != nil {
-				logger.Warn("source refresh admission failed", "error", admitErr)
+				publication.logger.Warn("source refresh admission failed", "error", admitErr)
 				continue
 			}
 			refreshCtx, cancel := context.WithCancel(producerCtx)
@@ -309,7 +279,7 @@ func Run(ctx context.Context, options Options) error {
 			case syscall.SIGHUP:
 				requestEpoch, admitErr := engine.Admit()
 				if admitErr != nil {
-					logger.Warn("reload admission failed", "error", admitErr)
+					publication.logger.Warn("reload admission failed", "error", admitErr)
 					continue
 				}
 				if sources.reloadCancel != nil {
@@ -328,10 +298,10 @@ func Run(ctx context.Context, options Options) error {
 					}
 				}(requestEpoch)
 			}
-		case metricsErr := <-metricsErrC:
+		case metricsErr := <-publication.metricsErrors():
 			if metricsErr != nil {
-				health.Store(false)
-				logger.Error("metrics listener failed", "error", metricsErr)
+				publication.health.Store(false)
+				publication.logger.Error("metrics listener failed", "error", metricsErr)
 				return errors.Join(metricsErr, stopService())
 			}
 		case result := <-results:
@@ -343,32 +313,28 @@ func Run(ctx context.Context, options Options) error {
 				sources.refreshCancel = nil
 			}
 			if result.err != nil {
-				logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
+				publication.logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
 				continue
 			}
-			if recovering || pending != nil {
+			if recovering || publication.pending() {
 				continue
 			}
-			sameListen := activeMetrics != nil && activeMetrics.listen == result.cfg.Metrics.Listen
-			var staged *metricsServer
-			var bindErr error
-			if !sameListen {
-				staged, bindErr = bindMetrics(result.cfg.Metrics.Listen, func() bool {
-					return engine.Healthy() && health.Load()
-				}, sources.timestamp.Load)
-				if bindErr != nil {
-					logger.Warn("reload failed", "error", bindErr)
-					continue
-				}
+			if err := publication.reserve(result); err != nil {
+				publication.logger.Warn("reload failed", "error", err)
+				continue
 			}
 			outcome, applyErr := engine.Apply(runCtx, result.candidate)
 			if applyErr != nil && !outcome.Committed {
 				if outcome.Degraded && outcome.Transaction != "" {
-					pending = &recoveryReservation{transaction: outcome.Transaction, staged: staged, replace: !sameListen, logger: result.logger, refreshErr: result.refreshErr}
+					if err := publication.retain(outcome.Transaction); err != nil {
+						_ = publication.discard()
+						publication.logger.Warn("reload failed", "error", err)
+						continue
+					}
 					scheduleRecovery()
 				} else {
-					_ = staged.closeImmediate()
-					logger.Warn("reload failed", "error", applyErr)
+					_ = publication.discard()
+					publication.logger.Warn("reload failed", "error", applyErr)
 					if !engine.Healthy() {
 						scheduleRecovery()
 					}
@@ -376,17 +342,12 @@ func Run(ctx context.Context, options Options) error {
 				continue
 			}
 			if !outcome.Committed {
-				_ = staged.closeImmediate()
-				logger.Warn("reload produced no committed revision")
+				_ = publication.discard()
+				publication.logger.Warn("reload produced no committed revision")
 				continue
 			}
-			logger = result.logger
-			promoteMetrics(&activeMetrics, staged, !sameListen, health, logger)
-			if err := sources.selectRevision(outcome.Active); err != nil {
+			if err := publication.publish(outcome.Active); err != nil {
 				return errors.Join(err, stopService())
-			}
-			if result.refreshErr != nil {
-				logger.Warn("using committed source snapshot after refresh failure", "error", result.refreshErr, "snapshot_age", sources.age())
 			}
 			if outcome.Degraded || !engine.Healthy() {
 				scheduleRecovery()
@@ -395,7 +356,7 @@ func Run(ctx context.Context, options Options) error {
 			recoveryTimer = nil
 			recovered, recoverErr := engine.Recover(runCtx)
 			if recoverErr != nil {
-				logger.Warn("firewall recovery failed", "error", recoverErr)
+				publication.logger.Warn("firewall recovery failed", "error", recoverErr)
 				if runCtx.Err() == nil {
 					recoveryTimer = time.NewTimer(recoveryBackoff)
 					if recoveryBackoff < 30*time.Second {
@@ -407,25 +368,11 @@ func Run(ctx context.Context, options Options) error {
 				}
 				continue
 			}
-			if err := sources.selectRevision(recovered); err != nil {
+			if err := publication.recover(recovered); err != nil {
 				return errors.Join(err, stopService())
 			}
-			if pending != nil {
-				if recovered != nil && recovered.ID == pending.transaction {
-					logger = pending.logger
-					if pending.refreshErr != nil {
-						logger.Warn("using committed source snapshot after refresh failure", "error", pending.refreshErr, "snapshot_age", sources.age())
-					}
-					if pending.replace {
-						promoteMetrics(&activeMetrics, pending.staged, true, health, logger)
-					}
-				} else {
-					_ = pending.staged.closeImmediate()
-				}
-				pending = nil
-			}
 			recovering = false
-			logger.Info("firewall recovery completed")
+			publication.logger.Info("firewall recovery completed")
 		}
 	}
 }
@@ -454,14 +401,6 @@ func Cleanup(ctx context.Context, options Options) error {
 	return collectPrefixes(store)
 }
 
-type recoveryReservation struct {
-	transaction string
-	staged      *metricsServer
-	replace     bool
-	logger      *slog.Logger
-	refreshErr  error
-}
-
 type stageResult struct {
 	candidate  Candidate
 	cfg        config.Config
@@ -479,42 +418,6 @@ func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver
 		return stageResult{candidate: Candidate{epoch: epoch}, err: fmt.Errorf("runtime configuration: %w", err)}
 	}
 	return stageSource(ctx, opts, resolver, epoch, 0, cfg, committed)
-}
-
-func promoteMetrics(active **metricsServer, staged *metricsServer, replace bool, health *atomic.Bool, logger *slog.Logger) {
-	if !replace {
-		return
-	}
-	if staged != nil {
-		staged.serve()
-	}
-	old := *active
-	*active = staged
-	retireFailed := false
-	if old != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := old.close(ctx)
-		cancel()
-		if err != nil {
-			retireFailed = true
-			health.Store(false)
-			logger.Warn("retiring metrics listener failed", "error", err)
-		}
-	}
-	if !retireFailed {
-		health.Store(true)
-	}
-}
-
-func closeMetrics(active **metricsServer) error {
-	server := *active
-	*active = nil
-	if server == nil {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return server.close(ctx)
 }
 
 func recoverUntilReady(ctx context.Context, engine *Engine, failed func(error)) (*state.Revision, error) {

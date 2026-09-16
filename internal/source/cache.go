@@ -340,15 +340,12 @@ func (c *Cache) loadObject(entry manifestEntry) (Record, error) {
 	if err := decodeCanonical(data, &object, maxCacheObjectBytes); err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
-	if err := validateObject(object); err != nil {
+	record, err := validateObject(object)
+	if err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
 	if object.Selector != entry.Selector || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !equalParameters(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt {
 		return Record{}, errors.New("manifest metadata does not match selector object")
-	}
-	record, err := recordFromObject(object)
-	if err != nil {
-		return Record{}, err
 	}
 	return record, nil
 }
@@ -464,11 +461,7 @@ func normalizeFamily(values []netip.Prefix, ipv4 bool) ([]netip.Prefix, error) {
 			return nil, fmt.Errorf("prefix %d has wrong address family", i)
 		}
 	}
-	set, err := prefix.New(values)
-	if err != nil {
-		return nil, err
-	}
-	return set.Prefixes(), nil
+	return prefix.Normalize(values)
 }
 
 func validateManifest(manifest manifestFile) error {
@@ -482,19 +475,10 @@ func validateManifest(manifest manifestFile) error {
 		return errors.New("manifest selector count is invalid")
 	}
 	for i, entry := range manifest.Entries {
-		selector, err := policy.CanonicalSelector(policy.SelectorKind(entry.Selector.Kind), entry.Selector.Value)
-		if err != nil {
-			return fmt.Errorf("selector %d: %w", i, err)
-		}
-		if selector.Kind != policy.SelectorKind(entry.Selector.Kind) || selector.Value != entry.Selector.Value {
-			return fmt.Errorf("selector %d is not canonical", i)
-		}
-		if err := validateCacheID(entry.Object, "object"); err != nil {
-			return fmt.Errorf("selector %d: %w", i, err)
-		}
 		if err := validateManifestEntry(entry, i); err != nil {
 			return err
 		}
+		selector := manifestSelector(entry)
 		if i > 0 && !selectorLess(manifestSelector(manifest.Entries[i-1]), selector) {
 			return errors.New("manifest selectors are not strictly sorted")
 		}
@@ -529,31 +513,31 @@ func validateManifestEntry(entry manifestEntry, index int) error {
 	return nil
 }
 
-func validateObject(object objectFile) error {
+func validateObject(object objectFile) (Record, error) {
 	if object.SchemaVersion != cacheSchemaVersion {
-		return fmt.Errorf("unsupported schema version %d", object.SchemaVersion)
+		return Record{}, fmt.Errorf("unsupported schema version %d", object.SchemaVersion)
 	}
 	if object.Parameters == nil || object.IPv4 == nil || object.IPv6 == nil {
-		return errors.New("object contains null parameters or family array")
+		return Record{}, errors.New("object contains null parameters or family array")
 	}
 	record, err := recordFromObject(object)
 	if err != nil {
-		return err
+		return Record{}, err
 	}
 	if canonicalTime(record.QueryStart) != object.QueryStart || canonicalTime(record.QueryEnd) != object.QueryEnd || canonicalTime(record.RetrievedAt) != object.RetrievedAt {
-		return errors.New("timestamps are not canonical UTC values")
+		return Record{}, errors.New("timestamps are not canonical UTC values")
 	}
 	canonical, err := canonicalRecord(record)
 	if err != nil {
-		return err
+		return Record{}, err
 	}
 	if object.ContentID != prefixContentID(canonical.IPv4, canonical.IPv6) {
-		return errors.New("normalized prefix content hash mismatch")
+		return Record{}, errors.New("normalized prefix content hash mismatch")
 	}
 	if !reflect.DeepEqual(prefixStrings(canonical.IPv4), object.IPv4) || !reflect.DeepEqual(prefixStrings(canonical.IPv6), object.IPv6) {
-		return errors.New("prefix arrays are not canonical")
+		return Record{}, errors.New("prefix arrays are not canonical")
 	}
-	return nil
+	return canonical, nil
 }
 
 func manifestSelector(entry manifestEntry) policy.Selector {

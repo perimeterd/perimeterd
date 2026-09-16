@@ -1,7 +1,10 @@
-// Package catalog contains the immutable built-in country and group registry.
+// Package catalog contains immutable built-in country, group, and selector facts.
 package catalog
 
-import "sort"
+import (
+	"sort"
+	"strconv"
+)
 
 // The country set is ISO 3166-1 alpha-2 (249 assigned codes), cross-checked
 // against ISO 3166-1:2020 (reviewed/confirmed 2025):
@@ -86,6 +89,48 @@ var regionalGroups = map[string][]string{
 	},
 }
 
+// rirServiceRegions is the release-pinned ISO country-to-RIR assignment, not
+// a geographic grouping. Reviewed 2026-09-15 against the RIPE NCC table:
+// https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/
+// Cross-checked with the NRO table and individual RIR service-region lists.
+// RIR selectors resolve these countries through country-resource-list; they
+// never become independent source records.
+var rirServiceRegions = map[string][]string{
+	"AFRINIC": {
+		"AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CI", "CM", "CV", "DJ",
+		"DZ", "EG", "EH", "ER", "ET", "GA", "GH", "GM", "GN", "GQ", "GW", "KE",
+		"KM", "LR", "LS", "LY", "MA", "MG", "ML", "MR", "MU", "MW", "MZ", "NA",
+		"NE", "NG", "RE", "RW", "SC", "SD", "SL", "SN", "SO", "SS", "ST", "SZ",
+		"TD", "TG", "TN", "TZ", "UG", "YT", "ZA", "ZM", "ZW",
+	},
+	"APNIC": {
+		"AF", "AS", "AU", "BD", "BN", "BT", "CC", "CK", "CN", "CX", "FJ", "FM",
+		"GU", "HK", "ID", "IN", "IO", "JP", "KH", "KI", "KP", "KR", "LA", "LK",
+		"MH", "MM", "MN", "MO", "MP", "MV", "MY", "NC", "NF", "NP", "NR", "NU",
+		"NZ", "PF", "PG", "PH", "PK", "PN", "PW", "SB", "SG", "TF", "TH", "TK",
+		"TL", "TO", "TV", "TW", "VN", "VU", "WF", "WS",
+	},
+	"ARIN": {
+		"AG", "AI", "AQ", "BB", "BL", "BM", "BS", "BV", "CA", "DM", "GD", "GP",
+		"HM", "JM", "KN", "KY", "LC", "MF", "MQ", "MS", "PM", "PR", "SH", "TC",
+		"UM", "US", "VC", "VG", "VI",
+	},
+	"LACNIC": {
+		"AR", "AW", "BO", "BQ", "BR", "BZ", "CL", "CO", "CR", "CU", "CW", "DO",
+		"EC", "FK", "GF", "GS", "GT", "GY", "HN", "HT", "MX", "NI", "PA", "PE",
+		"PY", "SR", "SV", "SX", "TT", "UY", "VE",
+	},
+	"RIPE": {
+		"AD", "AE", "AL", "AM", "AT", "AX", "AZ", "BA", "BE", "BG", "BH", "BY",
+		"CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FO", "FR", "GB", "GE",
+		"GG", "GI", "GL", "GR", "HR", "HU", "IE", "IL", "IM", "IQ", "IR", "IS",
+		"IT", "JE", "JO", "KG", "KW", "KZ", "LB", "LI", "LT", "LU", "LV", "MC",
+		"MD", "ME", "MK", "MT", "NL", "NO", "OM", "PL", "PS", "PT", "QA", "RO",
+		"RS", "RU", "SA", "SE", "SI", "SJ", "SK", "SM", "SY", "TJ", "TM", "TR",
+		"UA", "UZ", "VA", "YE",
+	},
+}
+
 var (
 	euMembers       = []string{"AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU", "IE", "IT", "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK"}
 	schengenMembers = []string{"AT", "BE", "BG", "CH", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU", "IS", "IT", "LI", "LT", "LU", "LV", "MT", "NL", "NO", "PL", "PT", "RO", "SE", "SI", "SK"}
@@ -122,6 +167,38 @@ func makeGroups() map[string][]string {
 func ValidCountry(code string) bool {
 	_, ok := countries[code]
 	return ok
+}
+
+// ValidRIR reports whether name is a canonical Regional Internet Registry
+// service-region name. Callers canonicalize input to uppercase before calling.
+func ValidRIR(name string) bool {
+	_, ok := rirServiceRegions[name]
+	return ok
+}
+
+// RIRCountries returns a defensive copy of the canonical country memberships
+// for a Regional Internet Registry service region. Unknown RIRs return nil.
+func RIRCountries(name string) []string {
+	return append([]string(nil), rirServiceRegions[name]...)
+}
+
+// ValidASN reports whether value uses canonical AS<number> spelling for an
+// unsigned 32-bit autonomous system number. AS0 and AS4294967295 are valid.
+func ValidASN(value string) bool {
+	if len(value) <= 2 || value[:2] != "AS" {
+		return false
+	}
+	digits := value[2:]
+	if digits[0] == '0' && len(digits) > 1 {
+		return false
+	}
+	for _, char := range digits {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	_, err := strconv.ParseUint(digits, 10, 32)
+	return err == nil
 }
 
 // Countries returns a copy of the canonical, lexicographically sorted member

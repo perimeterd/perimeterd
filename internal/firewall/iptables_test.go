@@ -40,7 +40,7 @@ func TestIPTablesDiscoveryRejectsMixedToolFamilies(t *testing.T) {
 }
 
 func TestIPTablesSavePreservesCountersAndRejectsMalformedProtocol(t *testing.T) {
-	inventory, err := parseIPTablesSave([]byte("*filter\n:INPUT ACCEPT [0:0]\n[42:9001] -A INPUT -m comment --comment \"two words\" -j RETURN\n[4:200] -A INPUT\nCOMMIT\n"))
+	inventory, err := parseIPTablesSave(policy.IPv4, []byte("*filter\n:INPUT ACCEPT [0:0]\n[42:9001] -A INPUT -m comment --comment \"two words\" -j RETURN\n[4:200] -A INPUT\nCOMMIT\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestIPTablesSavePreservesCountersAndRejectsMalformedProtocol(t *testing.T) 
 		"*filter\n:INPUT ACCEPT [0:0]\n",
 		"*filter\n:INPUT ACCEPT [0:0]\n[bad:0] -A INPUT -j RETURN\nCOMMIT\n",
 	} {
-		if _, err := parseIPTablesSave([]byte(input)); err == nil {
+		if _, err := parseIPTablesSave(policy.IPv4, []byte(input)); err == nil {
 			t.Fatalf("accepted malformed save: %q", input)
 		}
 	}
@@ -98,7 +98,7 @@ func TestIPTablesInventorySeparatesTableAndParentNames(t *testing.T) {
 		t.Fatalf("different table/parent identities collided: %+v", inventory.Chains)
 	}
 	parent := inventory.Chains[chainKey(policy.IPv4, "raw:OUTPUT")]
-	if parent.Name != "raw:OUTPUT" || parent.Table != familyName(policy.IPv4) {
+	if parent.Chain != "raw:OUTPUT" || parent.Table != "filter" || parent.Family != policy.IPv4 {
 		t.Fatalf("foreign raw table replaced configured filter parent: %+v", parent)
 	}
 }
@@ -106,8 +106,8 @@ func TestIPTablesInventorySeparatesTableAndParentNames(t *testing.T) {
 func TestIPTablesCapacityPreservesInspectionHeadroom(t *testing.T) {
 	inventory := newIPTInventory()
 	expected := &iptExpected{
-		chains: map[string][]iptChain{
-			"v4:pdcandidate": {{Name: "pdcandidate", Rules: []iptRule{{Args: []string{"-j", "RETURN"}}}}},
+		chains: map[iptChainKey][]iptChain{
+			chainKey(policy.IPv4, "pdcandidate"): {{Name: "pdcandidate", Rules: []iptRule{{Args: []string{"-j", "RETURN"}}}}},
 		},
 		sets: map[string]iptSet{"candidate": {Name: "candidate", Family: policy.IPv4}},
 	}
@@ -138,7 +138,7 @@ last\\tail" -j RETURN
 COMMIT
 # completed '
 `
-	inventory, err := parseIPTablesSave([]byte(data))
+	inventory, err := parseIPTablesSave(policy.IPv4, []byte(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestIPTablesPreflightRejectsExactCandidateSetCollision(t *testing.T) {
 
 func TestIPTablesOwnershipInspectionSeparatesOptionsAndOperands(t *testing.T) {
 	expected := &iptExpected{
-		chains: map[string][]iptChain{"filter:owned": nil},
+		chains: map[iptChainKey][]iptChain{chainKey(policy.IPv4, "owned"): nil},
 		sets:   map[string]iptSet{"owned_set": {}},
 		owners: map[string]bool{"recorded": true},
 	}
@@ -327,7 +327,7 @@ func TestIPTablesOwnershipInspectionSeparatesOptionsAndOperands(t *testing.T) {
 		{"ambiguous opaque operand", `-m opaque --value --comment -j owned`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			inventory, err := parseIPTablesSave([]byte("*filter\n:INPUT ACCEPT [0:0]\n-A INPUT " + tc.rule + "\nCOMMIT\n"))
+			inventory, err := parseIPTablesSave(policy.IPv4, []byte("*filter\n:INPUT ACCEPT [0:0]\n-A INPUT "+tc.rule+"\nCOMMIT\n"))
 			if err != nil {
 				t.Fatal(err)
 			}

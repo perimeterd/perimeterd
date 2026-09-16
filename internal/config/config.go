@@ -682,7 +682,7 @@ func normalizeSelector(raw rawSelector, groups map[string][]string, field string
 		seen := map[string]struct{}{}
 		for i, rir := range *raw.RIRs {
 			rir = strings.ToUpper(rir)
-			if !validRIR(rir) {
+			if !catalog.ValidRIR(rir) {
 				return Selector{}, 0, fmt.Errorf("%s.rirs[%d]: unknown RIR", field, i)
 			}
 			seen[rir] = struct{}{}
@@ -712,7 +712,7 @@ func normalizeSelector(raw rawSelector, groups map[string][]string, field string
 		}
 		seen := map[string]struct{}{}
 		for i, asn := range *raw.ASNs {
-			if !canonicalASN(asn) {
+			if !catalog.ValidASN(asn) {
 				return Selector{}, 0, fmt.Errorf("%s.asns[%d]: must use canonical AS<number> form", field, i)
 			}
 			seen[asn] = struct{}{}
@@ -881,32 +881,6 @@ func validateName(name, field string) error {
 		return fmt.Errorf("%s: must be a lowercase DNS-label-like name", field)
 	}
 	return nil
-}
-
-func validRIR(rir string) bool {
-	switch rir {
-	case "AFRINIC", "APNIC", "ARIN", "LACNIC", "RIPE":
-		return true
-	default:
-		return false
-	}
-}
-
-func canonicalASN(asn string) bool {
-	if !strings.HasPrefix(asn, "AS") || len(asn) <= 2 {
-		return false
-	}
-	digits := asn[2:]
-	if digits[0] == '0' && len(digits) > 1 {
-		return false
-	}
-	for _, r := range digits {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	n, err := strconv.ParseUint(digits, 10, 32)
-	return err == nil && n <= 4294967295
 }
 
 func sortedKeys(values map[string]struct{}) []string {
