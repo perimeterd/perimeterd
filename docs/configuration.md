@@ -13,9 +13,19 @@ owns the kernel realization.
 
 The package configuration path is `/etc/perimeterd/perimeterd.yaml`. State and
 prefix caches live under `/var/lib/perimeterd`. Parsing accepts exactly one YAML
-document: every mapping rejects unknown and duplicate fields, scalar types are
-checked without coercion, and `version` must be exactly `1`. Explicit nulls,
-aliases, and merge keys are rejected rather than silently defaulted or expanded.
+document. Each schema-defined mapping rejects unknown and duplicate fields;
+`groups` is intentionally a map whose keys are user-defined group names.
+Scalar types are checked without coercion, and `version` must be exactly `1`.
+Explicit nulls, aliases, and merge keys are rejected rather than silently
+defaulted or expanded.
+
+## Document and fragment forms
+
+The block in [Fully annotated configuration](#fully-annotated-configuration)
+is one complete YAML document. `configs/perimeterd.yaml` is another complete
+example. Every later YAML block in this document is a root-level fragment:
+merge it into a complete configuration at the shown top-level key before
+running `perimeterd validate`; a fragment is not a standalone configuration.
 
 ## Fully annotated configuration
 
@@ -68,9 +78,11 @@ crowdsec:
   update_frequency: 10s
 ```
 
-RIPEstat is the only version 1 geo/ASN provider and uses fixed official HTTPS
-endpoints. There is no provider field until a second implementation exists.
-The CrowdSec URL is independent and may be HTTP for a local LAPI.
+`geo` uses RIPEstat as the only version 1 provider and has no configurable
+provider field; [data sources](data-sources.md) owns its endpoints, snapshots,
+and compatibility contract. `crowdsec.lapi_url` is an independent absolute
+HTTP or HTTPS URL; HTTP is permitted for a local LAPI. CrowdSec runtime
+support is planned, as described below.
 
 ## Canonical field and default table
 
@@ -102,9 +114,9 @@ and are always validated; only the selected backend is applied.
 | `geo.refresh_jitter` | duration | `10m` | Positive upper delay |
 | `groups` | map | `{}` | Lowercase name to countries |
 | `policies` | list | `[]` | Explicit priority order |
-| `crowdsec.enabled` | bool | `false` | Enable LAPI stream |
-| `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | LAPI |
-| `crowdsec.api_key_file` | path | none | Required when enabled |
+| `crowdsec.enabled` | bool | `false` | Enable LAPI stream (planned runtime) |
+| `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
+| `crowdsec.api_key_file` | path | none | Required by schema when enabled |
 | `crowdsec.update_frequency` | duration | `10s` | Positive |
 
 `metrics.listen` must parse as one host:port. The loopback default avoids
@@ -112,18 +124,33 @@ accidental unauthenticated exposure; a non-empty listener that cannot bind
 prevents readiness. All duration fields use Go duration syntax and must be
 strictly positive.
 
-CrowdSec enablement also requires the operator-verified
-[supported LAPI contract](data-sources.md#supported-lapi-contract); no YAML field
-or successful local/API validation attests that remote deployment prerequisite.
+Defaults apply only when a key is omitted. Valid explicit values are retained:
+for example, `metrics.listen: ""` disables the listener, `firewall.ipv4: false`
+and `firewall.ipv6: false` disable those families, and an explicit nftables
+priority of `0` remains `0`. An explicit `attachments: []` clears the
+attachment default, while an explicit empty selector member list is rejected;
+an empty selector mapping is discussed in [Selectors](#selectors). An explicit
+empty configured global list contributes no configured entries (the effective
+allowlist still adds immutable local ranges).
+While CrowdSec is disabled, `api_key_file: ""` is equivalent to omission; when
+enabled, the schema requires a non-empty path.
+
+The `crowdsec` block is accepted by offline schema validation. Current
+`run` rejects `crowdsec.enabled: true`; the dynamic LAPI integration is planned.
+When that integration is delivered, enabling it will also require the operator-
+verified [supported LAPI contract](data-sources.md#supported-lapi-contract).
+Neither local validation nor a successful API call can attest that remote
+deployment prerequisite.
 
 ### iptables attachments
 
-Omitting `firewall.iptables.attachments` retains the default `INPUT`/ingress and
-`OUTPUT`/egress attachments. An explicit `attachments: []` is accepted for either
-backend and means no managed attachment jumps; it does not restore the defaults.
-The list is unused when nftables is selected. For iptables, local validation
-does not attest that policy has a packet path; the
-[runtime attachment contract](firewall-backends.md#iptables-attachment-contract)
+Omitting `firewall.iptables.attachments` retains the default `INPUT`/ingress
+and `OUTPUT`/egress attachments. An explicit `attachments: []` is accepted by
+offline validation for either backend and means no managed attachment jumps; it
+does not restore the defaults. The list is unused when nftables is selected.
+For iptables, a non-empty runtime target requires at least one attachment, and
+local validation does not attest that the configured policy has a packet path.
+The [runtime attachment contract](firewall-backends.md#iptables-attachment-contract)
 defines the enforcement requirement.
 
 Local validation treats `INPUT` and `OUTPUT` as host parents. Every other parent
@@ -190,7 +217,7 @@ Each policy accepts exactly these keys:
 | `direction` | yes | `ingress` or `egress` |
 | `mode` | yes | `allowlist`, `blocklist`, or `disabled` |
 | `traffic` | yes | Non-empty traffic list described below |
-| `include` | yes | Selector mapping; enabled policy resolves non-empty |
+| `include` | yes | Selector mapping; enabled policy is locally non-empty and resolves at runtime |
 | `exclude` | no | Selector mapping subtracted from include |
 
 A policy name starts and ends with an ASCII lowercase alphanumeric character
@@ -229,11 +256,14 @@ only list entry.
   normalized to uppercase;
 - `rirs`: `AFRINIC`, `APNIC`, `ARIN`, `LACNIC`, or `RIPE`;
 - `groups`: built-in or configured group names;
-- `asns`: strings in canonical `AS<number>` form.
+- `asns`: strings in canonical `AS<number>` form for unsigned 32-bit values
+  `AS0` through `AS4294967295`; leading zeroes are not accepted.
 
-Unknown countries, RIRs, groups, malformed ASNs, and empty selector values are
-errors. An enabled policy must have a non-empty `include` and must resolve to
-at least one prefix overall before firewall mutation.
+Unknown countries, RIRs, groups, malformed ASNs, and explicitly present empty
+category lists are errors. An empty selector mapping is allowed for `exclude`
+and for a disabled policy's `include`; an enabled policy must have a non-empty
+`include` and must resolve to at least one prefix overall before firewall
+mutation.
 
 Union selectors within and across categories, then subtract exclusions
 independently for each address family. An excluded prefix wins over every
@@ -283,10 +313,15 @@ direction, traffic, and selector syntax remain locally validated, but selectors
 are not fetched or resolved and the policy emits no rules or sets. A disabled
 policy therefore continues to reserve its priority within its direction, so
 enabling it cannot silently reorder another policy. Removing the policy has the
-same firewall result for that policy. Other policies and CrowdSec artifacts
-remain.
+same firewall result for that policy. Other policies remain; when the planned
+CrowdSec integration is available, its artifacts remain as well.
 
 ## Evaluation semantics
+
+The ordering below is the normative contract for static policy evaluation and
+for the planned CrowdSec stage. The current runtime rejects
+`crowdsec.enabled: true`; documenting this stage does not imply that it can be
+enabled today.
 
 1. `ESTABLISHED,RELATED` traffic returns before all perimeterd denial rules.
 2. Traffic that is not a new conntrack flow returns.
@@ -310,8 +345,9 @@ an administrator continue after perimeterd returns.
 Geo policy applies only to new conntrack flows and geo-eligible unicast remote
 addresses, defined exactly below. References to globally routable or global
 addresses in geo examples mean this classification, not a live routing lookup.
-CrowdSec may deny any explicitly banned valid IP or CIDR not present in the
-effective global allowlist. Established traffic returns first, preserving
+When the planned CrowdSec stage is available, it may deny any explicitly
+banned valid IP or CIDR not present in the effective global allowlist.
+Established traffic returns first, preserving
 replies to host-originated connections in ingress and replies to accepted
 inbound connections in egress.
 
@@ -361,10 +397,10 @@ relying on a library's evolving classification. The restored exceptions are
 more specific than their excluded parent; backend prefix compaction must not
 erase those holes.
 
-This classifier is consulted only after global allow, global block, and
-ingress CrowdSec checks. Exclusion from geo policy is not an unconditional
-allow: a configured global block or CrowdSec ban can still deny non-eligible
-space unless the effective global allowlist protects it.
+This classifier is consulted only after global allow, global block, and, when
+available, the planned ingress CrowdSec checks. Exclusion from geo policy is not
+an unconditional allow: a configured global block or CrowdSec ban can still
+deny non-eligible space unless the effective global allowlist protects it.
 
 Changes to these tables require an explicit reviewed release change with the
 registry snapshot date, boundary/exception checks, and release notes. The
@@ -381,10 +417,11 @@ artifacts, including allow-only rules and accounting objects, through the
 normal journaled apply/cleanup path. Configured and built-in allows alone do
 not require a firewall path.
 
-An empty policy list does not suppress a remaining global block. When CrowdSec
-is enabled, keep its dynamic path even when its current decision store is empty.
-Do not infer the no-artifacts state from a temporarily empty source response
-or from allows shadowing configured denies.
+An empty policy list does not suppress a remaining global block. When the
+planned CrowdSec integration is available and enabled, keep its dynamic path
+even when its current decision store is empty. Do not infer the no-artifacts
+state from a temporarily empty source response or from allows shadowing
+configured denies.
 
 When the no-artifacts predicate is false, compilation requires at least one
 enabled address family. Disabling both `firewall.ipv4` and `firewall.ipv6` does
@@ -409,8 +446,10 @@ wins. The documentation addresses are illustrative and must be replaced.
 
 ## Policy examples
 
-Each fragment belongs under the top-level `policies` list unless a complete
-configuration section is shown.
+Except for the complete document above, every fenced YAML block here is a
+root-level fragment. A block containing `policies:` supplies that top-level
+list; blocks containing `groups:` or `crowdsec:` likewise supply root keys.
+Combine a fragment with the complete schema before validation.
 
 ### Five-country all-port egress allowlist
 
@@ -556,6 +595,8 @@ policies:
 the four configured partner countries; other global destinations are denied.
 
 ### Disable only SSH while retaining web and CrowdSec
+This fragment illustrates the planned CrowdSec integration; the current runtime
+rejects `crowdsec.enabled: true`.
 
 Before:
 
@@ -662,21 +703,35 @@ These cases are normative checks of the preceding ordering:
 7. **SSH-only reset:** changing only `ssh-admin` to `disabled`, or removing it,
    removes its static rule/set artifacts. Web policy and CrowdSec dynamic sets
    are unchanged.
-8. **CrowdSec precedence:** a new ingress flow not globally listed but from a
-   CrowdSec-banned address is denied before geo evaluation even when a geo
-   allowlist contains it.
+8. **Planned CrowdSec precedence:** when the planned integration is available, a
+   new ingress flow not globally listed but from a CrowdSec-banned address is
+   denied before geo evaluation even when a geo allowlist contains it.
 
 ## Validation phases
 
-`perimeterd validate` performs decoding, defaulting, field/value checks,
-uniqueness checks, local group expansion, and syntax validation without
-network access or firewall mutation. `run` performs that validation only after
-exclusive lifecycle acquisition and recovery from persisted state; it does
-not require valid current YAML to recover. `run` and reload additionally
-resolve selectors, require enabled policies to resolve at least one prefix
-overall, obtain an authoritative CrowdSec snapshot when enabled under the
-supported LAPI contract, bind metrics, verify configured parent chains, and
-stage a backend reconcile. Initial readiness also requires applying that
-decision projection; it does not attest remote feature flags or database
-behavior. See [architecture](architecture.md) for freshness, commit, rollback,
-and recovery.
+`perimeterd validate` reads the selected YAML file and performs strict decoding
+of one document, defaulting, field/value checks, local group expansion, policy
+syntax checks, and uniqueness checks. It does not read credential files,
+resolve external selectors or source prefixes, contact services, bind metrics,
+verify parent chains, or mutate a firewall. Success therefore means that the
+document is accepted by offline schema validation; it does not mean that every
+field is supported by the current runtime.
+
+`run` acquires lifecycle ownership and recovers durable state before reading
+the current YAML, so invalid current YAML does not prevent recovery from being
+attempted. After loading the document, runtime staging resolves enabled
+selectors from the RIPEstat/cache path, compiles the policy against a complete
+snapshot, requires every enabled policy to resolve to a non-empty prefix set
+overall, binds the metrics listener, verifies configured parent chains for a
+non-empty target, and stages then applies a backend reconcile. Reload repeats
+this full staging path; initial readiness additionally requires the decision
+projection to be applied and its durable active revision committed.
+
+The current static runtime supports the RIPEstat-backed country/ASN policy
+model on both nftables and iptables/ipset. `crowdsec.enabled: true` is accepted
+by `validate` only as a schema value and is rejected by `run`; the dynamic LAPI
+integration and its remote prerequisite remain planned. A configuration with
+both `firewall.ipv4: false` and `firewall.ipv6: false` is locally valid when
+it requests no artifacts, but runtime compilation rejects it when enforcement
+is requested. See [architecture](architecture.md) for freshness, commit,
+rollback, and recovery.

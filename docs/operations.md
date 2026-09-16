@@ -1,41 +1,84 @@
 # Operations
 
-For the planned version 1 release, this document specifies the installed
-system, systemd service, observability, and package lifecycle.
-[Configuration](configuration.md) defines operator fields; [architecture](architecture.md)
-defines readiness and cleanup safety.
+This document owns operator procedures, process startup/shutdown, service
+integration, and observability. [Configuration](configuration.md) owns fields
+and policy semantics; [architecture](architecture.md) owns revision admission,
+durable commit, and recovery; [firewall backends](firewall-backends.md) owns
+native kernel behavior. The [implementation plan](implementation-plan.md) is
+authoritative for delivery status.
 
-The [implementation plan](implementation-plan.md) is authoritative for delivery
-status. The source-build instructions below are executable now; installed-system
-requirements later in this document are the version-1 deployment contract.
+> **Status boundary.** The source-build instructions in this document describe
+> what runs today. The installed package, systemd, CrowdSec, Docker-specific
+> coexistence, and release sections are first-release contracts that remain
+> planned. A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
 
-The implemented runtime supports `firewall.backend: nftables` and `iptables`,
-direct `global.allowlist`/`global.blocklist` IPs and CIDRs, and static geo allowlist or
-blocklist policies backed by RIPEstat countries and ASNs. RIRs and built-in/custom
-groups expand locally into country queries. Ingress/egress scopes, exclusions,
-policy priority, and IPv4/IPv6 family-empty behavior use the same policy compiler.
-CrowdSec must remain disabled.
-Offline `validate` still checks the full configuration contract without fetching
-data, so successful validation does not imply source availability or support for
-a planned runtime integration.
+The current binary implements:
 
-For iptables, install `ipset` and a matched IPv4/IPv6 frontend/save/restore tool
-family, selected through `PATH`. Both legacy and nf_tables variants are supported;
-missing or mixed tools are errors, never a fallback. Keep tool alternatives
-unchanged while owned iptables artifacts remain; switching the compatibility
-variant requires cleanup with the original tools first. Configured custom parent
-chains must already exist. See the [attachment contract](firewall-backends.md#iptables-attachment-contract).
+- strict offline `validate` and `version` commands;
+- `run` and `cleanup` under one process-lifetime ownership lock;
+- nftables and iptables/ipset policy application, including both legacy and
+  nf_tables iptables tool families;
+- direct global address lists and RIPEstat country/ASN snapshots, with local
+  RIR and built-in/custom group expansion;
+- immutable source snapshots, refresh, cache fallback, durable revision/journal
+  recovery, backend and target migration, and custom iptables attachments; and
+- native processed and terminal-denial packet/byte accounting plus the
+  enforcement-health signal.
 
-Changing `firewall.backend` on reload stages the replacement before retiring the
-old backend. iptables family switches are separate transactions: a failure can
-expose a mixed-generation window, followed by compensating rollback. Failed
-compensation retains the journal and reports unhealthy enforcement until recovery
-succeeds. A postcommit retirement failure keeps the new revision authoritative.
+The current runtime rejects `crowdsec.enabled: true`. Docker-specific
+coexistence is not a verified runtime milestone; the `DOCKER-USER` material in
+[firewall backends](firewall-backends.md#docker-docker-user-attachment) is
+planned guidance, not a support claim. Offline validation intentionally accepts
+the complete version-1 schema, including fields for these planned integrations.
+`configs/perimeterd.yaml` is a full-schema example and must not be treated as a
+runnable capability list.
 
-Use a disposable VM or isolated network namespace, not the development host's
-firewall. A minimal direct-rule configuration is:
+### Source-build prerequisites
+
+Build with Go `1.27.1` (the version declared by `go.mod`) and run on Linux as
+root. Use a disposable VM or isolated network namespace; never test policy
+against the development host's firewall.
+
+Install the native tools for the selected backend before `run`:
+
+- nftables: `nft` in `PATH`;
+- iptables: `iptables`, `ip6tables`, `iptables-save`, `ip6tables-save`,
+  `iptables-restore`, `ip6tables-restore`, and `ipset` in `PATH`.
+
+The iptables commands must all report the same implementation (`legacy` or
+`nf_tables`) and the IPv4/IPv6 pair must match. A missing or mixed family or
+variant is an error; perimeterd does not auto-detect a replacement or silently
+fall back. Configured iptables parent chains must already exist. The backend
+also uses the host-wide xtables lock for restore operations; do not substitute a
+private lock. See the [attachment contract](firewall-backends.md#iptables-attachment-contract).
+
+Keep the selected command alternatives unchanged while perimeterd-owned
+iptables artifacts remain. To switch between legacy and nf_tables, first stop
+the daemon and run cleanup with the original tools, then change the alternatives
+and reconcile again; never change `PATH` underneath recorded ownership.
+
+A source-backed policy needs network access to the fixed RIPEstat endpoints on
+its first resolution unless an acceptable committed snapshot covers every
+required selector. Direct-only configurations make no source requests.
+
+### Build, validate, and run
+
+```sh
+make build
+bin/perimeterd validate --config /etc/perimeterd/perimeterd.yaml
+sudo bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
+```
+
+`validate` is local-only: it parses the YAML and performs schema and semantic
+checks without reading credentials, resolving selectors, contacting RIPEstat,
+or touching firewall state. A successful validation therefore does not prove
+that source data or native backend tools are available, and it does not enable
+CrowdSec.
+
+The minimum direct-rule configuration below is suitable for a disposable test
+(the address is only an example):
 
 ```yaml
 version: 1
@@ -51,247 +94,182 @@ crowdsec:
   enabled: false
 ```
 
-Build with `make build`, save the configuration as
-`/etc/perimeterd/perimeterd.yaml`, and run:
+`run` stays in the foreground. `SIGHUP` stages a complete reload; a rejected
+reload leaves the active revision in place. `SIGTERM` or `SIGINT` stops the
+process without removing enforcement. `cleanup` takes no configuration path:
+it reads durable ownership records and removes only recorded perimeterd
+artifacts. Stop `run` and confirm it is inactive before invoking cleanup.
 
-```sh
-sudo bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
-```
+Default persistent paths are `/var/lib/perimeterd` for revisions, journals,
+and immutable prefix snapshots, and `/run/perimeterd/owner.lock` for the
+lifecycle lock. The runtime creates missing directories when invoked as root.
+Do not delete either path, its records, or the lock inode to bypass recovery or
+ownership checks. A committed static policy remains in the kernel after a
+normal stop; dynamic integrations are not enabled by the current runtime.
 
-`run` remains in the foreground. Send `SIGHUP` to stage a reload and `SIGTERM`
-to stop without removing enforcement. After stopping, `sudo bin/perimeterd
-cleanup` removes only recorded owned artifacts; it does not read current YAML.
-Do not remove `/var/lib/perimeterd` or the stable `/run/perimeterd/owner.lock`
-to bypass recovery or ownership checks. The runtime creates its private state
-and runtime directories when needed and holds the same lock for its lifetime.
+Source-backed candidates carry immutable, content-addressed manifests under
+`/var/lib/perimeterd/prefixes/`; the committed revision selects its manifest.
+Do not edit these files or choose one by modification time. Startup validates
+referenced cache evidence before mutating the firewall. Unreferenced cache files
+are collected only after startup recovery or explicit cleanup, not while source
+workers may be staging candidates.
 
-Immutable revision files, the prepared journal, and durable `active.json`
-publication define recovery authority. Startup recovers persisted state before
-reading YAML. An uncertain publication fences new applies until stabilization;
-post-commit retirement failures are retried without rolling back the committed
-revision. Ownership inspection rejects unknown children. nftables sets use their
-recorded owner/generation-qualified names plus exact type, flags, and contents
-inside the marked table: nft JSON does not round-trip set comments.
+Refresh uses the configured `geo.refresh_interval` (default `24h`) plus sampled
+jitter up to `geo.refresh_jitter` (default `10m`). Each request defaults to a
+`30s` timeout, with at most four source requests in flight and at most 512
+selectors. Incomplete, malformed, oversized, or otherwise unacceptable source
+data leaves the committed policy unchanged. A committed snapshot is reused
+only when it covers every required selector; a newly introduced selector must
+resolve successfully. Failed refreshes retain the active policy and retry on
+the normal schedule.
 
-Source-backed candidates carry an immutable manifest under
-`/var/lib/perimeterd/prefixes/`; the committed revision selects it. Do not edit
-these content-addressed files or choose a manifest by its modification time.
-Startup validates referenced cache evidence before recovery mutates the firewall.
-Unreferenced cache files are collected after startup recovery or explicit cleanup,
-not while source workers may be staging candidates.
-
-Refresh defaults to every `24h` plus independently sampled `0..10m` jitter,
-with a `30s` request timeout and at most four requests in flight. Incomplete,
-malformed, or oversized source data leaves committed enforcement unchanged.
-Startup/reload can fall back only to the committed snapshot when it covers every
-required selector; newly introduced selectors must resolve successfully. Reusing
-cached data preserves its original retrieval time. Failed refreshes are logged
-with snapshot age and retried on the normal schedule. Direct-only configurations
-make no source requests.
-
-Encoded state records are limited to 16 MiB and rejected before publication if
-oversized. nftables preflight requires each complete target to fit the 8 MiB
-installation limit and budgets inspection of both retained generations before
-preparing a transaction. Its conservative inspection budget is 48 MiB per table.
-iptables and ipset command input is conservatively budgeted at 16 MiB per batch;
-preflight also reserves inspection capacity for retained generations and the full
-iptables rule inventories within a 48 MiB budget. `ipset` contents are queried only
-for exact recorded/candidate names, so unrelated foreign set data does not enter
-that budget. Both backends capture at most 64 MiB of native output per command;
-the total captured content of selected ipsets has the same limit. Oversized
-reloads leave the committed revision recoverable rather than installing
-unreadable state.
-
-When configured, `/metrics` exposes `perimeterd_enforcement_health` and, for an
-active source-backed revision,
-`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The timestamp
-is the oldest required selector's retrieval time, not manifest publication time.
-Kernel packet/byte counters remain available through nftables named counters or
-iptables ownership-tagged rules; unchanged iptables processed rules retain their
-counters across generation switches. The full metric suite, installed systemd
-unit, packages, and release gates below remain planned.
-Startup sends bounded systemd timeout extensions and `READY=1` only after
-reconciliation, durable commit, and required recovery complete.
-The metrics server bounds complete request reads and response writes to ten
-seconds, headers to five seconds, and idle keep-alive connections to thirty
-seconds; a client withholding a request body cannot retain a connection forever.
-During listener replacement, an expired graceful-shutdown deadline does not
-degrade enforcement health if the old listener and connections are successfully
-force-closed. Actual resource-close failures still degrade health.
-
-The following operator sequence assumes the planned package and installed unit,
-not just the current source build.
+State and native-input limits are safety fences, not tuning knobs. Encoded
+state is limited to 16 MiB. nftables preflight requires each complete target to
+fit the 8 MiB installation limit and budgets inspection of both retained
+generations at 48 MiB per table. iptables/ipset command input is limited to
+16 MiB per batch; preflight reserves retained-generation and complete-rule
+inventory capacity within a 48 MiB budget. Each backend captures at most 64 MiB
+of native output per command, and selected ipset contents share that cap.
+Oversized candidates are rejected before replacing the committed revision.
 
 ## Operator sequence
 
+This sequence is for the current source build. It does not assume a package,
+installed systemd unit, tmpfiles payload, or automatic service startup.
+
 ### Prerequisites
 
-1. Install the package. Its post-install hook provisions the shared xtables
-   lock when systemd is available; no service starts automatically.
-2. If installing after boot, confirm `/run/xtables.lock` was created by the
-   packaged tmpfiles declaration before enabling the unit.
-3. If `crowdsec.enabled` is true or the LAPI endpoint is being replaced,
-   complete the [supported LAPI prerequisite](#supported-crowdsec-lapi-prerequisite)
-   checks, including both feature-flag locations. `validate` cannot perform
-   the remote attestation; leave CrowdSec disabled until the operator checks
-   pass.
-4. Ensure the selected backend tools and any configured parent chains exist.
-   For iptables, verify the validated legacy or nft variant is a matched
-   IPv4/IPv6 set and that `/run/xtables.lock` is the shared writable host file.
+1. Build the binary and install the selected backend tools listed above.
+2. Prepare an isolated test host or namespace and verify that configured
+   iptables parent chains exist.
+3. Write the configuration as root with mode `0600`. Keep credentials outside
+   the YAML and mode `0600` when a future integration requires them.
+4. Run `perimeterd validate --config PATH`, remembering that validation does
+   not perform runtime backend or source checks.
 
 ### Configure and validate
 
-5. Write `/etc/perimeterd/perimeterd.yaml` and any credential file as root with
-   mode `0600`.
-6. Run `perimeterd validate --config /etc/perimeterd/perimeterd.yaml`.
+Use `--config PATH` with `run` and `validate`; if omitted, the CLI uses
+`/etc/perimeterd/perimeterd.yaml`. `firewall.backend` is required. Choose
+`nftables` or `iptables` explicitly; there is no capability auto-selection or
+fallback after an apply error.
+
+An explicit `firewall.iptables.attachments: []` is accepted by local validation.
+When iptables is selected and the desired policy is non-empty, runtime
+reconciliation rejects the candidate before mutation because it has no managed
+packet path. nftables ignores this list. Only the canonical
+[empty desired state](configuration.md#empty-desired-state) may converge to no
+owned artifacts. Do not infer active enforcement from administrator-managed
+jumps.
 
 ### Start and check health
 
-7. Enable and start `perimeterd.service`; check readiness, the bounded
-   `perimeterd_enforcement_health` metric, journal, and `/metrics`.
-8. For a manual `perimeterd run` outside systemd, first run the installed
-   tmpfiles declaration, create `/run/perimeterd` if systemd is not managing
-   `RuntimeDirectory`, and run as root. Never substitute a private xtables lock.
+Run as root and watch stdout/stderr (or the terminal where the foreground
+process is attached). If `metrics.listen` is non-empty, the listener binds
+before the first firewall commit; the default is loopback-only
+`127.0.0.1:2112`. Initial bind failure prevents readiness of the process's
+startup protocol. `GET /metrics` is unauthenticated, so expose a non-loopback
+address only behind suitable network access control.
+
+The current endpoint emits `perimeterd_enforcement_health` and, for an active
+source-backed revision,
+`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. Native
+processed and terminal-denial counters are available through the selected
+backend's owned counter objects; their semantics and inspection paths are in
+[Packet and byte accounting](firewall-backends.md#packet-and-byte-accounting).
+The broader Prometheus metric surface remains a planned release artifact (see
+[Prometheus metrics](#prometheus-metrics)).
 
 ### Reload, recover, and cleanup
 
-9. Use `systemctl reload perimeterd` for staged changes. A health value of `0`
-   after readiness requires recovery; it is not made healthy by systemd's
-   already-sent `READY=1`. If recovery fails, repair prerequisites and restart,
-   or stop the service and invoke explicit cleanup as described in the
-   [durable recovery contract](architecture.md#durable-apply-and-crash-recovery);
-   preserve recovery metadata and do not purge state.
-10. Before intentional decommissioning, stop the service and confirm it is
-    inactive, then run `perimeterd cleanup`. Purge configuration or state only
-    after cleanup reports success; a failure preserves recovery metadata and
-    owned locks for retry.
+1. Edit a complete configuration, then send `SIGHUP`.
+2. If resolution, compilation, preflight, apply, or durable publication fails,
+   keep the old configuration and inspect the structured log. Do not delete
+   state to force a reload.
+3. If enforcement becomes unhealthy, stop ordinary changes. Preserve the
+   journal, active record, revisions, source manifests, and ownership metadata;
+   restart `run` or invoke explicit cleanup only after stopping the daemon.
+4. For intentional decommissioning, stop the process, confirm it is inactive,
+   run `sudo bin/perimeterd cleanup`, and purge state only after cleanup
+   reports success.
+
+The backend-specific mixed-family window, migration overlap, retained
+ownership, and degraded-recovery behavior are defined in
+[architecture](architecture.md#durable-apply-and-crash-recovery) and
+[firewall backend failure behavior](firewall-backends.md#failure-and-cleanup-behavior).
 
 ## Supported CrowdSec LAPI prerequisite
 
-Before setting `crowdsec.enabled: true`, install and verify the reviewed
-CrowdSec v1.7.6 LAPI deployment described in the [supported LAPI
-contract](data-sources.md#supported-lapi-contract). This is the only version 1
-baseline; a future CrowdSec version requires review before it is used.
+**Planned integration.** The current runtime rejects CrowdSec enablement. Before
+this integration can be released, the operator must install and verify the
+reviewed CrowdSec v1.7.6 LAPI deployment described by the [supported LAPI
+contract](data-sources.md#supported-lapi-contract). A future CrowdSec version
+requires compatibility review before use.
 
-The `chunked_decisions_stream` feature must be disabled in both locations on
-the CrowdSec host:
+The planned prerequisite requires `chunked_decisions_stream` to be disabled in
+both locations on the CrowdSec host:
 
-- in the environment of the `crowdsec` process, set
-  `CROWDSEC_FEATURE_CHUNKED_DECISIONS_STREAM=false`; and
-- in `ConfigDir/feature.yaml` (normally
-  `/etc/crowdsec/feature.yaml`), leave out the
-  `- chunked_decisions_stream` list entry.
+- set `CROWDSEC_FEATURE_CHUNKED_DECISIONS_STREAM=false` in the `crowdsec`
+  process environment; and
+- omit `- chunked_decisions_stream` from `ConfigDir/feature.yaml` (normally
+  `/etc/crowdsec/feature.yaml`).
 
-An environment value of `false` does not override a YAML list entry that
-enables the feature. If `ConfigDir/feature.yaml` still contains
-`- chunked_decisions_stream`, the feature remains enabled. Inspect both
-locations, restart CrowdSec after changing either one, and inspect the new
-process's effective environment and loaded feature configuration.
-
-This is an operator-checked deployment prerequisite, not a capability that
-perimeterd can attest remotely. `perimeterd validate` checks local
-configuration and cannot prove the remote CrowdSec version or effective
-feature state. Successful authentication, HTTP status, response-envelope
-validation, or a `Transfer-Encoding` header likewise cannot prove that the
-server is using the safe supported path or that the backend is complete.
-Before initial enable and every LAPI endpoint replacement, check the server
-version and both feature-flag locations, then run `perimeterd validate`; enable
-or reload only after those checks pass. The protocol and request details remain
-in the [source contract](data-sources.md#supported-lapi-contract).
+An environment value of `false` does not override a YAML list entry that enables
+the feature. Inspect both locations, restart CrowdSec after changing either,
+and inspect the new process's effective environment and loaded feature
+configuration. This is an operator-checked prerequisite, not a capability that
+perimeterd can attest remotely. Local `validate`, successful authentication,
+HTTP status, or response-envelope validation cannot prove the remote version,
+feature state, or complete stream contract.
 
 ## Lifecycle lock and recovery
 
-Before reading or mutating firewall state, persisted ownership metadata, or
-recovery state, both `perimeterd run` and `perimeterd cleanup` open
-`/run/perimeterd/owner.lock` and acquire an exclusive nonblocking `flock`.
-This is process-lifetime ownership, not merely iptables serialization. A
-second daemon, or cleanup while the service is active, fails clearly and
-performs no mutation. Stop the service and confirm it is inactive before
-package scripts or an operator invokes cleanup. Neither command unlinks or
-replaces `owner.lock`; `RuntimeDirectoryPreserve=yes` protects its inode while
-the service and cleanup hand off ownership. See the
-[exclusive lifecycle ownership contract](architecture.md#exclusive-lifecycle-ownership).
+`run` and `cleanup` acquire an exclusive, nonblocking `flock` on
+`/run/perimeterd/owner.lock` before reading or mutating persisted ownership,
+recovery state, or firewall state. They hold it for their whole lifetime. A
+second daemon, or cleanup while the daemon is active, fails without mutation.
+The lock inode is never unlinked or replaced. The lifecycle lock is distinct
+from the host-wide xtables lock: xtables serializes compatible iptables restore
+commands only and does not coordinate nftables, migrations, or durable state.
 
-The xtables lock remains a separate host-wide lock used by legacy and nft
-iptables restore operations. It does not replace the lifecycle lock and does
-not serialize nftables changes, target migration, or persisted metadata.
-
-For operator-visible recovery behavior, see the architecture's
-[durable apply and crash recovery](architecture.md#durable-apply-and-crash-recovery)
-and [failure safety](architecture.md#failure-safety) contracts. In particular,
-iptables IPv4 and IPv6 applies are separate operations: a failure after one
-family commits can expose a mixed-generation window. Compensating rollback is
-attempted but cannot erase that window. If rollback or recovery cannot restore
-the last committed target, perimeterd retains recovery metadata and keeps the
-last committed revision authoritative, reports enforcement degraded, and blocks
-ordinary reload or other mutation.
-Only recovery or explicit cleanup may proceed under the lifecycle lock.
-
-Target migration applies the replacement before removing the recorded old
-target. During overlap both owned targets can enforce and may overblock. Old
-target cleanup must finish before migration is healthy; if it fails, both
-targets and recovery metadata remain for operator repair, the daemon is
-not-ready on the next activation, and enforcement health stays degraded. See
-[backend and target migration](architecture.md#backend-and-target-migration).
-
-Recovery metadata is never discarded to make a stop, upgrade, removal, or
-failed cleanup appear successful. The durable active-record transaction is the
-commit point; journal phases alone are not authoritative. If recovery fails,
-state and ownership records remain intact and mutations stay blocked except for
-recovery or explicit cleanup. Package purge is forbidden until owned cleanup
-has succeeded.
+Recovery is authoritative from the immutable revisions, prepared journal, and
+published `active.json`; it is not inferred from current YAML or a partially
+observed kernel listing. Startup recovers pending work before loading and
+validating YAML. A precommit failure restores the prior recorded selection; a
+committed transaction remains authoritative even if retirement is delayed. An
+uncertain publication or failed compensation retains all evidence, reports
+unhealthy enforcement, and fences ordinary mutations until recovery succeeds.
+See the canonical [exclusive lifecycle ownership](architecture.md#exclusive-lifecycle-ownership),
+[durable apply and crash recovery](architecture.md#durable-apply-and-crash-recovery),
+and [backend migration](architecture.md#backend-and-target-migration) contracts.
 
 ## Installed layout
 
-- `/usr/bin/perimeterd`: root-owned executable; static daemon and CLI.
-- `/etc/perimeterd/perimeterd.yaml`: `root:root`, mode `0600`; configuration.
-- `/etc/perimeterd/credentials.d/`: `root:root`, mode `0700`; secret directory.
-- `/etc/perimeterd/credentials.d/*`: `root:root`, mode `0600`; credentials.
-- `/var/lib/perimeterd/`: `root:root`, mode `0700`; state and cache.
-- `/run/perimeterd/`: `root:root`, mode `0700`; runtime state.
-- `/run/perimeterd/owner.lock`: root-owned mode `0600` lifecycle lock shared by
-  `run` and `cleanup`.
-- `/run/xtables.lock`: root-owned mode `0600` host-wide lock shared by the
-  iptables and ip6tables command families.
-- `/usr/lib/tmpfiles.d/perimeterd.conf` (or the distribution's equivalent
-  tmpfiles directory): packaged declaration for the shared xtables lock.
-- `perimeterd.service`: `root:root`, mode `0644`; distribution system unit.
+**Planned package artifact.** A source build does not install these paths or
+create a service. The eventual package contract is:
 
-The package installs the unit into the distribution's system unit directory,
-commonly `/usr/lib/systemd/system/` or `/lib/systemd/system/`; operators do not
-hard-code one path across distributions. systemd creates the state and runtime
-directories with `StateDirectory=perimeterd` and
-`RuntimeDirectory=perimeterd`. `RuntimeDirectoryPreserve=yes` keeps
-`/run/perimeterd/owner.lock` available with the same inode across a service
-stop/restart, so a stopped service can hand the lock to an explicitly invoked
-cleanup command.
+- `/usr/bin/perimeterd`: root-owned static executable;
+- `/etc/perimeterd/perimeterd.yaml`: `root:root`, mode `0600`;
+- `/etc/perimeterd/credentials.d/`: `root:root`, mode `0700`, with files mode
+  `0600`;
+- `/var/lib/perimeterd/`: `root:root`, mode `0700`, for state and cache;
+- `/run/perimeterd/`: `root:root`, mode `0700`, for runtime state;
+- `/run/perimeterd/owner.lock`: root-owned mode `0600` lifecycle lock;
+- `/run/xtables.lock`: root-owned mode `0600` shared by iptables and
+  ip6tables; and
+- a packaged tmpfiles declaration and `perimeterd.service` in the distribution
+  system-unit directory.
 
-The package's tmpfiles payload contains this declaration:
-
-```text
-f /run/xtables.lock 0600 root root -
-```
-
-The `f` entry creates the exact host lock when it is absent and does not
-unlink, replace, or truncate an existing lock. It is never moved into a
-private service namespace or replaced with a per-service lock. Package scripts
-and cleanup therefore leave `/run/xtables.lock` in place even when perimeterd
-is removed.
-
-There is deliberately no service user. The process remains UID 0 so
-`iptables-restore --wait` and `ip6tables-restore --wait` interoperate through
-the root-owned global xtables lock rather than a separate, non-interoperable
-lock. The unit constrains privileges to `CAP_NET_ADMIN` and `CAP_NET_RAW` plus
-filesystem hardening. The iptables backend supports both the legacy
-(`iptables-legacy`/`ip6tables-legacy`) and nft
-(`iptables-nft`/`ip6tables-nft`) command variants. Startup and reload validate
-a matched IPv4/IPv6 save/restore tool family, the selected variant's `ipset`
-compatibility, and access to the shared lock; a missing or mixed variant fails
-closed rather than silently falling back.
+The package must preserve the lifecycle-lock inode across service stop/restart,
+create the state/runtime directories, and provision the shared xtables lock
+without unlinking or replacing an existing lock. There is deliberately no
+service user in that contract: the process remains UID 0 and is constrained to
+`CAP_NET_ADMIN` and `CAP_NET_RAW` by the planned unit.
 
 ## systemd service contract
 
-The packaged unit follows this model:
+**Planned integration; not runnable from the repository's source build.** The
+installed unit is expected to use this shape:
 
 ```systemd
 [Unit]
@@ -336,253 +314,201 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-`systemd-tmpfiles-setup.service` is required and ordered before perimeterd, so
-the packaged declaration provisions `/run/xtables.lock` during boot before the
-daemon can run. `ProtectSystem=strict` is retained; `ReadWritePaths` grants
-the daemon access to that exact host file and does not make `/run` generally
-writable. The service never uses a private lock path and never unlinks or
-recreates the host lock.
+The packaged tmpfiles payload must create, but never replace, the shared lock:
 
-`After=crowdsec.service` is ordering only; it does not require or start
-CrowdSec. CrowdSec-disabled systems remain valid. When CrowdSec is enabled,
-the operator must first satisfy the [supported LAPI
-contract](data-sources.md#supported-lapi-contract). Then `run` must complete
-authentication, an authoritative initial LAPI decision synchronization, and
-application of that synchronized decision set in the initial firewall
-reconcile before it sends `READY=1`. Authentication and response-envelope
-validation are necessary input checks, not proof that the remote backend
-implements the supported server path or complete decision contract. A
-connected or authenticated client without a completed authoritative sync is
-not ready. Failure of that initial sync or application prevents readiness and
-lets systemd retry the service.
+```text
+f /run/xtables.lock 0600 root root -
+```
 
-The process stays in the foreground and never writes a PID file or application
-log file. It sends `READY=1` only after source-dependent validation, metrics
-bind, backend-variant validation, the required initial CrowdSec work (when
-enabled), the initial firewall reconcile, and durable active-record commit.
-See systemd's
-[`Type=notify` service behavior](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Type=)
-and [execution sandbox options](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+`systemd-tmpfiles-setup.service` is ordered before perimeterd so the host lock
+exists before startup. `After=crowdsec.service` is ordering only; it does not
+start or require CrowdSec. `ProtectSystem=strict` remains in force, while
+`ReadWritePaths` grants access to this exact lock rather than making `/run`
+generally writable. The service never uses a private lock path.
 
 ### Recovery before validation
 
-The service invokes `run` directly: it has no `ExecStartPre=validate`.
-`run` first acquires lifecycle ownership and recovers journaled transactions
-using persisted state, even if the current YAML is missing or invalid. Only
-after recovery completes does it parse and validate that YAML and initialize
-sources. A configuration error then exits nonzero without undoing recovered
-enforcement. The standalone `validate` command remains available for operators
-and packaging checks; it is not a prerequisite that can block recovery.
+The planned unit must not use `ExecStartPre=validate`: `run` must recover
+persisted state before reading current YAML. It must extend the activation
+window while bounded startup proceeds and send `READY=1` only after recovery,
+source resolution, backend validation, initial reconcile, durable commit, and
+any required planned CrowdSec synchronization. `READY=1` is not a revocable
+health assertion; operators must also monitor the enforcement-health metric.
 
 ### Bounded startup deadline
 
-Version 1 gives each `run` invocation a fixed overall startup deadline of
-`75m`, measured with a monotonic clock from process entry. It includes ownership
-acquisition, recovery, validation, source resolution, compilation, initial apply,
-and durable commit. All startup contexts and child-command deadlines are
-bounded by the remaining time; a configured request timeout does not extend
-the overall deadline. A known fatal error exits immediately rather than waiting.
+The current `run` startup deadline is 75 minutes, measured with a monotonic
+clock from process entry. It covers lifecycle ownership, recovery, local
+validation, source resolution, compilation, initial apply, and durable
+publication. Startup contexts and child-command deadlines are bounded by the
+remaining time; request timeouts cannot extend it. Known fatal errors exit
+immediately.
 
-`TimeoutStartSec=90s` is the explicit initial systemd activation window, not
-the total allowed initialization time. While initialization is in progress,
-the main process sends `EXTEND_TIMEOUT_USEC` immediately and every `20s`,
-requesting the smaller of `60s` and the remaining overall deadline, together
-with a bounded `STATUS` describing the current phase. The notifier is separate
-from the serialized writer so a pending fetch or apply cannot starve it, and
-notification delivery failure is surfaced. Requested extension intervals never
-exceed the remaining overall deadline. See
-[systemd startup timeout extension](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#TimeoutStartSec=).
+The planned unit's [`TimeoutStartSec=90s`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#TimeoutStartSec=)
+is the initial activation window, not the total startup budget. The notification
+protocol below is implemented, but a source build does not install a unit.
 
-This accommodates 512 uncached selectors at concurrency four even when every
-successful request takes the default `30s`: fetching consumes up to `64m`,
-leaving `11m` for other initialization. It is a deadline policy, not a promise
-that arbitrarily slow sources or recovery always succeed. No independent
+While initialization is in progress, the main process sends
+`EXTEND_TIMEOUT_USEC` immediately and every 20s, requesting the smaller of
+60s and the remaining overall deadline, together with a bounded `STATUS`
+describing the current phase. The notifier is independent of the serialized
+writer so a pending source fetch or apply cannot starve it; notification
+delivery failure is surfaced. Requested extension intervals never exceed the
+remaining deadline.
+
+The budget accommodates 512 uncached selectors at concurrency four when every
+successful request takes the default 30s: source fetching can consume up to
+64m, leaving 11m for other initialization. This is a deadline policy, not a
+promise that arbitrarily slow sources or recovery succeed. No independent
 retry loop resets the startup clock.
 
-At the overall deadline, cancel startup, admit no further mutations, withhold
-`READY=1`, and exit nonzero. Preserve the journal and every required recovery
-object if apply/compensation cannot finish; the next invocation recovers them.
+At the overall deadline, startup cancels, admits no further mutations,
+withholds `READY=1`, and exits nonzero. If apply or compensation cannot finish,
+the journal and every required recovery object remain for the next invocation.
 systemd enforces the last requested activation deadline if the process stalls.
 Direct non-systemd runs enforce the same overall deadline without notification
-delivery. After readiness the startup timer and extensions stop; this mechanism
-is not a runtime watchdog and does not change reload semantics.
-
-A reload stages `SIGHUP`; reload failure keeps the active revision. A normal
-stop leaves static rules and current dynamic kernel leases in place. CrowdSec
-bans are not guaranteed to persist for their full source duration while the
-daemon is down: capped leases expire unless a running owner renews them.
-Static policy remains active independently. See the
-[source lease contract](data-sources.md#overlap-expiry-and-backend-projection).
-`run` and `cleanup` share the lifecycle lock described below; cleanup is only
-for explicit removal of owned artifacts after the service has stopped.
+delivery. After readiness, the startup timer and extensions stop; this is not a
+runtime watchdog and does not change reload semantics.
 
 ## Prometheus metrics
 
-The daemon serves unauthenticated Prometheus exposition at exactly `/metrics`
-on `metrics.listen`. The default `127.0.0.1:2112` is loopback-only; an empty
-string disables the listener. Operators exposing another address must provide
-network access control or a trusted proxy. Initial bind failure prevents
-readiness; a reload binds the replacement listener before committing the
-revision.
+**Current source-build surface.** If `metrics.listen` is configured, `GET
+/metrics` emits:
 
-The version 1 metric surface is:
+- `perimeterd_enforcement_health` (unlabeled gauge): `1` only when the selected
+  enforcement is healthy; it becomes `0` for degraded recovery or listener
+  failure; and
+- `perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}` (gauge),
+  when a source-backed revision is active. It is the oldest required selector's
+  retrieval time, not manifest publication time.
+
+The endpoint allows only `GET` on `/metrics`; other paths return 404 and other
+methods return 405. Read headers are limited to 5s, complete request reads and
+writes to 10s, and idle keep-alive connections to 30s. Listener replacement
+uses a 5s graceful-shutdown deadline and force-closes an expired listener.
+Metrics are unauthenticated and must not be exposed beyond a trusted network
+boundary.
+
+Native packet accounting is implemented independently of the listener. Both
+backends retain processed path-traversal and terminal-denial counters in owned
+kernel objects; disabling HTTP exposition does not change enforcement. See
+[firewall accounting](firewall-backends.md#packet-and-byte-accounting) for
+traversal and denial semantics.
+
+**Planned release metric surface.** The following names and labels remain the
+version-1 observability contract, not a claim that the source build currently
+exports them:
 
 - `perimeterd_build_info` (gauge): constant `1` with bounded build metadata.
 - `perimeterd_config_reload_total{result}` (counter): reload outcomes.
 - `perimeterd_reconcile_total{reason,result}` (counter): reconcile outcomes.
 - `perimeterd_reconcile_duration_seconds{reason}` (histogram): apply latency.
 - `perimeterd_prefixes{family,source,type}` (gauge): active prefix count.
-- `perimeterd_prefix_snapshot_timestamp_seconds{source}` (gauge): snapshot time.
 - `perimeterd_source_requests_total{source,result}` (counter): request outcomes.
 - `perimeterd_crowdsec_decisions{family}` (gauge): active unexpired bans.
 - `perimeterd_crowdsec_connected` (gauge): `1` while connected.
 - `perimeterd_backend_apply_total{backend,result}` (counter): apply outcomes.
-- `perimeterd_enforcement_health` (gauge): unlabeled; `1` only while the
-  committed static selection and current desired dynamic projection are known
-  applied and required cleanup is complete; `0` during partial apply, pending
-  failed dynamic updates, degraded recovery, or incomplete target cleanup.
-- `perimeterd_firewall_processed_packets_total{backend,family,direction}`
-  (counter): owned direction-path traversals entering the perimeterd path.
-- `perimeterd_firewall_processed_bytes_total{backend,family,direction}`
-  (counter): bytes entering an owned direction-path traversal.
+- `perimeterd_firewall_processed_packets_total{backend,family,direction}` and
+  `perimeterd_firewall_processed_bytes_total{backend,family,direction}`
+  (counters): processed path traversals and their bytes.
 - `perimeterd_firewall_denied_packets_total{backend,family,direction,reason,action}`
-  (counter): terminal denial decisions actually executed by perimeterd.
-- `perimeterd_firewall_denied_bytes_total{backend,family,direction,reason,action}`
-  (counter): bytes for terminal denial decisions actually executed by
-  perimeterd.
-- `perimeterd_firewall_counter_read_total{backend,result}` (counter): kernel
+  and `perimeterd_firewall_denied_bytes_total{backend,family,direction,reason,action}`
+  (counters): executed terminal denial decisions and their bytes.
+- `perimeterd_firewall_counter_read_total{backend,result}` (counter): native
   counter-read outcomes.
-- `perimeterd_firewall_counter_timestamp_seconds{backend}` (gauge): time of
-  the last successful kernel counter read.
+- `perimeterd_firewall_counter_timestamp_seconds{backend}` (gauge): timestamp
+  of the last successful native counter read.
 
 The prefix gauge includes built-in local, configured global, and RIPEstat
-prefixes through fixed `source` and `type` label values.
+prefixes through fixed `source` and `type` label values. Allowed label values
+remain bounded: firewall `reason` is `global_blocklist`, `crowdsec`, or
+`geo_policy`; `action` is `drop` or `reject`; and counter-read `result` is
+`success` or `error`. No metric label may contain an address, ASN, country,
+policy name, raw error, or unbounded remote revision.
 
-Allowed label values come from fixed enumerations. Firewall counter `reason` is
-`global_blocklist`, `crowdsec`, or `geo_policy`; `action` is `drop` or
-`reject`; and counter-read `result` is `success` or `error`. Metrics never use
-an IP, ASN, country, policy name, raw error text, or unbounded remote revision
-as a label. `perimeterd_enforcement_health` has no labels and is the bounded
-post-readiness enforcement signal.
+The release contract extends the current unlabeled `perimeterd_enforcement_health`
+gauge to the planned dynamic projection: it is `1` only when the committed
+static selection and current desired dynamic projection are
+known applied and required cleanup is complete. It is `0` during partial apply,
+pending failed dynamic updates, degraded recovery, or incomplete target
+cleanup. `READY=1` is a systemd activation notification, not a revocable
+health assertion; post-readiness failures set this metric to `0` without
+retracting `READY=1`. Health returns to `1` only after serialized recovery
+confirms committed enforcement and required cleanup.
 
-`processed` counts each traversal when it enters an owned perimeterd
-direction path, including traversals that later return because they are
-established, non-new, globally allowed, non-global, or unmatched. A packet may
-traverse multiple valid attachments, such as `FORWARD` and `DOCKER-USER`, or
-both target generations during migration; each traversal contributes, so this
-is not a globally unique-packet total and no packet-mark de-duplication is
-used. A return is not an acceptance verdict from the surrounding firewall.
-`denied` counts only the terminal perimeterd denial decision actually executed
-on a traversal. It does not count an unexecuted duplicate rule or a generated
-rejection response. Executed terminal rules from multiple generated paths
-contribute to the bounded aggregate reason; policy identities never become
-metric labels.
+The planned fixed 15-second background sampler reads native counters through the
+serialized backend path and serves last in-memory values without querying the
+firewall from the Prometheus handler. When a reconcile replaces raw counters,
+it attempts a final read of the retired generation after dispatch switches
+away from it and before removal, then establishes the replacement baseline. A
+failed final read records an accounting gap and never rolls back enforcement.
+Exported process-lifetime totals remain monotonic across reconciles; a daemon
+restart is an ordinary Prometheus counter reset.
 
-A fixed 15-second background sampler reads kernel counters through the
-serialized backend path and serves the last in-memory values without querying
-the firewall from the Prometheus handler. A reconcile that replaces raw
-counters attempts a final read of the retired generation after the dispatch
-switch and before removal, then establishes the replacement baseline. A failed
-final read records an accounting gap but never rolls back enforcement. The
-exported process-lifetime counters otherwise remain monotonic across
-perimeterd reconciles. A daemon restart is an ordinary Prometheus counter
-reset.
-
-A failed read retains the prior values, increments the error result, and
+A failed periodic read retains prior values, increments the `error` result, and
 leaves the last-success timestamp unchanged. Counter collection never changes
-firewall state or readiness. These metrics are operational telemetry, not
-lossless billing or audit records: a process or host crash, external rule
-replacement, or external counter reset can lose accounting. Snapshot age is
-derived from the prefix timestamp gauge; firewall-counter staleness is derived
-from the counter timestamp gauge. Exposition follows the official
+firewall state or readiness. A process or host crash, external rule replacement,
+or external counter reset can lose accounting. These metrics are operational
+telemetry, not lossless billing or audit records. Snapshot age is derived from
+the prefix timestamp gauge; native-counter staleness is derived from the
+counter timestamp gauge. Exposition follows the official
 [Prometheus exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/).
-
-`READY=1` is a systemd activation notification, not a revocable enforcement
-health assertion. A post-readiness apply, rollback, or migration-cleanup
-failure sets `perimeterd_enforcement_health` to `0` and reports status and
-bounded metrics; the daemon does not pretend it can retract `READY=1`.
-Health returns to `1` only after serialized recovery confirms the active
-committed enforcement and required cleanup. Operators must alert on this
-metric in addition to systemd readiness.
 
 ## Logging
 
-Logging uses the Go standard library `log/slog` and writes stdout only;
-stderr is reserved for process-start failures before logging initializes. Both
-streams remain attached to journald under systemd. Supported levels are
-`debug`, `info`, `warn`, and `error`; formats are human-readable `text` and
-machine-readable `json`.
-
-Every record has a timestamp and message. Stable fields are used where
-applicable:
-
-- `component`
-- `operation`
-- `revision`
-- `backend`
-- `policy`
-- `family`
-- `duration`
-- `error`
-
-The API key, credential contents, authorization headers, full prefix lists,
-and packet IP addresses are forbidden. Error values are scrubbed at the
-network boundary so wrapped errors cannot leak credentials.
+The current runtime uses Go `log/slog` and writes stdout; stderr is reserved
+for process-start failures before logging initializes. Levels are `debug`,
+`info`, `warn`, and `error`; formats are `text` and `json`. Records include a
+timestamp and message and may include bounded fields such as `component`,
+`operation`, `revision`, `backend`, `policy`, `family`, `duration`, and `error`.
+Credentials, authorization headers, complete prefix lists, and packet IP
+addresses must not be logged. Network-boundary errors are scrubbed before they
+reach logs.
 
 ## Packages
 
-One package named `perimeterd` is produced as both RPM and DEB with
-[GoReleaser v2's nFPM integration](https://goreleaser.com/customization/nfpm/).
-Builds are static Linux binaries with `CGO_ENABLED=0` for:
-
-- `amd64` with `GOAMD64=v1`; and
-- `arm64`.
-
-Each package contains the binary, systemd unit, packaged tmpfiles payload
+**Planned release artifact.** The intended release produces one `perimeterd`
+package as RPM and DEB through GoReleaser v2's nFPM integration. Builds are
+static Linux binaries (`CGO_ENABLED=0`) for amd64 (`GOAMD64=v1`) and arm64.
+Each package contains the binary, systemd unit, packaged
 `/usr/lib/tmpfiles.d/perimeterd.conf` (or the distribution equivalent),
-commented example configuration, [MIT license](../LICENSE), and
-documentation. The example configuration is installed with nFPM type
-`config|noreplace`; upgrades never replace an operator-edited file.
+commented example configuration, MIT license, and this documentation. The
+example configuration is installed as `config|noreplace`; upgrades never
+replace an operator-edited file.
 
-Dependency relationships guarantee either nftables or the complete
-iptables/ipset pair:
+Dependency alternatives must provide either nftables or a complete
+iptables/ipset stack, without selecting a backend implicitly:
 
-- Debian: `nftables | iptables, nftables | ipset`
-- RPM rich dependency: `(nftables or (iptables and ipset))`
+- Debian: `nftables | iptables, nftables | ipset`;
+- RPM: a rich dependency equivalent to
+  `(nftables or (iptables and ipset))`.
 
-The selected backend remains an explicit YAML choice; package dependency
-resolution does not auto-select it. When iptables is selected, the daemon
-explicitly validates either the host's legacy command variant or its nft
-variant, including matching IPv4/IPv6 tools and the shared xtables lock; it
-does not silently switch variants after startup.
+When iptables is selected, the daemon validates the matched legacy or
+nf_tables IPv4/IPv6 tools and shared xtables lock; it never silently changes
+variants. Release workflows and provenance checks are owned by
+[development](development.md) and remain planned.
 
 ## Package lifecycle
 
-Package scripts have narrow responsibilities and never mutate firewall policy
+**Planned release artifact.** Package scripts must never mutate firewall policy
 as a side effect:
 
-- **Post-install:** install the unit and tmpfiles payload, run
+- post-install installs the unit and tmpfiles payload, runs
   `systemd-tmpfiles --create` against the installed perimeterd tmpfiles file
-  when systemd is available (including installation after boot), and run
-  `systemctl daemon-reload`. Report a provisioning failure and do not enable
-  or start the daemon. Print enable/configuration guidance only; do not enable
-  or start an unconfigured firewall daemon.
-- **Upgrade:** preserve configuration, credentials, state, recovery and
-  ownership metadata, and active firewall rules. Restart only under
-  distribution policy; never run cleanup, purge state, or unlink/recreate
-  `/run/xtables.lock` or `/run/perimeterd/owner.lock`.
-- **Final removal:** stop `perimeterd.service` and require it to be inactive,
-  then invoke `perimeterd cleanup` under the shared lifecycle lock using
-  persisted target metadata. Remove packaged files only after cleanup
-  succeeds, and reload systemd. If stopping or cleanup fails, report the error
-  and preserve active rules, recovery metadata, ownership metadata, state, and
-  locks; do not broaden deletion.
-- **Purge:** additionally remove configuration, credentials, cache, and state
-  according to package-manager semantics only after owned-rule cleanup has
-  succeeded. A failed cleanup forbids purging state or recovery metadata and
-  requires an explicit recovery or cleanup retry.
+  when systemd is available (including installation after boot), and runs
+  `systemctl daemon-reload`. A provisioning failure is reported; the script
+  does not enable or start an unconfigured daemon and prints guidance only;
+- upgrade preserves configuration, credentials, state, recovery, ownership
+  metadata, active rules, and both lock inodes. Any restart follows
+  distribution policy; the script never runs cleanup, purges state, or
+  unlinks/replaces `/run/xtables.lock` or `/run/perimeterd/owner.lock`; and
+- final removal stops `perimeterd.service` and requires it to be inactive, then
+  runs `perimeterd cleanup` under the shared lifecycle lock using persisted
+  target metadata. It removes packaged files only after cleanup succeeds and
+  reloads systemd. If stop or cleanup fails, it reports the error and preserves
+  active rules, recovery metadata, ownership metadata, state, and locks.
 
-Scripts never alter host default firewall policies, globally flush netfilter,
-create Docker chains, infer ownership from object names alone, or remove the
+Purge may remove configuration, credentials, cache, and state only after owned
+firewall cleanup succeeds. Scripts must not flush global netfilter state,
+create Docker-owned chains, infer ownership from names alone, or remove the
 host-wide xtables lock.
-

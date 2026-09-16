@@ -1,13 +1,13 @@
 # Architecture
 
-This document owns the components, static revision lifecycle, writer ownership,
-and durable recovery contract for the planned first release. Read the component
-boundaries and lifecycle first; admission and transaction details follow.
+This document owns component boundaries, static revision admission, writer
+ownership, and durable recovery. The static lifecycle is implemented for both
+native backends; CrowdSec and deployment extensions below remain first-release
+or future requirements.
 
-> **Version-1 design contract.** This document includes integrations that are not
-> implemented yet. See the [implementation plan](implementation-plan.md) for
-> current milestone status and [operations](operations.md#current-source-build-runtime)
-> for the available runtime.
+The [implementation plan](implementation-plan.md) owns milestone status.
+[Operations](operations.md#current-source-build-runtime) describes what can run
+from a source build today.
 
 Related contracts have one canonical home:
 
@@ -26,7 +26,7 @@ flowchart LR
     CS[Local config source] --> V[Strict validation]
     V --> R[Selector resolver and RIPEstat cache]
     R --> C[Policy compiler]
-    L[CrowdSec LAPI stream] --> D[Dynamic decision store]
+    L[CrowdSec LAPI stream - planned] --> D[Dynamic decision store - planned]
     C --> W[Serialized firewall writer]
     D --> W
     W --> B[Selected firewall backend]
@@ -40,16 +40,16 @@ flowchart LR
     O -. observes .-> B
 ```
 
-`perimeterd` is one foreground process. It has one owner for firewall
-mutation: the serialized writer. Config parsing, network requests, prefix
-normalization, policy compilation, and replacement-resource setup happen
-outside the apply critical section. Only completed policy candidates and
-coalesced CrowdSec deltas enter the writer queue. The writer serializes every
-nftables, iptables, ip6tables, and ipset operation.
+`perimeterd` is one foreground process with one serialized firewall writer.
+Configuration parsing, network requests, prefix normalization, policy compilation,
+and replacement-resource setup happen outside the apply critical section.
+Completed static candidates enter the writer; the planned CrowdSec integration
+will submit coalesced decision deltas through the same owner.
 
-Backend packages, source adapters, and CrowdSec code never mutate shared
-firewall or active-revision state directly. Logging and metrics observe each
-stage but do not participate in policy decisions.
+Only the writer invokes backend mutations and native inspection. Backends
+perform these operations under that ownership; source adapters never mutate
+firewall or active-revision state. Logging and metrics observe the selected
+revision but do not make policy decisions.
 
 ### Exclusive lifecycle ownership
 
@@ -75,47 +75,36 @@ managers.
 
 ## Conceptual contracts
 
-The names below specify boundaries, not a committed package API:
+These are responsibility boundaries, not a prescription for additional Go
+interfaces. [Development](development.md#current-repository-layout) maps them
+to the current files.
 
-```go
-type ConfigSource interface {
-    Load(context.Context) (Config, Revision, error)
-    Watch(context.Context) <-chan Revision
-}
+| Boundary | Responsibility | Must not own |
+| --- | --- | --- |
+| Configuration | Read local YAML, validate and normalize it; admit reload requests through the app | Kernel mutation or remote-source resolution |
+| Source resolution | Resolve required selectors into one immutable, validated snapshot and cache manifest | Partial policy publication or backend syntax |
+| Policy compilation | Purely compile normalized configuration and snapshots into immutable, backend-neutral rules, sets, and accounting roles | Network, filesystem, or kernel I/O |
+| Application engine | Serialize admission, freshness checks, mutation, and transaction decisions | Native packet-filter syntax |
+| Durable store | Validate and publish revision/journal records with explicit durability barriers | Choosing which attempted revision should win |
+| Native backend | Preflight, apply, retire, and clean up exact owned targets; preserve native accounting objects | Fetching source data or selecting the durable active revision |
+| Runtime publication | Publish the selected source snapshot, logger, and listener; retain or discard staged resources according to the selected transaction | Treating an uncertain commit as success |
 
-type PrefixSource interface {
-    Resolve(context.Context, []Selector) (PrefixSnapshot, error)
-}
+The current configuration ingress is a local file, reloaded with `SIGHUP`; the
+current static provider is RIPEstat. Future configuration or prefix providers
+must preserve these boundaries and produce complete candidates rather than
+bypass admission or call a backend directly.
 
-type PolicyCompiler interface {
-    Compile(Config, PrefixSnapshot) (PolicyState, error)
-}
+Static reconciliation remains separate from the planned incremental CrowdSec
+path: individual decisions must not rebuild global or geo sets. Both paths use
+the same writer.
 
-type Backend interface {
-    ReconcilePolicy(context.Context, PolicyState) error
-    ApplyDecisionDelta(context.Context, DecisionDelta) error
-    ReadCounters(context.Context) (CounterSnapshot, error)
-    Cleanup(context.Context) error
-}
-```
-
-Version 1 supplies a local-file `ConfigSource`; `SIGHUP` causes another load.
-A later central configuration service must satisfy the same contract rather
-than entering process orchestration or firewall packages. Version 1 supplies a
-RIPEstat `PrefixSource`; a later centrally supplied prefix snapshot must return
-the same normalized, all-or-nothing `PrefixSnapshot`.
-
-`PolicyCompiler` output is immutable, backend-neutral, and contains global
-IP/CIDR allow/block rules plus static geo policy, rules, sets, and bounded
-accounting roles. Static policy reconciliation is separate from incremental
-CrowdSec changes so a decision does not rebuild global or geo sets. Backend
-mutations and counter reads all run exclusively through the writer.
-
-Counter sampling is an observer, not a policy input. It calls `ReadCounters`
-through the writer outside the Prometheus request path, never mutates rules,
-and does not change readiness. [Operations](operations.md#prometheus-metrics)
-owns the 15-second cadence, generation-delta accumulation, monotonic
-process-lifetime totals, and retention of the last successful sample on failure.
+Kernel packet/byte accounting is implemented; periodic collection and Prometheus
+export of those counters are planned. The collector must be an observer, not a
+policy input: it reads through the writer outside the Prometheus request path,
+never mutates rules, and does not change readiness.
+[Operations](operations.md#prometheus-metrics) owns the required 15-second cadence,
+generation-delta accumulation, monotonic process-lifetime totals, and retention
+of the last successful sample on failure.
 
 ## Revision lifecycle
 
@@ -127,12 +116,13 @@ process-lifetime totals, and retention of the last successful sample on failure.
 - `perimeterd run --config /etc/perimeterd/perimeterd.yaml` acquires lifecycle
   ownership and recovers pending transactions before reading or validating the
   current YAML. It then obtains every required fresh or committed cached
-  prefix, synchronizes CrowdSec authoritatively when enabled, reconciles once,
-  durably commits, and only then signals systemd readiness. The
+  prefix, reconciles, durably commits, and completes required recovery before
+  reporting readiness. The planned CrowdSec integration additionally requires
+  authoritative synchronization when enabled. The
   [bounded startup protocol](operations.md#bounded-startup-deadline) applies
   throughout recovery and initialization.
-- `perimeterd version` reports the tag, commit, and build time embedded by the
-  release workflow.
+- `perimeterd version` reports build metadata. Population from signed release
+  tags belongs to the planned release workflow.
 - `perimeterd cleanup` acquires lifecycle ownership and reads persisted active,
   prepared, and retired target metadata plus ownership markers, not the
   possibly invalid current configuration. It removes every recorded owned
@@ -144,13 +134,16 @@ process-lifetime totals, and retention of the last successful sample on failure.
 `SIGHUP` stages a complete reload. `SIGTERM` stops watchers, refresh workers,
 and the HTTP listener, drains or safely cancels in-flight work, and exits. It
 deliberately leaves the last applied static rules active across restart.
-Dynamic CrowdSec entries retain only their remaining kernel lease; without a
-running owner they may expire before the source decision's deadline. This is
-not indefinite fail-closed ban retention. Only `cleanup` removes all rules.
+The planned CrowdSec integration retains only the remaining kernel lease on
+shutdown: without a running owner, bans may expire before the source decision's
+deadline. This is not indefinite fail-closed ban retention. Only explicit
+`cleanup` removes all recorded owned artifacts.
 
 ### Staged reload
 
-A reload is a candidate revision until every stage succeeds:
+A reload is a candidate revision until every stage succeeds. Static staging is
+implemented; CrowdSec client synchronization and dynamic-store capture in the
+steps below are requirements for its planned integration.
 
 1. Admit a new request epoch, then parse and strictly validate the complete file.
 2. Resolve selectors using acceptable cache entries and required network
@@ -174,6 +167,13 @@ the last committed revision remains recorded, but it is not claimed to describe
 actual enforcement. No new candidate or source delta may mutate the firewall
 until recovery succeeds. Counter reads and explicit cleanup remain available.
 See [firewall backends](firewall-backends.md#failure-and-cleanup-behavior).
+
+Runtime resources follow the durable selection, not merely the last attempted
+apply. A committed-but-degraded result publishes the committed revision while
+health remains false. An uncertain uncommitted result retains its staged listener
+until recovery either selects that transaction or discards it. An unchanged
+metrics address reuses the active listener; pending listeners are also released
+on shutdown. Startup still withholds readiness until required recovery completes.
 
 Removing a policy or setting its mode to `disabled` is valid. The canonical
 [empty desired state](configuration.md#empty-desired-state) predicate includes
@@ -206,7 +206,7 @@ Superseded work is cancelled opportunistically and discarded at the writer
 even if cancellation loses a race. Discard closes candidate resources without
 changing active state, cache pointers, or failure health.
 
-CrowdSec shares the writer but has its own
+The planned CrowdSec integration shares the writer but has its own
 [dynamic admission and activation contract](data-sources.md#authoritative-stream-and-decision-identity).
 It distinguishes client identity, desired revision, and enforcement operation
 sequence so unchanged bans can renew without admitting stale work. That
@@ -238,12 +238,12 @@ The journal records:
 - recovery progress, including switched iptables families.
 
 Persist configuration paths and source identity, never credential contents.
-Dynamic decisions are not a durable cache: surviving kernel entries retain
-only their remaining leases, and authoritative LAPI synchronization rebuilds
-the store before readiness after restart. Static rollback restores the prior
-dynamic-set references without resetting timeouts. Live renewal uses the
-authoritative unexpired store under the source lease contract; it never
-extends the decision deadline. If kernel state was lost on reboot, source
+For the planned CrowdSec integration, decisions are not a durable cache:
+surviving kernel entries retain only their remaining leases, and authoritative
+LAPI synchronization rebuilds the store before readiness after restart. Static
+rollback restores prior dynamic-set references without resetting timeouts.
+Live renewal follows the [source lease contract](data-sources.md) and never
+extends a decision deadline. If kernel state was lost on reboot, source
 initialization must succeed before a complete initial reconcile.
 
 ### Durable record publication
@@ -350,7 +350,8 @@ The last-known-good revision remains authoritative when a candidate is unsafe:
 
 - Unknown or invalid configuration never enters the writer.
 - An incomplete source snapshot is an error, never an empty selector result.
-- A missing configured parent chain fails reconciliation.
+- A missing parent chain required by the candidate fails preflight. A missing
+  obsolete custom parent does not prevent removal of remaining owned artifacts.
 - A failed nftables switch is atomic; a partially committed iptables update
   requires compensation and may enter degraded recovery.
 - First start with required geo selectors and neither a valid committed cache
@@ -360,9 +361,9 @@ The last-known-good revision remains authoritative when a candidate is unsafe:
 - Refresh failure retains cached prefixes and the active rules. Logs and
   metrics expose the error and snapshot age; the normal schedule retries.
 
-CrowdSec delta failures are additionally retained in the authoritative
-in-memory decision store and retried idempotently, as detailed in
-[data sources](data-sources.md).
+The planned [CrowdSec contract](data-sources.md#crowdsec-stream) additionally
+retains failed deltas in the authoritative in-memory store and retries them
+idempotently.
 
 ## Security and trust boundaries
 
@@ -373,9 +374,10 @@ output boundaries and accept only typed desired state, never source-provided
 firewall syntax. No source adapter can select commands, chain names, or raw
 rules.
 
-The service runs as UID 0 with only the capabilities and systemd hardening
-listed in [operations](operations.md). Metrics are unauthenticated, loopback by
-default, and contain no secrets or unbounded identifiers.
+`run` and `cleanup` require UID 0. The planned installed service adds the
+capability restrictions and systemd hardening in [operations](operations.md);
+a source build does not install that unit. Metrics are unauthenticated,
+loopback-only by default, and contain no secrets or unbounded identifiers.
 
 ## Future deployment boundaries
 
@@ -384,20 +386,15 @@ respective source adapters later; they do not change the compiler, writer, or
 backend contracts. Their protocols, authentication, and consistency model are
 intentionally undecided.
 
-A future container and Helm release will most likely target
+A future container/Helm delivery may target
 [Cilium Host Firewall](https://docs.cilium.io/en/stable/security/host-firewall/)
-rather than mutate each node's nftables state directly. A Cilium backend would
-compile the same backend-neutral policy into owned
-`CiliumClusterwideNetworkPolicy` resources selected by `spec.nodeSelector` and
-reconcile them through the Kubernetes API. Cilium host-firewall enforcement
-must already be enabled by the cluster operator.
+rather than mutate each node's nftables state directly. A possible backend would
+reconcile owned `CiliumClusterwideNetworkPolicy` resources selected by
+`spec.nodeSelector`, with host-firewall enforcement already enabled by the
+cluster operator.
 
-The exact deployment topology remains undecided. A leader-elected controller
-is the likely model for cluster-wide resources; a per-node DaemonSet is
-appropriate only if a later requirement introduces node-local work. Policy
-ownership, atomic revision switching, CrowdSec decision representation,
-required Cilium capabilities, chart values, and Kubernetes RBAC must be
-designed and tested before that backend is committed.
-
-That delivery phase adds `build/package/` and `charts/perimeterd/`; no
-placeholders are created now.
+That is not a committed backend or deployment topology. Before implementation,
+define ownership, revision switching, CrowdSec representation, required Cilium
+capabilities, chart values, and Kubernetes RBAC. A cluster controller versus
+node-local DaemonSet is a later requirements decision. Add `build/package/` and
+`charts/perimeterd/` only with working artifacts, not placeholder directories.

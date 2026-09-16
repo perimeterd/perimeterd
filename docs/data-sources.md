@@ -1,16 +1,53 @@
 # Data Sources
 
-> **Version-1 source contract.** The RIPEstat adapter, immutable cache, and static
-> policy refresh/recovery integration are implemented for nftables. CrowdSec
-> dynamic-ban integration remains planned. The
-> [implementation plan](implementation-plan.md) tracks delivery.
+> **Implemented status.** The RIPEstat resolver and immutable cache provide
+> static country/ASN snapshots, including release-pinned country-based RIR and
+> group expansion. Source-backed policy is implemented on both nftables and
+> iptables/ipset (legacy and nf_tables tool families). Refresh, cache, and
+> durable-recovery behavior are implemented; backend realization is specified
+> in [firewall backends](firewall-backends.md).
+>
+> **Planned status.** CrowdSec dynamic-ban runtime integration remains planned.
+> The protocol, authoritative-stream, expiry, projection, lease, and reload
+> requirements below are the first-release contract for that integration, not a
+> claim that the current runtime can enable it. The
+> [implementation plan](implementation-plan.md) is authoritative for delivery
+> status, and [operations](operations.md#current-source-build-runtime) lists
+> currently usable runtime capabilities.
 
-Version 1 uses RIPEstat for static country/ASN prefixes and CrowdSec LAPI for
-dynamic ingress bans. [Configuration](configuration.md) defines selectors and
-defaults; [architecture](architecture.md) defines revision commit behavior and
-process lifecycle. Sources produce typed data and never emit firewall syntax.
-This document owns source wire compatibility, source-side validation, cache
-coupling, authoritative dynamic state, timed projection, and lease behavior.
+## Contents
+
+- [RIPEstat scope and accuracy](#ripestat-scope-and-accuracy)
+  - [Normative provider contract](#normative-provider-contract)
+  - [Evaluated alternative: sapics/ip-location-db](#evaluated-alternative-sapicsip-location-db)
+- [Resolution transaction](#resolution-transaction)
+  - [Normative resolution steps](#normative-resolution-steps)
+  - [Actual-response fixtures](#actual-response-fixtures)
+- [Immutable selector objects and snapshot manifests](#immutable-selector-objects-and-snapshot-manifests)
+  - [Selector objects](#selector-objects)
+  - [Snapshot manifests](#snapshot-manifests)
+  - [Cache publication and durable-commit coupling](#cache-publication-and-durable-commit-coupling)
+  - [Fresh reuse and stale fallback](#fresh-reuse-and-stale-fallback)
+- [CrowdSec stream (planned)](#crowdsec-stream)
+  - [Supported LAPI contract](#supported-lapi-contract)
+  - [Compatibility rationale and primary-source evidence](#compatibility-rationale-and-primary-source-evidence)
+  - [Response-envelope validation](#response-envelope-validation)
+  - [Decision acceptance and expiry](#decision-acceptance-and-expiry)
+  - [Authoritative stream and decision identity](#authoritative-stream-and-decision-identity)
+  - [Stream synchronization and activation](#stream-synchronization-and-activation)
+  - [Overlap, expiry, and backend projection](#overlap-expiry-and-backend-projection)
+  - [Renewable kernel leases](#renewable-kernel-leases)
+- [CrowdSec availability, endpoint changes, and secrets (planned)](#crowdsec-availability-endpoint-changes-and-secrets)
+- [Source failure matrix](#source-failure-matrix)
+
+Version 1 uses RIPEstat for static country/ASN prefixes. The first-release
+design also includes a planned CrowdSec LAPI integration for dynamic ingress
+bans. [Configuration](configuration.md) defines selectors and defaults;
+[architecture](architecture.md) defines revision admission, commit behavior,
+and process lifecycle. Sources produce typed data and never emit firewall
+syntax. This document owns source wire compatibility, source-side validation,
+cache coupling, authoritative dynamic state, timed projection, and lease
+behavior.
 
 ## RIPEstat scope and accuracy
 
@@ -79,9 +116,10 @@ added until such an implementation exists.
 
 ## Resolution transaction
 
-`PrefixSource.Resolve` expands only selectors referenced by enabled policies.
-Every resolution is a complete candidate, not a stream of independently
-publishable selector updates.
+`internal/source.Resolver.Resolve` expands only selectors referenced by
+enabled policies and stages one complete immutable cache snapshot. Every
+resolution is a complete candidate, not a stream of independently publishable
+selector updates.
 
 RIR service regions use a release-pinned, explicit country assignment from the
 [RIPE NCC country/RIR table](https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/),
@@ -196,9 +234,10 @@ cache files.
 
 ### Cache publication and durable-commit coupling
 
-The source cache follows the shared durable-commit contract in
-[architecture](architecture.md#durable-apply-and-crash-recovery); this section
-specifies only the cache-specific coupling rules:
+Static candidate admission, journal preparation, active-record publication, and
+crash recovery follow the canonical
+[durable-apply contract](architecture.md#durable-apply-and-crash-recovery).
+The source-specific coupling rules are:
 
 1. Stage and validate every needed object, then write and `fsync` the complete
    manifest and atomically install it, followed by a directory `fsync`.
@@ -210,20 +249,19 @@ specifies only the cache-specific coupling rules:
 3. Change the active committed record, including its transaction ID and
    candidate manifest identifier, only after complete enforcement succeeds.
    Atomically and durably installing that active record is the commit point.
-   Previous generations and their referenced objects remain until that commit is
-   durable.
+   Previous generations and their referenced objects remain until that commit
+   is durable.
 4. Garbage-collect an object or manifest only after no active, journaled, or
    retained generation references it. Garbage collection never changes an
    active pointer.
 
-If a refresh fails after staging some objects, those objects and an
-uncommitted manifest are ignored as orphans; the active manifest is unchanged.
-If a crash occurs before the active record transaction commits, architecture's
-precommit recovery restores the previous owned enforcement before accepting new
-mutations. If the active record transaction is durable, recovery treats it as
-committed and finishes retirement/cleanup. Recovery therefore cannot select a
-snapshot whose selectors come from mixed uncommitted generations; validation of
-journal and committed references is mandatory before work is admitted.
+A failed refresh leaves any staged objects and uncommitted manifest as orphans;
+the active manifest is unchanged. Manifest loading is exact and all-or-nothing:
+it validates every referenced object and never combines independently selected
+cache files or substitutes a newly fetched generation during recovery. The
+architecture contract decides whether precommit recovery restores the previous
+selection or a durable active record finishes retirement; source validation is
+required before either path admits new work.
 
 ### Fresh reuse and stale fallback
 
@@ -263,12 +301,18 @@ normal schedule.
 
 ## CrowdSec stream
 
-When enabled, perimeterd uses the MIT-licensed
+> **Planned first-release integration.** CrowdSec runtime code is not
+> implemented in the current build; `crowdsec.enabled` is schema-valid for
+> offline validation but must remain disabled for runtime use. The requirements
+> in this section are normative for the planned integration and do not imply
+> that a current daemon can authenticate, poll, or enforce CrowdSec decisions.
+
+The planned adapter uses the MIT-licensed
 [`github.com/crowdsecurity/go-cs-bouncer`](https://github.com/crowdsecurity/go-cs-bouncer)
 for authenticated API client setup and its stream-mode data types, not its
 point-query protocol. The adapter owns the polling loop and calls the exposed
 `APIClient.Decisions.GetStream` with explicit `DecisionsStreamOpts.Startup`.
-It does not delegate recovery to `StreamBouncer.Run`: the current
+It must not delegate recovery to `StreamBouncer.Run`: the current
 [implementation](https://raw.githubusercontent.com/crowdsecurity/go-cs-bouncer/main/stream_bouncer.go)
 keeps `Startup=false` after post-start errors and does not implement this
 design's reconnect contract. Pin and review the dependency used for these APIs.
@@ -278,9 +322,9 @@ on Security Engine decisions.
 
 ### Supported LAPI contract
 
-Version 1 supports the reviewed CrowdSec LAPI baseline at
-[v1.7.6](https://github.com/crowdsecurity/crowdsec/tree/v1.7.6), including the
-stream decoder behavior reviewed in
+The planned version-1 integration targets the reviewed CrowdSec LAPI baseline
+at [v1.7.6](https://github.com/crowdsecurity/crowdsec/tree/v1.7.6), including
+the stream decoder behavior reviewed in
 [`pkg/apiclient/client_http.go`](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/apiclient/client_http.go)
 and the feature registration in
 [`pkg/fflag/crowdsec.go`](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/fflag/crowdsec.go).
@@ -619,7 +663,11 @@ degraded recovery blocks dynamic mutations.
 
 ## CrowdSec availability, endpoint changes, and secrets
 
-CrowdSec is optional. When enabled:
+> **Planned integration.** The requirements in this section apply only after
+> the CrowdSec runtime milestone is implemented. Current runtime use keeps
+> CrowdSec disabled; see [operations](operations.md#current-source-build-runtime).
+
+For the planned integration, CrowdSec is optional. When enabled:
 
 - the key file must exist, be readable, and contain a usable credential;
 - initial LAPI authentication, authoritative full synchronization, exact
@@ -627,39 +675,52 @@ CrowdSec is optional. When enabled:
 - later disconnects retain currently valid decisions and enforcement, mark the
   integration unhealthy, obtain a full snapshot on reconnect, and use bounded
   exponential backoff;
-- expiry processing and current `P(D)` projection reconciliation continue while
-  disconnected; and
+- expiry processing and current `P(D)` projection reconciliation continue
+  while disconnected; and
 - replacement credentials are authenticated as a staged reload resource.
 
-Credential replacement and endpoint replacement are staged configuration changes
-under [architecture](architecture.md#staged-reload). Each replacement obtains
-a full `startup=true` snapshot into a separate store. The old store and its
-expiry processing remain authoritative until the configuration's durable commit
-promotes the new client epoch. Do not poll two clients sharing one LAPI stream
-cursor concurrently: pause old polling at a batch boundary while synchronizing
-its replacement, retaining its store and enforcement. If staging fails, resume
-the old client via a full synchronization rather than assuming its incremental
-cursor is unchanged.
+Credential replacement, endpoint replacement, and disabling the integration
+follow [staged reload](architecture.md#staged-reload). The source-specific
+handover rules are:
 
-For an endpoint change, the new endpoint's snapshot is the sole candidate
-authority; never union old-endpoint decisions into it. Disabling CrowdSec stages
-an empty projection. Apply the selected projection with the candidate static
-state at the writer boundary; retire the old client and store only after durable
-commit. A failed apply compensates to the old client's current, unexpired
-projection; failed compensation enters degraded recovery, not a claim that old
-enforcement survived untouched. Precommit crash recovery restores the prior
-static selection and re-synchronizes its configured LAPI before readiness. These
-changes do not independently commit outside the configuration transaction.
+- each replacement obtains a full `startup=true` snapshot into a separate
+  store;
+- the old store and its expiry processing remain authoritative until durable
+  configuration commit promotes the new client epoch;
+- two clients must not poll one LAPI stream cursor concurrently: pause old
+  polling at a batch boundary while synchronizing its replacement, retaining
+  its store and enforcement; and
+- if staging fails, resume the old client via a full synchronization rather
+  than assuming its incremental cursor is unchanged.
 
-The API key is read from `crowdsec.api_key_file`. Its value must never appear in
-the main YAML example, logs, metrics, process arguments, error wrapping, or
+The [durable-apply contract](architecture.md#durable-apply-and-crash-recovery)
+governs the writer boundary, commit point, compensation, and precommit
+recovery. At that boundary, an endpoint change treats the new endpoint's
+snapshot as the sole candidate authority and never unions old-endpoint
+decisions into it. Disabling CrowdSec stages an empty projection. Apply the
+selected projection with the candidate static state, retire the old client and
+store only after durable commit, and compensate a failed apply from the old
+client's current unexpired projection. Failed compensation enters degraded
+recovery rather than claiming old enforcement survived untouched. Precommit
+crash recovery restores the prior static selection and re-synchronizes its
+configured LAPI before readiness. These changes do not independently commit
+outside the configuration transaction.
+
+The API key is read from `crowdsec.api_key_file`. Its value must never appear
+in the main YAML example, logs, metrics, process arguments, error wrapping, or
 diagnostic dumps. Logs also omit complete prefix lists; metrics use bounded
-source/result labels only. CrowdSec decisions are not persisted as secrets or as
-an authority across restart: restart performs a new authoritative LAPI snapshot
-and reconciliation. See [operations](operations.md) for credential file modes
-and observability.
+source/result labels only. CrowdSec decisions are not persisted as secrets or
+as an authority across restart: restart performs a new authoritative LAPI
+snapshot and reconciliation. See [operations](operations.md) for credential
+file modes and observability.
+
 
 ## Source failure matrix
+
+The RIPEstat/cache rows describe implemented source-backed policy. The CrowdSec
+rows are requirements for the planned integration.
+
+### RIPEstat and cache (implemented)
 
 | Failure | Required behavior |
 | --- | --- |
@@ -667,9 +728,14 @@ and observability.
 | Malformed, partial, status-failed, or identity-mismatched RIPEstat response | Reject the whole candidate. An active daemon exposes failure and age without replacing its committed manifest. |
 | Corrupt staged objects or orphaned/uncommitted manifests | Ignore them and fetch or use a complete valid committed manifest. First start fails if a complete candidate cannot be built. |
 | Corrupt objects referenced by recovery state | Do not silently substitute a newly fetched generation. Recovery validates the journal and committed references before admitting work; missing recovery evidence requires repair as specified in [architecture](architecture.md#durable-apply-and-crash-recovery). |
+| Initial backend application failure | Withhold readiness and perform backend-specific compensation; preserve recovery evidence if it fails. |
+
+### CrowdSec integration (planned)
+
+| Failure | Required behavior |
+| --- | --- |
 | CrowdSec key missing or unreadable | Fail first-start readiness. A reload is rejected and its active client remains. |
 | Initial CrowdSec authentication or authoritative snapshot failure | Fail first-start readiness before applying a candidate. |
-| Initial backend application failure | Withhold readiness and perform backend-specific compensation; preserve recovery evidence if it fails. |
 | Credential/endpoint replacement or disable failure | Keep the old configuration committed, resume its synchronization, and compensate any partial apply. Failed compensation reports degraded enforcement. |
 | Later CrowdSec outage or reconnect snapshot failure | Mark the integration unhealthy, retain unexpired decisions until local expiry, and retry the full authoritative synchronization. |
 | CrowdSec backend delta failure | Recompute the current `P(D)` projection from the authoritative store, queue that reconciliation, and retry idempotently. |

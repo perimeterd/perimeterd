@@ -19,7 +19,7 @@ internal/config/catalog/      checked-in selector catalogs
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
-internal/source/              RIPEstat resolution, immutable cache and captured HTTP fixtures
+internal/source/              RIPEstat resolution, immutable cache and local HTTP fixtures
 internal/state/               revision store, record codec/validation and durable filesystem IO
 configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
 .github/workflows/ci.yml      quality, build, unit/race and native firewall gates
@@ -30,84 +30,70 @@ docs/                         design contracts, current operations and implement
 Makefile                      local and CI entry points
 ```
 
-Ownership follows [architecture](architecture.md): `internal/app` coordinates
-revisions and the serialized writer; `internal/policy` knows no backend syntax;
-the firewall backend consumes immutable targets and does not fetch source data.
-File boundaries inside a package separate responsibilities without introducing
-new package APIs:
+Ownership follows [architecture](architecture.md): `internal/app` owns
+revision admission and the serialized writer; `internal/policy` stays
+backend-neutral; source resolution and cache publication stay in
+`internal/source`; native firewall mutation stays in `internal/firewall`.
+The detailed lifecycle, source, configuration, and packet-path contracts belong
+to their canonical documents rather than this contributor guide.
 
-- `internal/app/publication.go`: active logger/listener ownership, staged
-  reservations, source selection, and transaction-gated resource publication.
-- `internal/config/catalog/`: shared country, RIR, and ASN vocabulary; callers
-  retain contextual validation at each trust boundary.
-- `internal/firewall/exec.go`: bounded subprocess I/O shared by native backends;
-  timeout policy and transaction guarantees remain backend-specific.
-- `internal/firewall/iptables.go`: generation staging, family selection,
-  compensation, and owned retirement/cleanup.
-- `internal/firewall/iptables_inventory.go`: explicit family/table/chain
-  identities, native inspection, ownership validation, and capacity accounting.
-- `internal/firewall/iptables_codec.go` and `ipset_codec.go`: distinct native
-  grammars, tokenization, and snapshot decoding.
-- `internal/firewall/iptables_model.go`: deterministic policy lowering and
-  immutable native object identities.
-- `internal/state/store.go`: store lifecycle and durable transaction operations.
-- `internal/state/records.go`: record types, encoding and semantic validation.
-- `internal/state/filesystem.go`: private paths, bounded reads, publication and sync helpers.
-- `tests/e2e/harness_test.go`: suite admission, namespace isolation and command execution.
-- `tests/e2e/network_test.go`: peer networking and packet probes.
-- `tests/e2e/daemon_test.go`: shared daemon process/notification lifecycle and
-  readiness waiting, with backend-specific enforcement predicates.
-- `tests/e2e/nftables_test.go`: native inventory and ownership assertions.
-- `tests/e2e/iptables_test.go`: both tool families, compensation, migration and attachment behavior.
-- `tests/e2e/crash_test.go`: test-only application failure injection.
+The most useful file boundaries when changing an existing path are:
+
+- `internal/app/publication.go`: staged metrics/listener reservations and
+  transaction-gated runtime publication.
+- `internal/config/catalog/`: checked-in country, RIR, and ASN vocabulary.
+- `internal/firewall/exec.go`: bounded native subprocess I/O shared by
+  backends.
+- `internal/firewall/iptables.go`, `iptables_inventory.go`, `iptables_codec.go`,
+  `iptables_model.go`, and `ipset_codec.go`: iptables/ipset staging, inventory,
+  native grammars, deterministic lowering, and snapshot decoding.
+- `internal/firewall/nftables.go` and `nftables_model.go`: nftables inspection,
+  reconciliation, and native model generation.
+- `internal/state/store.go`, `records.go`, and `filesystem.go`: durable
+  lifecycle, record validation/encoding, and filesystem barriers.
+- `tests/e2e/`: namespace admission and isolation (`harness_test.go`), traffic
+  probes (`network_test.go`), daemon lifecycle (`daemon_test.go`), geo
+  scenarios (`geo_test.go`), native backend scenarios (`nftables_test.go` and
+  `iptables_test.go`), runtime/recovery boundaries (`runtime_test.go`,
+  `recovery_test.go`), and failure injection (`crash_test.go`).
 
 ### Planned additions
 
-CrowdSec, Docker integration, expanded observability, installed systemd/tmpfiles
-payloads, package lifecycle scripts, and GoReleaser/release workflows belong to
-later milestones. Their eventual
-package layout should follow the real integration boundaries; these directories
-and files are not present scaffolding.
+CrowdSec runtime support, Docker-specific coexistence, installed
+systemd/tmpfiles payloads, package lifecycle scripts, and GoReleaser/release
+workflows belong to later milestones. Their eventual package layout should
+follow the real integration boundaries; these directories and files are not
+present scaffolding.
 
-No `pkg/` tree exists until a real supported public Go API exists. A future
+No `pkg/` tree exists until a real supported public Go API exists. Future
 container/Helm delivery adds `build/package/` and `charts/perimeterd/` only
 when those artifacts are implemented, not as empty placeholders.
 
 ## Pure compiler API
 
-`internal/policy.Compile` consumes a normalized `config.Config` from
-`config.Parse` and an immutable `policy.Snapshot`. `RequiredSelectors` reports
-the enabled policies' canonical country and ASN input identities; RIR memberships
-and built-in/custom groups expand locally into country identities. `NewSnapshot`
-accepts resolved IPv4/IPv6 prefix records, distinguishes missing records from valid empty ones,
-and rejects malformed, wrong-family, or duplicate canonical records.
+`internal/policy` is the backend-neutral compiler seam. It consumes normalized
+configuration and an immutable source snapshot, and emits typed policy state;
+it does not fetch sources or mutate the filesystem or kernel. Prefix
+normalization and set algebra live in `internal/prefix`, while checked-in
+selector vocabulary lives in `internal/config/catalog`.
 
-The source resolver fetches required countries and ASNs into one immutable cache
-manifest; RIR/group unions use those country records. Source metadata validation,
-fresh reuse, and whole-committed-snapshot fallback stay in `internal/source`.
-The compiler performs no fetching or filesystem/kernel operations. An enabled
-policy must retain at least one prefix overall after exclusions, while
-family-empty behavior follows
-[configuration semantics](configuration.md#evaluation-semantics).
-
-The immutable result exposes owned inspection copies through `State.Families`:
-family-specific sets, ordered ingress/egress rules, dynamic CrowdSec references,
-and bounded accounting roles. `Return` means return to the parent firewall path,
-not accept; `Reject` is lowered by each backend to the documented
-family/protocol-specific response. `State.Empty` identifies the canonical
-no-artifacts state. The packet interpreter remains test-only.
-
-`internal/prefix` supplies the shared immutable normalization, membership, union,
-and difference operations used by configuration parsing and compilation. Tests
-exercise the emitted model with a test-only interpreter using deterministic
-snapshots and the existing verification matrix below.
+For behavior rather than package mechanics, use the owning references:
+[configuration](configuration.md) defines schema, defaults, and evaluation
+semantics; [data sources](data-sources.md) defines selector resolution and
+snapshot/cache contracts; [firewall backends](firewall-backends.md) defines
+native lowering and packet-path behavior; [architecture](architecture.md)
+defines revision admission, publication, and recovery; and
+[operations](operations.md) defines runtime procedures, service boundaries, and
+metrics. The compiler and backend models have focused unit coverage; the
+isolated packet interpreter is test-only.
 
 ## Local commands
 
-The current implementation provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`,
-`test-race`, `test-e2e`, `build`, and `verify`. Use Go 1.27.1, or enable automatic
-toolchain selection when the installed Go is older. Race tests additionally
-require a native C compiler; the target enables CGO itself.
+The `Makefile` is the source of truth for executable local gates. It provides
+`fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`, `test-e2e`, `build`, and
+`verify`. Use Go 1.27.1, or enable automatic toolchain selection when the
+installed Go is older. The race target requires a native C compiler and enables
+CGO for that command.
 
 ```sh
 export GOTOOLCHAIN=auto
@@ -117,12 +103,16 @@ make test-race
 bin/perimeterd validate --config configs/perimeterd.yaml
 ```
 
-`make build` writes `bin/perimeterd` for the native Linux architecture by default;
-`GOARCH=arm64 make build` cross-compiles it. Version metadata defaults to
-`dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and `BUILD_TIME` at build
-time. CI supplies its revision and UTC build timestamp.
+`make build` writes `bin/perimeterd` with `GOOS=linux`, the host `GOARCH`, and
+`CGO_ENABLED=0` by default. Override these variables when a different local
+build is needed; for example, `GOARCH=arm64 make build` cross-compiles the
+Linux binary. The current CI build matrix checks Linux `amd64` and `arm64`;
+other local `GOARCH` values are not release-support claims. Version metadata
+defaults to `dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and
+`BUILD_TIME` at build time. CI supplies its revision and UTC build timestamp.
 
-Run the opt-in native gate separately:
+`perimeterd validate` is an offline local check. It does not fetch sources or
+touch the firewall. Run the opt-in native gate separately:
 
 ```sh
 make test-e2e
@@ -130,77 +120,97 @@ make test-e2e
 make test-e2e E2E_SUDO=sudo
 ```
 
-The harness requires Linux, `nft`, `ip`, `ipset`, `unshare`, `nsenter`, and both
-legacy and nf_tables iptables/ip6tables frontend, save, and restore binaries.
+The `test-e2e` target first builds the binary, then checks for `nft`, `ip`,
+`ipset`, `unshare`, `nsenter`, `iptables-nft`, `ip6tables-nft`,
+`iptables-legacy`, and `ip6tables-legacy`. The harness requires Linux and also
+invokes the corresponding frontends and save/restore tools inside its isolated fixture.
 Install `iptables` and `ipset` on Debian-family systems; Fedora provides the
 variants in `iptables-nft` and `iptables-legacy`. The host kernel must support
 `hash:net`, `hash:ip`, xtables set matches, and IPv4/IPv6 filter and NAT tables.
 Load the required modules before using an unprivileged user namespace.
-It creates disposable mount, network, and PID namespaces, verifies isolation before mutation,
-and mounts private runtime/state directories. Unprivileged callers also create a
-user namespace to obtain namespace root. Root callers (including CI with `sudo`)
-retain their existing user namespace so they can execute binaries beneath private
-workspace directories owned by the checkout user. No workspace permissions need
-to be relaxed. The fixture is PID namespace init, so its exit or forced timeout
-terminates all descendants. It exercises real CLI lifecycle,
-IPv4/IPv6 TCP/UDP packets, reloads, counters, ownership collisions, and interrupted
-transactions. It never applies test rules to the development host's firewall.
-Tagged E2E sources are formatted and linted by the ordinary gates but execute only
-through this explicit target. CI runs the native gate in a separate Linux job.
-Ingress and egress probes distinguish silent DROP from protocol REJECT, including
-local UDP sends that return `EPERM` for both actions: the subsequent ICMP error
-or receive timeout determines the outcome. TCP exchanges have explicit deadlines
-so lost established traffic fails promptly rather than hanging the fixture.
-Configuration files and readiness sockets use private, unique temporary
-directories rather than PID-derived shared paths, so independent PID namespaces
-cannot overwrite or unlink each other's fixtures. Table-deletion assertions
-require successful ruleset inspection and explicit absence; command failures,
-timeouts, and malformed inspection output fail the assertion.
+
+The fixture creates disposable mount, network, PID, and (for unprivileged
+callers) user namespaces, verifies isolation before mutation, and mounts
+private runtime/state directories. Root callers, including CI with `sudo`,
+retain their existing user namespace while executing binaries beneath private
+checkout-owned directories. The fixture process is PID-namespace init, so its
+exit or timeout terminates descendants. It exercises real CLI lifecycle,
+IPv4/IPv6 TCP/UDP packets, reloads, kernel counters, ownership collisions, and
+interrupted transactions, and never applies test rules to the development
+host's firewall. Tagged E2E sources are formatted and linted by the ordinary
+gates but execute only through this target. CI runs this native gate in a
+separate Linux job.
+
+Ingress and egress probes distinguish silent DROP from protocol REJECT,
+including local UDP sends that return `EPERM` for both actions: a subsequent
+ICMP error or receive timeout determines the outcome. TCP exchanges have
+explicit deadlines. Configuration files and readiness sockets use private,
+unique temporary directories, and table-deletion assertions require successful
+ruleset inspection plus explicit absence; command failures, timeouts, and
+malformed inspection output fail the assertion.
 
 The executable target inventory is:
 
 | Target | Contract |
 | --- | --- |
-| `fmt` | Run pinned `gofumpt` and `goimports`; fail on a remaining diff in CI |
-| `fmt-check` | Check pinned formatting without modifying files |
-| `lint` | Run the pinned golangci-lint policy and spelling/import checks |
-| `vuln` | Run pinned `govulncheck` on application packages |
-| `test` | Run shuffled unit tests and write coverage output |
-| `test-race` | Run unit tests with the race detector |
-| `test-e2e` | Run explicitly privileged network-namespace/backend scenarios |
+| `fmt` | Rewrite all Go sources selected with the `e2e` build tag using pinned `gofumpt` followed by `goimports` |
+| `fmt-check` | Check pinned `gofumpt` and `goimports` formatting without modifying files |
+| `lint` | Run golangci-lint's pinned `gci` diff check and lint policy with the `e2e` build tag |
+| `vuln` | Run pinned `govulncheck ./...` |
+| `test` | Run shuffled unit tests and write `coverage.out` |
+| `test-race` | Run all package tests with the race detector and shuffled order |
+| `test-e2e` | Build and run the explicitly privileged Linux namespace/backend scenarios |
 | `build` | Build the current CLI with version metadata |
-| `verify` | Run module, format, lint, vulnerability, build, and test gates |
+| `verify` | Run `go mod verify`, `fmt-check`, `lint`, `vuln`, `build`, and `test` |
 
-`package` is a planned GoReleaser/nFPM snapshot-packaging command, not an
-implemented target or a successful no-op.
+`verify` intentionally does not run `test-race` or `test-e2e`; those are
+separate gates. `package` is a planned GoReleaser/nFPM snapshot-packaging
+command, not an implemented target or a successful no-op.
 
-Tool binaries are pinned in the Go tool/module manifest or a checksummed tool
-bootstrap file. GitHub Actions are pinned to immutable commit SHAs, with a
-comment naming the human-readable release. No workflow downloads an unpinned
-`latest` binary.
+Tool dependencies and exact versions are pinned in the `tool` and module
+requirements in [`go.mod`](../go.mod). The Make targets invoke them with `go tool`,
+so a globally installed tool or a version copied into this guide is not the
+authority.
+
+| Tool | Go module | Used by |
+| --- | --- | --- |
+| `gofumpt` | `mvdan.cc/gofumpt` | `fmt`, `fmt-check` |
+| `goimports` | `golang.org/x/tools` | `fmt`, `fmt-check` |
+| `golangci-lint` | `github.com/golangci/golangci-lint/v2` | `lint` |
+| `govulncheck` | `golang.org/x/vuln` | `vuln` |
+
+GitHub Actions in the existing workflows are pinned to immutable commit SHAs
+with comments naming their releases. No current workflow downloads an
+unpinned `latest` binary.
 
 ## Static and dependency analysis
 
-Formatting uses `gofumpt` followed by `goimports`. The pinned golangci-lint
-configuration enables at least `govet`, `staticcheck`, `errcheck`, `revive`,
-`gosec`, spelling checks, and import-order checks. CI also runs `govulncheck`
-and `go mod verify`.
+Formatting uses `gofumpt` followed by `goimports`; `.golangci.yml` separately
+enables the `gci` import-order formatter for its diff check. The pinned
+golangci-lint policy enables `govet`, `staticcheck`, `errcheck`, `revive`,
+`gosec`, and US spelling checks. `make verify` also runs `go mod verify` and
+`govulncheck`.
 
-Unit tests run shuffled to expose ordering assumptions, under the race detector
-in a separate job, and produce coverage reports without a vanity threshold.
-Coverage is diagnostic; behavior-focused review of the [verification
-matrix](#verification-matrix) is the gate. CodeQL scans Go on pull
-requests, default-branch pushes, and its configured schedule. Renovate tracks
-Go modules, GitHub Actions, GoReleaser, and pinned development tools, and raises
-reviewable update pull requests. GitHub Actions updates must retain immutable
+Unit tests run shuffled to expose ordering assumptions, while race tests run
+in a separate command. `make test` writes `coverage.out`; coverage is
+diagnostic and has no vanity threshold. Behavior-focused review of the
+[verification matrix](#verification-matrix), not coverage percentage, is the
+release gate.
+
+CodeQL scans Go on pull requests and pushes to `main`, plus its configured
+weekly schedule. Renovate currently tracks Go modules and GitHub Actions,
+including the pinned development tools; it does not track a nonexistent
+GoReleaser workflow. GitHub Actions updates must retain immutable
 commit SHAs and refresh their human-readable release comments.
 
 ## Version 1 verification and delivery requirements
 
-The remaining sections specify the complete first-release contract, including
-CrowdSec, Docker, packaging and systemd-VM work that is not
-implemented yet. The [local commands](#local-commands) describe what can run now;
-the [implementation plan](implementation-plan.md) tracks progress.
+The remaining sections are the complete first-release contract, not a list of
+currently passing tests. The local commands above describe what can run now.
+Static source-backed policy and both native backend paths are implemented;
+CrowdSec runtime support, Docker-specific coexistence, package/systemd
+integration, and release workflows remain planned. The
+[implementation plan](implementation-plan.md) tracks milestone status.
 
 ## Verification matrix
 
@@ -342,24 +352,29 @@ and packaging matrix](#service-and-packaging).
 
 ## Pull-request and branch CI
 
-The existing `.github/workflows/ci.yml` and `.github/workflows/codeql.yml` run on
-pull requests targeting the default branch and pushes to the default branch.
-Current gates cover:
+The existing `.github/workflows/ci.yml` triggers for pull requests targeting
+`main` and pushes to `main`. It has three current jobs:
 
-- format, lint, spelling/import policy, module verification, vulnerability
-  analysis, and CodeQL;
-- Linux builds, shuffled unit tests, race tests, and a coverage artifact;
-- the isolated native nftables and iptables/ipset E2E suite, including both
-  legacy and nf_tables compatibility variants.
+- `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
+  `coverage.out`.
+- `build` runs `make build` for both `GOARCH=amd64` and `GOARCH=arm64`.
+- `privileged firewall E2E` installs the namespace prerequisites and runs
+  `E2E_SUDO=sudo make test-e2e`, covering the nftables and both iptables tool
+  families selected by the suite.
+
+The separate `.github/workflows/codeql.yml` scans Go for the same pull-request
+and `main` push events plus its weekly schedule. These workflows are the
+current executable CI gates; the matrix below remains the full first-release
+verification contract.
 
 Before version 1, CI must also implement the matrix's Docker, pinned CrowdSec
-compatibility, package installation/upgrade, and
-systemd-VM gates. Listing them as requirements does not mean those jobs exist.
+compatibility, package installation/upgrade, and systemd-VM gates. Listing them
+as requirements does not mean those jobs exist.
 
-Workflow permissions default to read-only and are elevated per job only when a
-specific upload or attestation step requires it. Superseded runs for the same
-branch or pull request use concurrency cancellation. The planned release
-workflow must never cancel an earlier release because a later tag arrived.
+Workflow permissions are read-only by default and elevated only for a job's
+required security or artifact operation. Superseded runs for the same branch or
+pull request use concurrency cancellation. The planned release workflow must
+never cancel an earlier release because a later tag arrived.
 
 ## Release workflow
 

@@ -1,66 +1,62 @@
 # Firewall Backends
 
-This document owns packet-path semantics, firewall object ownership, and
-backend reconciliation. [Configuration](configuration.md) owns fields and
-policy selection; [architecture](architecture.md) owns the writer and revision
-lifecycle.
+This document owns packet-path semantics, native objects, ownership fences, and
+backend-specific reconciliation. [Configuration](configuration.md) owns fields
+and policy evaluation; [architecture](architecture.md) owns admission, durable
+publication, recovery, and the cross-target migration algorithm;
+[operations](operations.md) owns procedures and observability.
 
-> **Version-1 backend contract.** This specification includes backend and
-> coexistence integrations beyond the current runtime. See the
-> [implementation plan](implementation-plan.md) for status and
-> [current operations](operations.md#current-source-build-runtime) for supported use.
+> **Status boundary.** Static source-backed policy, both native backends, target
+> migration, custom attachments, and native packet accounting are implemented.
+> CrowdSec dynamic updates and Docker-specific coexistence remain first-release
+> work. Where this document describes those integrations, it labels the
+> contract rather than claiming current runtime support.
 
 ## Common invariants
 
-Both backends obey the same safety contract:
+Both implemented backends obey these rules:
 
-- Create, change, and remove only perimeterd-owned tables, chains, and sets,
-  plus parent-chain jumps carrying an exact perimeterd ownership comment.
-- Never flush a global table, built-in chain, configured parent chain, or
-  another manager's object.
-- Build a complete staged static generation before switching traffic to it.
-  Generation-suffixed static sets are immutable after creation: never change
-  or swap the contents of a set referenced by active rules; switch references
-  to a newly populated generation instead. Validation or staging failure leaves
-  the active generation selected.
-- Serialize static reconciles, CrowdSec deltas, counter reads, migrations, and
-  cleanup through the writer. [Architecture](architecture.md#exclusive-lifecycle-ownership)
-  owns lifecycle locking; its [durable transaction contract](architecture.md#durable-apply-and-crash-recovery)
-  governs journal preparation, active-record commitment, and prior-generation
-  retention for every static reconcile, migration, and cleanup.
-- Credential/endpoint replacement or CrowdSec disable prepares separate
-  dynamic-set references with the candidate, retaining old references and live
-  lease state until durable commit. Ordinary static/geo refreshes reuse the
-  active dynamic sets, so precommit rollback never depends on restoring bans
-  from a stable set overwritten by a replacement client. See
-  [staged reload](architecture.md#staged-reload).
-- Every dynamic entry, including both members of an ipset `/0` pair, implements
-  the source-owned [timed projection and renewable lease contract](data-sources.md#renewable-kernel-leases).
-  Backends lower that contract into native entries; they do not define a second
-  cap, renewal schedule, or expiry policy. Daemon downtime can let leases expire
-  early; the retained source deadline is never extended.
-- Keep IPv4 and IPv6 address sets separate.
-- Apply only to conntrack `NEW` or equivalent new-flow traffic. Return from
-  `ESTABLISHED,RELATED` before any denial rule.
-- The nftables hook priority uses the supported range `-199` through
-  `2147483647`, a signed 32-bit integer strictly after conntrack priority
-  `-200`. Local validation enforces this even when nftables is not selected;
-  every apply also checks the typed value before staging or journal mutation.
-  Values at or below `-200` cannot bypass the OUTPUT NEW-flow guard. See
-  [configuration](configuration.md#nftables-hook-priority).
-- Evaluate new traffic in this order: global allowlist, global blocklist,
-  ingress CrowdSec set, then geo policies by ascending priority.
-- A non-match and an allowlist success return/continue; neither emits a global
-  `ACCEPT` verdict.
-- Map `deny_action: drop` directly to DROP. Map `reject` to a TCP reset for
-  TCP and the backend-native administratively prohibited ICMP or ICMPv6
-  response for UDP and other protocols.
+- Create, change, and remove only perimeterd-owned tables, chains, sets,
+  counters, and exact comment-tagged parent jumps. Never flush a global table,
+  built-in chain, configured parent chain, or another manager's object.
+- Build a complete static generation before selecting it. Generation-suffixed
+  static sets are immutable after an active rule references them: populate a new
+  generation and switch references instead of changing an active set. A
+  validation or staging failure leaves the active generation selected.
+- Serialize every reconcile, migration, cleanup, and native counter operation
+  through the writer. The [exclusive lifecycle ownership](architecture.md#exclusive-lifecycle-ownership)
+  and [durable apply](architecture.md#durable-apply-and-crash-recovery) contracts
+  define the lock, journal, active-record commit point, and retained ownership.
+- Never retire the previous target before a replacement is applied and durably
+  committed. A migration can temporarily leave both targets enforcing and can
+  overblock; failed retirement does not roll back a successful committed
+  replacement. See [backend and target migration](architecture.md#backend-and-target-migration).
+- Keep IPv4 and IPv6 sets distinct. nftables switches both families together
+  in one netlink transaction; iptables commits each family independently.
 
-The effective global allowlist includes built-in local ranges and therefore
-prevents CrowdSec and every other perimeterd denial source from blocking LAN
-traffic. Global lists match any valid remote address. Geo policy then bypasses
-remaining non-global space. Ingress uses source; egress uses destination. See
-[configuration](configuration.md) for the exact policy algorithm.
+**Planned dynamic integration.** When CrowdSec is delivered, stable dynamic
+sets will use the source-owned [timed projection and renewable lease
+contract](data-sources.md#renewable-kernel-leases). Credential or endpoint
+replacement and disable will stage separate dynamic-set references, retaining
+old references and live lease state through durable commit. Ordinary static
+refreshes will reuse active dynamic sets. A backend must not invent another
+ban cap, renewal schedule, or expiry policy; daemon downtime can let leases
+expire before the retained source deadline.
+
+The packet path is limited to new flows. `ESTABLISHED,RELATED` returns before
+any denial check, and non-`NEW` traffic returns. For a new flow, the effective
+order is global allowlist, global blocklist, planned ingress CrowdSec set, then
+geo policies by ascending priority. A non-match and an allowlist match return
+or continue to the surrounding firewall; neither emits a global `ACCEPT`.
+`drop` maps to DROP. `reject` maps to a TCP reset for TCP and the native
+administratively-prohibited ICMP/ICMPv6 response for other protocols. The
+configuration document owns the complete precedence and geo classification.
+
+The effective global allowlist contains built-in local ranges. It therefore
+protects LAN, loopback, link-local, and IPv6 unique-local traffic from every
+perimeterd denial source. Global lists match the remote address (source on
+ingress, destination on egress); geo evaluation bypasses remaining
+non-global, non-routable space.
 
 ## Logical packet path
 
@@ -68,281 +64,185 @@ remaining non-global space. Ingress uses source; egress uses destination. See
 owned direction entry
   -> ESTABLISHED,RELATED? return
   -> not a NEW flow? return
-  -> global allowlist match? return
-  -> global blocklist match? deny
-  -> ingress and CrowdSec set match? deny
+  -> global allowlist? return/continue
+  -> global blocklist? deny
+  -> planned ingress CrowdSec set? deny
   -> remote address not globally routable unicast? return
-  -> policy priority 10 traffic scope matches? decide and return/deny
-  -> policy priority 20 traffic scope matches? decide and return/deny
-  -> ...
+  -> geo policies in ascending priority: first matching traffic scope decides
   -> no matching scope: return
 ```
 
-The established return occurs before all denial checks. Global allow then
-precedes global block and CrowdSec. This ordering preserves LAN access and
-established-flow symmetry for host-originated and accepted inbound traffic.
+The established-flow return occurs before all denial checks. A return hands
+control back to the parent path; another firewall manager can still deny it.
 
 ## Packet and byte accounting
 
-Both backends expose kernel accounting: nftables
-[`counter` objects](https://wiki.nftables.org/wiki-nftables/index.php/Counters)
-record packets and bytes, while
-[`iptables-save --counters`](https://www.man7.org/linux/man-pages/man8/iptables-save.8.html)
-exports the counters attached to iptables rules.
+Native accounting is installed independently of the metrics listener. nftables
+uses named `counter` objects; iptables uses counters attached to ownership-tagged
+rules and reads machine-oriented `iptables-save --counters`/
+`ip6tables-save --counters`. Counters are owned artifacts and are removed by
+migration, explicit cleanup, or reconciliation to the canonical
+[empty desired state](configuration.md#empty-desired-state).
 
-The backend-neutral model assigns bounded accounting roles rather than
-operator-derived metric labels. Accounting is per traversal of a
-perimeterd-owned direction path: each traversal increments that path's
-processed packet and byte counters. A packet can traverse more than one valid
-attachment (for example, both `FORWARD` and `DOCKER-USER`) or both generations
-during target migration, so these counters are not globally unique packets and
-may count the same packet more than once. Perimeterd does not use packet marks
-or topology-based de-duplication.
-Only the terminal perimeterd denial decision actually executed on a traversal
-increments its denied packet and byte counters, classified by
-`global_blocklist`, `crowdsec`, or `geo_policy` and by DROP or REJECT.
-Intermediate match and jump counters, and terminal rules that were not
-executed, are never aggregated. A generated rejection response is not another
-denied packet.
+A processed counter represents one traversal into a perimeterd-owned direction
+path and increments for established, non-new, allowed, non-global, and
+unmatched traffic as well as traffic that is denied later. A packet can traverse
+multiple valid attachments (for example, both `FORWARD` and `DOCKER-USER`) or
+both targets during migration, so processed totals are not globally unique
+packets. Perimeterd does not use packet marks or topology-based de-duplication.
 
-Each backend returns a typed raw counter snapshot through the writer.
-[Operations](operations.md#prometheus-metrics) owns sampling, generation-delta
-accumulation, monotonic totals, and failed-periodic-read behavior. When a
-reconcile replaces raw counters, it attempts a final read after dispatch
-switches away from the retired generation and before removal, then establishes
-the replacement baseline. A failed final read records an accounting gap but
-does not roll back successful enforcement.
+A denied counter increments only for the terminal denial decision actually
+executed on that traversal. It is classified by `global_blocklist`,
+`crowdsec` (planned), or `geo_policy`, and by `drop` or `reject`. Intermediate
+match/jump counters and terminal rules that were not executed are not included;
+a generated rejection response is not another denied packet.
 
-Kernel counters are installed independently of the metrics listener so
-enabling or disabling HTTP exposition never changes the packet path. They are
-owned artifacts and are removed by target migration, explicit cleanup, or
-reconciliation to the canonical empty desired state.
-Process or host crashes and external counter or rule changes may lose
-accounting; this is operational telemetry rather than an audit ledger.
+The backend retains raw native counters and the writer is the only path that
+reads them. The current source build does not export the planned aggregated
+Prometheus counter names or run the planned 15-second sampler; operators can
+inspect the native counters using the ownership rules below. A future sampler
+must preserve generation deltas, monotonic process totals, and last-good values
+on failed reads. Counter gaps after a crash, external rule replacement, or
+external counter reset are operational telemetry loss, not an audit result.
 
 ## nftables
 
 The nftables backend owns one `inet` table whose configured name defaults to
-`perimeterd`. Within it:
+`perimeterd`. It owns:
 
-- named input and output filter base chains hook at the configured priority
-  (default `-10`). Their names are stable logical anchors, not immutable
-  nftables objects: a priority change replaces all applicable owned base chains
-  atomically as described below;
-- stable dynamic IPv4 and IPv6 CrowdSec sets carry renewable element leases
-  governed by [renewable kernel leases](data-sources.md#renewable-kernel-leases);
-- stable named counter objects hold processed and bounded-reason denial
-  accounting;
-- stable entry chains increment the appropriate processed counter, apply
-  established/new-flow guards, and transfer to the active generated path;
-- the generated path evaluates global allow/block sets, the stable CrowdSec
-  sets, and ordered geo policy, referencing the appropriate named counter
-  immediately before each terminal denial; and
-- generation-suffixed, interval-capable IPv4 and IPv6 sets hold global and geo
-  prefixes.
+- named ingress and egress filter base chains at the configured hook priority
+  (default `-10`); names are stable logical anchors, not immutable native
+  objects;
+- stable entry chains that count processed traversals, apply established/new
+  guards, and dispatch to the selected generated path;
+- stable named counters for processed traffic and bounded denial reasons;
+- generation-suffixed IPv4 and IPv6 sets for global and geo prefixes; and
+- **planned** stable dynamic IPv4/IPv6 CrowdSec sets with renewable leases.
+
+The priority must be a signed 32-bit value strictly greater than conntrack's
+`-200`: the accepted range is `-199` through `2147483647`. Local validation
+checks this even when iptables is selected, and every nftables apply validates
+the typed value before staging or journal mutation. See
+[configuration](configuration.md#nftables-hook-priority).
 
 ### Same-table priority reload
 
-A `firewall.nftables.priority` change uses a same-table, journaled base-chain
-replacement. Other configuration changes in the same reload remain part of
-that one candidate transaction.
+Linux stores hook priority in a base-chain definition; it cannot edit the
+priority of an existing base chain in place. A priority change therefore
+flushes rules only from the verified perimeterd-owned base chains, deletes
+those chains, and recreates the same-named chains at the new priority in one
+nftables netlink transaction. The recreated chains point to the stable entry
+chains. No built-in or foreign chain is flushed.
 
-**Kernel constraint:** hook priority belongs to the base-chain definition;
-Linux cannot change an existing base chain's priority in place.
-
-Before mutation, the durable apply state records the previous and candidate
-hook definitions for every owned applicable base chain (family, table, name,
-type, hook, priority, policy, and exact target references), together with the
-previous and candidate generated state, using the protocol in
-[architecture](architecture.md#durable-apply-and-crash-recovery). In one
-nftables netlink transaction it flushes rules only from those owned base
-chains, deletes them, and recreates the same-named chains at the new priority
-with their target references to the stable entry chains. Flushing the owned
-rules first permits deletion of nonempty chains; no built-in or unrelated
-chain is flushed. Any generated-path or replacement-client reference changes
-in the same reload are switched in that transaction too. Old and new base
-chains cannot coexist under the same names, so the durable state retains the
-previous definitions and complete rule references. Precommit recovery likewise
-flushes/deletes only verified candidate-owned base chains and recreates prior
-hooks and prior generated-path references in one transaction, never as
-separately visible removal and creation.
-
-For a priority-only reload, only the base-chain hook objects are replaced. The
-table, stable entry chains and their rule counters, owned counter objects and
-values, dynamic sets and their live leases, and selected static generation
-remain in place. Combined changes preserve objects not changed by the other
-candidate fields and retain all previous referenced generations until commit.
-The transaction is atomic: failure leaves the old hooks and dispatch selected.
-After successful enforcement, the active record commits the candidate priority
-and transaction ID. A crash before that commit restores the previous hooks
-from the durable state; a post-commit crash resumes retirement from committed
-intent.
+The durable journal records complete previous and candidate hook definitions,
+including family, table, name, type, hook, priority, policy, ownership, and
+references. A combined reload switches any changed generated-path references
+in the same transaction. A priority-only reload keeps the table, stable entry
+chains, counter objects and values, dynamic sets, and selected static
+generation in place. If the transaction fails, old hooks and dispatch remain
+selected; recovery recreates the recorded prior hooks before commit or retains
+candidate hooks after a committed active record. Architecture owns that
+precommit/postcommit decision; this section defines the native atomic boundary.
 
 ### Static generations and dynamic updates
 
-A static reconcile constructs all new generation sets and packet-path chains,
-then switches the stable transfer in one netlink transaction. This is the
-nftables atomicity boundary: if any operation in that transaction fails, the
-visible dispatch and prior generation remain unchanged. The transaction never
-changes the contents of a set referenced by the old rules. Ordinary static/geo
-refreshes do not recreate the table, base chains, stable entry chains, named
-counters, or dynamic sets, preserving totals and live leases. A configured
-priority change is the explicit base-chain replacement exception described
-above; a priority-only candidate preserves other objects. A staged client
-replacement selects its separately prepared dynamic sets in the same
-packet-switch transaction; old dynamic references survive until durable
-commit.
+A static reconcile builds all candidate sets and packet-path chains, then
+switches the stable dispatch in one netlink transaction. If any operation
+fails, the visible dispatch and prior generation remain unchanged. The
+transaction never changes a set referenced by the old rules. Ordinary static
+refreshes therefore preserve the table, base chains, stable entry chains,
+named counters, and dynamic sets. A configured priority change is the explicit
+base-chain replacement exception above.
 
 Do not garbage-collect the old generation in the packet-switch transaction.
-Only after durable active-record commit may a later cleanup transaction remove
-it. The [recovery contract](architecture.md#startup-recovery) selects restoration
-before commit or retirement afterward, including previous hook definitions
-for priority reloads. Delayed or failed GC may leave extra owned sets and
-chains; retain their ownership for retry or explicit cleanup, never revert a
-successful packet switch merely because retirement failed.
+Only after durable active-record commit may a later cleanup remove it. Delayed
+or failed cleanup retains owned sets/chains for retry and never reverts a
+successful enforcement switch.
 
-CrowdSec additions and deletions use smaller netlink transactions against the
-stable dynamic sets. Every changed element follows the renewable lease and
-absolute-deadline rules in [data sources](data-sources.md#renewable-kernel-leases).
-A failed batch leaves that batch unapplied and is retried
-idempotently by the decision store. An nftables failure is reported; it never
-silently falls back to iptables.
+**Planned dynamic updates.** CrowdSec additions and removals will use smaller
+netlink transactions against stable dynamic sets and the source lease rules;
+they must not rebuild static generations. Until that integration lands, the
+runtime rejects `crowdsec.enabled: true` and creates no dynamic CrowdSec
+objects.
 
-A table-name change uses [target migration](architecture.md#backend-and-target-migration),
-not a same-table update: build the complete new table, commit the replacement,
-then retire recorded old ownership. Until retirement, both hook paths may
-enforce and temporarily overblock. A failed replacement leaves the old target
-selected; it is never removed first.
+Changing the table name is a target migration, not an in-place update: build
+and apply the new table, commit it, then retire recorded old ownership. The
+old table is never removed first.
 
 ## iptables and ipset
 
-The iptables backend integrates with existing parent chains instead of owning a
+The iptables backend integrates with existing parent chains and does not own a
 global table. It uses:
 
 - `iptables-restore --wait --noflush` for IPv4 rules;
 - `ip6tables-restore --wait --noflush` for IPv6 rules; and
-- `ipset restore` for address-set transactions.
+- `ipset restore` for batched set creation and population. It is not the
+  packet-switch atomicity boundary.
 
-It creates stable owned ingress/egress direction chains and stable dynamic
-CrowdSec sets. Static global and geo sets are generation-suffixed `hash:net`
-sets using `family inet` or `family inet6`. A reconcile first creates and
-populates complete staging sets and chains, with no active rule referencing
-them, then commits only perimeterd-owned chain and comment-tagged jump
-references. It never swaps or rewrites the contents of a generation still
-referenced by the old rules. A staging failure therefore leaves active rules
-and sets selected.
+At startup and before ownership changes it probes `iptables`, `ip6tables`,
+`iptables-save`, `ip6tables-save`, `iptables-restore`, `ip6tables-restore`, and
+`ipset`. All six iptables-family commands must identify the same `legacy` or
+`nf_tables` implementation and matched IPv4/IPv6 tools. A variant change while
+ownership exists is rejected. Restore's `--wait` uses the host-wide xtables
+lock; `iptables-save` has no wait flag, so reads are serialized with restore
+operations through the writer. The source-build process must remain UID 0 for
+this interoperability.
 
-The IPv4 and IPv6 commits use separate `iptables-restore --wait --noflush` and
-`ip6tables-restore --wait --noflush` operations. Each family commit is atomic
-only within that family; the two commits are not one transaction. Only after
-both families enforce the candidate does the durable active-record transaction
-publish it and retire the prior generation, following
-[architecture](architecture.md#durable-apply-and-crash-recovery). Prior sets
-and chains remain owned until that commit and are removed only by later
-cleanup.
+It creates stable owned ingress/egress direction chains and generation-
+suffixed `hash:net` sets (`family inet` or `inet6`). It first creates and
+populates complete staging sets and chains with no active rule referring to
+them, then changes only perimeterd-owned chains and exact comment-tagged parent
+jumps. It never flushes or rewrites a configured parent chain, and never swaps
+the contents of a generation still referenced by old rules.
+
+Static set names are deterministic, exact 31-byte `hash:net` identifiers;
+shortening includes backend, family, role, policy identity, and generation and
+must be collision-checked against the complete generated model. The full
+identity remains in durable metadata.
 
 ### Per-family commit and rollback
 
-If the IPv4 commit succeeds but the IPv6 commit fails (or the reverse), the
-successful family temporarily enforces the candidate while the other family
-still enforces the previous generation. This mixed-generation window is
-unavoidable even when compensation succeeds. The writer does not publish the
-candidate as active; it immediately attempts a compensating restore of the
-successful family to its previous recorded generation.
+The IPv4 and IPv6 restores are separate kernel transactions. A successful IPv4
+commit followed by an IPv6 failure (or the reverse) can expose a mixed-
+generation window that compensation cannot erase. The writer does not publish
+the candidate until both families enforce it, and immediately attempts a
+compensating restore of every family whose switch was attempted.
 
-When compensation succeeds, the previous generation remains the active
-committed state. The failed candidate and any partially staged ownership stay
-recorded until cleanup completes, and no candidate content is copied into the
-previous generation.
+If compensation succeeds, the previous committed target remains authoritative;
+failed candidate ownership stays recorded for cleanup. If compensation fails,
+durable state records the phase, actual family generations, and ownership. The
+last committed revision remains recorded but is not claimed to describe actual
+enforcement: readiness is withheld at startup, live health is degraded, and
+ordinary mutations are fenced until recovery or explicit cleanup. There is no
+silent fallback to nftables or another iptables variant.
 
-When compensation itself fails, the durable apply state records the phase,
-per-family actual generations, and ownership. The last committed revision
-remains recorded, but enforcement is unhealthy rather than claimed to match
-it. Startup withholds readiness; a live daemon exposes the ongoing health
-signal defined in [operations](operations.md). Further mutations are blocked
-except recovery or explicit cleanup. Recovery retries the precommit
-restoration; it does not silently fall back to another backend.
-
-If staging or either family commit fails before a family switch, active
-references remain unchanged. A successful two-family commit retains the
-retired generation through the active-record transaction; a later cleanup
-failure retains both generations and retries cleanup without rolling back
-enforcement. A crash after that transaction but before cleanup resumes cleanup
-from the committed ownership record.
+After a successful two-family commit and durable active-record publication,
+retirement is cleanup rather than rollback. A cleanup failure retains both
+owned generations and retries without undoing the committed enforcement.
 
 ### ipset prefix representation
 
-Lower a valid `/0` at every ipset insertion boundary, including static global
-and geo sets and stable dynamic CrowdSec sets:
+`ipset hash:net` cannot store a zero-length prefix. Lower `/0` at every ipset
+insertion boundary while retaining one logical prefix for matching and
+allow-before-block precedence:
 
-| Logical prefix | Stored `hash:net` entries |
+| Logical prefix | Stored entries |
 | --- | --- |
 | `0.0.0.0/0` | `0.0.0.0/1` and `128.0.0.0/1` |
 | `::/0` | `::/1` and `8000::/1` |
 
-**Representation constraint:** [`ipset` `hash:net`](https://ipset.netfilter.org/ipset.man.html)
-cannot store a zero-length prefix; the pair represents the same address union.
-
-The pair is one logical projected prefix for matching and allow-before-block
-precedence; no policy semantics change. Dynamic inputs are the disjoint timed
-projection `P(D)` defined in
-[data sources](data-sources.md#overlap-expiry-and-backend-projection), not
-individual decision events. The `/0` pair is derived from one projected
-absolute deadline; both lowered entries receive the same renewable kernel lease
-under [renewable kernel leases](data-sources.md#renewable-kernel-leases), not a
-fresh full ban-duration timeout. On any partial update, reconcile both lowered
-entries from the current projection and their remaining lease timeouts; do not
-blindly delete a member still required by that projection. Non-`/0` projected
-prefixes are stored unchanged in shape, and dynamic ones use the same source
-lease semantics. nftables can represent `/0` natively with the same logical
-semantics.
-
-ipset names have a 31-character limit. Names therefore use deterministic short
-backend, family, role, policy-identity, and generation components; the full
-identity remains in persisted metadata. Hash shortening must be collision
-checked within a generated model.
-
-Inspection and counter sampling use machine-oriented `iptables-save
---counters`, `ip6tables-save --counters`, and ipset protocols. Exact
-perimeterd ownership and accounting-role comments identify the stable entry
-jumps and terminal denial rules whose counters may be aggregated; perimeterd
-never sums intermediate rule counters or parses human-formatted `iptables -L`
-output. `iptables-save` has no lock-wait option, so perimeterd serializes reads
-with its own `iptables-restore --wait` operations through the writer. Restore's
-`--wait` participates in the global xtables lock, which is why the systemd
-service remains UID 0; see [operations](operations.md).
-`ipset` existence checks use a bounded name-only census and exact comparisons with
-the generated 31-byte identifiers. Set contents are then queried individually by
-recorded or candidate name. Global `ipset save` is not used as a foreign-object
-inventory: names may contain unquoted spaces or newlines. A newline-containing
-foreign name cannot forge a complete generated identifier because the kernel's
-31-byte name limit leaves no room for additional characters.
-Each exact set also has a terse XML header queried with `ipset list NAME -output
-xml -terse`. Its kernel reference count must equal the references accounted for
-by recorded rules in the inspected inventory. This detects foreign `list:set`
-membership and references from the other xtables implementation without parsing
-unrelated set contents. Missing or ambiguous reference metadata, query failures,
-and count mismatches reject the operation before staging, unhooking, or deletion.
-Quoted comments may span physical lines in native save output. Inspection
-preserves them as single logical records rather than interpreting their contents
-as additional rules or table directives.
-Each protocol retains its own quoting rules: iptables uses backslash escapes,
-whereas ipset emits backslashes and apostrophes literally inside double-quoted
-comments. An ipset comment's trailing backslash must not hide the closing quote
-or consume subsequent set definitions.
-Rule inspection retains whether tokens were quoted or escaped and consumes known
-option operands as data, even when they spell flags such as `-j`. It checks all
-ownership comments and chain/set references rather than taking the first apparent
-option. Unknown extension arities are inspected conservatively so ambiguous
-operands cannot hide a foreign reference.
-Full iptables rule inventories are still inspected, so foreign references into
-recorded chains or sets remain errors. Exact candidate-name collisions are also
-rejected rather than adopted.
+Static global and geo sets use this lowering today. **Planned dynamic
+integration** must lower dynamic `/0` in the same way: the pair is one
+projected prefix with one absolute deadline and equal remaining lease timeout,
+not two fresh full-duration bans. Reconcile both members from the current
+projection on partial updates; do not delete a member still required by that
+projection. Non-`/0` prefixes retain their shape. nftables represents `/0`
+natively with the same logical semantics.
 
 ## iptables attachment contract
 
-`firewall.iptables.attachments` defines the managed integration boundary. Each
-configured entry contains:
+`firewall.iptables.attachments` is the managed integration boundary. Each
+normalized entry contains:
 
 | Field | Meaning |
 | --- | --- |
@@ -352,21 +252,13 @@ configured entry contains:
 | `output_interfaces` | Optional allowed output-interface matches |
 | `original_destination` | Optional pre-DNAT destination-port matching |
 
-The daemon verifies every parent chain before reconciliation. It inserts
-exactly one jump per normalized attachment, with its interface match and an
-exact ownership comment. Only that comment-tagged jump may later be replaced
-or deleted. A missing chain is a reconcile error and preserves the prior
-state.
+Runtime verifies every parent chain before reconciliation and inserts managed
+jumps matching each normalized attachment's interface constraints, with an exact
+perimeterd ownership comment. Only that comment-tagged jump may be replaced or
+deleted. A missing parent is an apply error and leaves the previous state
+selected.
 
-An explicitly empty attachment list is valid local configuration. When iptables
-is selected and the desired policy is not the
-[canonical empty state](configuration.md#empty-desired-state), startup or reload
-must reject a candidate with no managed attachments before firewall mutation.
-Do not report active enforcement or assume administrator-managed jumps exist.
-A genuinely empty desired state may reconcile to no owned artifacts without
-attachments; nftables does not use this list.
-
-The default host attachments are:
+Omitting the list retains the default host attachments:
 
 ```yaml
 firewall:
@@ -379,23 +271,32 @@ firewall:
         direction: egress
 ```
 
-Forwarded and container traffic is opt-in through additional explicit
-attachments. Every forwarding-chain attachment must constrain an input or
-output interface appropriate to its direction. This prevents a new container
-egress flow traversing the forwarding path from being interpreted as external
-ingress.
-The [local attachment checks](configuration.md#iptables-attachments) apply this
-conservative constraint to every non-host parent, including custom chains.
+An explicit `attachments: []` means no managed jumps; it does not restore the
+defaults. With iptables selected, a non-empty desired policy and no managed
+attachments is rejected before mutation. The canonical empty desired state may
+instead reconcile to no owned artifacts, including counters and allow-only
+rules. nftables does not use this list.
 
-These are attachment matching requirements, not topology validation. Perimeterd
-verifies configured chains and ownership but does not inspect the host's
-forwarding topology, infer traversal uniqueness, or reject overlapping paths.
-It inserts and reads no packet marks for de-duplication.
+Forwarding and custom-chain attachments are opt-in. A forwarding-chain ingress
+attachment must constrain `input_interfaces`; an egress attachment must
+constrain `output_interfaces`. This prevents a container egress flow from
+being interpreted as external ingress merely because both traverse a forwarding
+path. These are conservative matching requirements, not topology validation:
+perimeterd does not infer traversal uniqueness, inspect forwarding topology, or
+insert packet marks for de-duplication.
+
+`original_destination: true` requests conntrack original-destination port
+matching for pre-DNAT policy. It has a performance cost and should be enabled
+only where published host ports must be distinguished from translated
+container ports.
 
 ## Docker `DOCKER-USER` attachment
 
-A safe published-service ingress attachment names the external host
-interfaces:
+**Planned Docker-specific coexistence guidance.** Docker integration and its
+verification milestone are not implemented support in the current release.
+The example below records the intended explicit interface-constrained shape;
+it must not be read as proof that perimeterd manages Docker coexistence today.
+Perimeterd must never create or flush the Docker-owned chain.
 
 ```yaml
 firewall:
@@ -412,86 +313,85 @@ firewall:
         original_destination: true
 ```
 
-Docker documents that packets reach
-[`DOCKER-USER` after DNAT](https://docs.docker.com/engine/network/firewall-iptables/).
-Without `original_destination`, destination port policy sees the translated
-container port. With it, generated rules use conntrack original-destination
-matching so policy ports mean published host ports. That conntrack lookup has
-a performance cost and should be enabled only when required.
+Docker documents that `DOCKER-USER` receives packets after DNAT. With
+`original_destination`, the intended generated rule matches the original
+published host port; without it, policy ports see the translated container
+port. The input-interface constraint prevents container-originated forwarding
+from entering an ingress policy. Overlapping `FORWARD` and `DOCKER-USER`
+attachments are expected to count separate owned-path traversals; no packet-mark
+or topology de-duplication is intended.
 
-The input-interface constraint ensures container-originated forwarding does
-not enter an ingress policy merely because it shares `DOCKER-USER`. A
-`FORWARD` attachment and a `DOCKER-USER` attachment may both be configured for
-the same direction and matching interfaces; that overlap is valid and
-intentionally covers both owned-path traversals. Depending on topology,
-operators may instead or additionally use a constrained explicit egress
-attachment; no unconstrained forwarding attachment is valid.
-
-If `DOCKER-USER` is configured but absent, reconciliation fails and retains the
-last-known-good state. Start Docker before perimeterd or omit this attachment.
-Perimeterd never creates a Docker-owned chain.
+For the planned integration, an absent `DOCKER-USER` chain must fail
+reconciliation and preserve last-known-good enforcement. Operators must start
+Docker first or omit this planned attachment. The current generic custom-chain
+contract still requires every configured parent to exist, but Docker-specific
+coexistence, documentation, and tests remain release work.
 
 ## Coexistence
 
-Backend selection is explicit. There is no capability auto-detection, backend
-auto-selection, or fallback after an apply error.
+Backend selection is explicit. There is no capability auto-selection, fallback
+after apply failure, or conversion between legacy and nf_tables command
+families. Operators choose existing parent chains and preserve perimeterd's
+exact tagged jumps. nftables operators choose a hook priority in the supported
+range and must compose it with other base chains; `-10` is a default, not a
+host-topology guarantee.
 
-For iptables, operators choose the actual parent chains managed by firewalld,
-ufw, Docker, or custom policy and must preserve perimeterd's tagged jumps. For
-nftables, operators choose a hook priority within the supported signed 32-bit
-range that composes with other base chains. The default `-10` is a starting
-contract, not a guarantee about a host's other rules. Changing it uses the
-same-table priority reload described in [same-table priority
-reload](firewall-backends.md#same-table-priority-reload).
-Allowlist success always returns/continues, allowing later firewall policy to
-deny. Package scripts do not add jumps, change default policies, flush rules,
-or enable the service. Backend and target changes follow the canonical
-[migration contract](architecture.md#backend-and-target-migration). Its overlap
-window may overblock and count a packet on both paths; denied counters still
-require an executed terminal decision. Cleanup uses persisted ownership and
-removes only identified perimeterd artifacts.
+Allowlist success returns/continues so another manager may still deny. No
+package or service action may add jumps, alter default policies, globally flush
+netfilter, enable an unconfigured service, or adopt an object from its name
+alone. Cleanup is authorized only by durable ownership records.
+
+## Ownership inspection and reference fences
+
+The iptables backend reads machine-oriented save/restore protocols rather than
+human `iptables -L` output. It preserves quoted comments as one logical record,
+retains escaping state, consumes known option operands (even operands that look
+like `-j`), and inspects unknown extension arities conservatively. Every
+ownership comment and chain/set reference in the complete rule inventory is
+checked; malformed or ambiguous input rejects the operation.
+
+For ipset, a bounded name-only census avoids treating a foreign set's contents
+as perimeterd inventory. Contents are queried only for exact recorded or
+candidate names. Each exact set's terse XML header is checked: the kernel
+reference count must equal references accounted for by the inspected rules.
+This detects foreign `list:set` membership and references from the other
+xtables implementation. Missing or ambiguous metadata, query failure, count
+mismatch, unexpected entries, and exact candidate-name collision all reject
+before staging, unhooking, or deletion. A foreign name containing spaces or
+newlines cannot forge a complete generated identifier because every generated
+identifier occupies all 31 bytes of the kernel name limit.
+
+The nftables backend uses typed JSON inventory. It requires the marked `inet`
+table, exact ownership comments and types for chains and counters, complete
+expected set elements, and only recorded rules and objects. nft JSON does not
+round-trip set comments; set ownership therefore comes from the recorded
+owner/generation-qualified name plus exact type, flags, and contents inside the
+marked table. Unknown children or foreign references reject the operation
+rather than being adopted.
 
 ## Failure and cleanup behavior
 
-A reconcile validates parent objects and renders a complete typed model before
-mutation. Durable precommit preparation and the active-record commit are the
-[architecture](architecture.md#durable-apply-and-crash-recovery) contract. A
-validation or staging failure leaves active references unchanged. nftables
-preserves that result with its single-transaction atomic boundary;
-iptables/ipset may first enter the explicit per-family mixed window described
-above and then compensate. The active committed record changes only after
-complete enforcement succeeds. The canonical
-[empty desired state](configuration.md#empty-desired-state) removes all owned
-artifacts, including counters and allow-only rules. CrowdSec-enabled state
-does not meet that predicate, even with zero current bans.
+Architecture owns the complete journal and recovery state machine. The native
+boundaries are:
 
-Target migration follows the [migration contract](architecture.md#backend-and-target-migration).
-A failed replacement apply preserves the old target and compensates for any
-partial candidate attachment; failed compensation degrades enforcement. If
-old-target cleanup fails after the active-record commit, both recorded targets
-may still enforce, enforcement is unhealthy, and retirement is retried without
-admitting new mutations. The replacement is not rolled back merely because
-retirement is delayed.
+- nftables switches dispatch atomically in one netlink transaction; failed
+  staging or apply leaves old references selected;
+- iptables stages both families before switching either, then commits each
+  family separately and compensates on failure; the mixed window is real and
+  failed compensation degrades and fences enforcement; and
+- migrations apply the replacement first, may overlap and overblock, commit the
+  replacement, then retire only recorded old ownership. Retirement failure
+  retains both targets and the committed replacement.
 
-If precommit recovery or compensating rollback cannot restore the previous
-owned enforcement, including the previous hook definitions for a priority
-reload, the durable state retains actual ownership and generations. Startup
-withholds readiness and a live daemon exposes unhealthy enforcement; further
-mutations are blocked except recovery or explicit cleanup. A committed intent
-instead finishes retirement and never causes recovery to select a staging
-generation.
+A failed candidate never mutates an active generation. The canonical empty
+state removes all owned artifacts, including counters and allow-only rules;
+enabled CrowdSec (once implemented) prevents that predicate even with zero
+current decisions.
 
-Ordinary shutdown leaves rules active. Lifecycle ownership is defined in
-[architecture](architecture.md#exclusive-lifecycle-ownership): `run` and
-`perimeterd cleanup` take and hold the same exclusive, nonblocking namespace
-lock at `/run/perimeterd/owner.lock` for their entire lifetimes. If the lock
-is held, cleanup fails without touching firewall state; the lock is never
-unlinked or recreated while held. Cleanup reads durable journal and ownership
-records for active, prepared, and retired generations on current and prior
-migration targets. It removes tagged parent jumps before owned child objects,
-attempts cleanup for both supported backends and prior targets, and finishes
-committed retirement. It never derives cleanup scope from current YAML or
-broadens ownership because an expected object is missing.
-Already-absent custom parents do not prevent removal of remaining recorded
-ownership, including retirement during migration or a transition to empty policy.
-Parent existence is still required for attachments in the desired policy.
+Normal shutdown leaves rules active. `run` and `perimeterd cleanup` share the
+same nonblocking lifecycle lock at `/run/perimeterd/owner.lock`; cleanup while
+`run` holds it fails without mutation. Cleanup reads durable active, prepared,
+and retired target metadata for current and migration targets, removes tagged
+parent jumps before child objects, and never derives scope from current YAML.
+Already-absent custom parents do not block removal of remaining recorded
+ownership, but a parent must exist for an attachment in the desired policy.
