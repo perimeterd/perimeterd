@@ -51,7 +51,7 @@ func iptModelTestTarget(generation string, attachments []config.Attachment) *Tar
 
 func TestIPTFamilyLowersZeroPrefixAndPreservesPolicyDirection(t *testing.T) {
 	target := iptModelTestTarget("abcdefabcdefabcdefabcdefabcdefab", []config.Attachment{{Chain: "INPUT", Direction: "ingress"}, {Chain: "OUTPUT", Direction: "egress", OriginalDestination: true}})
-	model, err := buildIPTFamily(target, policy.IPv4)
+	model, err := buildIPTFamily(target, policy.IPv4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,11 +89,11 @@ func TestIPTFamilyLowersZeroPrefixAndPreservesPolicyDirection(t *testing.T) {
 
 func TestIPTActiveAttachmentNamesStableAcrossGeneration(t *testing.T) {
 	attachments := []config.Attachment{{Chain: "FORWARD", Direction: "ingress", InputInterfaces: []string{"eth0", "eth1"}}}
-	first, err := buildIPTFamily(iptModelTestTarget("abcdefabcdefabcdefabcdefabcdefab", attachments), policy.IPv4)
+	first, err := buildIPTFamily(iptModelTestTarget("abcdefabcdefabcdefabcdefabcdefab", attachments), policy.IPv4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := buildIPTFamily(iptModelTestTarget("fedcbafedcbafedcbafedcbafedcbafe", attachments), policy.IPv4)
+	second, err := buildIPTFamily(iptModelTestTarget("fedcbafedcbafedcbafedcbafedcbafe", attachments), policy.IPv4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

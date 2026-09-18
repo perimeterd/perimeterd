@@ -86,7 +86,7 @@ func TestPriorityOnlyKeepsGenerationAndBaseReplacement(t *testing.T) {
 	inventory.table = nftObject{Kind: "table", Family: "inet", Name: first.Table, Comment: tableComment(first.Owner)}
 	name := baseChainName(first, policy.Ingress)
 	inventory.chains[name] = nftObject{Kind: "chain", Family: "inet", Table: first.Table, Name: name, Comment: ownershipComment(first.Owner, stableToken, baseRole(policy.Ingress), true), Prio: first.Priority, HasPrio: true}
-	batch, err := commandBatch(&candidate, inventory, first)
+	batch, err := commandBatch(&candidate, inventory, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestCommandBatchRepairsMissingGenerationRules(t *testing.T) {
 		Kind: "chain", Family: "inet", Table: target.Table, Name: name,
 		Comment: ownershipComment(target.Owner, target.Generation, chainRole(policy.IPv4, policy.Ingress), false),
 	}
-	batch, err := commandBatch(target, inventory, target)
+	batch, err := commandBatch(target, inventory, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestPreflightRejectsExistingSameOwnerEmptyCandidateTable(t *testing.T) {
 		}
 		return []byte(`{"nftables":[]}`), nil
 	}}
-	if err := backend.Preflight(context.Background(), nil, target); err == nil {
+	if err := backend.Preflight(context.Background(), nil, target, nil); err == nil {
 		t.Fatal("preflight adopted an existing same-owner candidate table")
 	}
 }
@@ -598,10 +598,10 @@ func TestOversizedTargetRejectedBeforeNativeCommands(t *testing.T) {
 		t.Fatal("oversized target reached native execution")
 		return nil, nil
 	}}
-	if err := backend.Preflight(context.Background(), nil, target); err == nil {
+	if err := backend.Preflight(context.Background(), nil, target, nil); err == nil {
 		t.Fatal("oversized target passed preflight")
 	}
-	if err := backend.Apply(context.Background(), nil, target); err == nil {
+	if err := backend.Apply(context.Background(), nil, target, nil); err == nil {
 		t.Fatal("oversized target passed direct apply")
 	}
 }

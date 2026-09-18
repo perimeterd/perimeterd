@@ -115,11 +115,14 @@ func (i *IPTables) restore(ctx context.Context, family policy.Family, lines []st
 
 // Preflight checks tool compatibility, ownership, parents, and recovery capacity
 // before the writer publishes durable intent.
-func (i *IPTables) Preflight(ctx context.Context, previous, candidate *Target) error {
+func (i *IPTables) Preflight(ctx context.Context, previous, candidate *Target, dynamic *DynamicState) error {
+	if err := validateDynamicState(candidate, dynamic); err != nil {
+		return err
+	}
 	if previous == nil && candidate == nil {
 		return ctx.Err()
 	}
-	expected, err := expectedIPT(previous, candidate)
+	expected, err := expectedIPTWithProjection(dynamic, previous, candidate)
 	if err != nil {
 		return err
 	}
@@ -132,11 +135,11 @@ func (i *IPTables) Preflight(ctx context.Context, previous, candidate *Target) e
 	}
 	// Before Prepare, candidate-only names have no durable authorization.
 	if candidate != nil {
-		old, err := expectedIPT(previous)
+		old, err := expectedIPTWithProjection(nil, previous)
 		if err != nil {
 			return err
 		}
-		next, err := expectedIPT(candidate)
+		next, err := expectedIPTWithProjection(dynamic, candidate)
 		if err != nil {
 			return err
 		}
@@ -291,9 +294,6 @@ func (i *IPTables) stage(ctx context.Context, models map[policy.Family]iptFamily
 				}
 			}
 			if set.Dynamic {
-				if exists && referencedSet(inventory, set.Name) {
-					continue // A reused live generation is reconciled by UpdateDynamic.
-				}
 				if err := appendDynamicIPSet(&setInput, set, inventory, desired); err != nil {
 					return err
 				}
@@ -453,7 +453,7 @@ func (i *IPTables) UpdateDynamic(ctx context.Context, target *Target, prefixes [
 	if err := ValidateDynamic(prefixes); err != nil {
 		return err
 	}
-	expected, err := expectedIPT(target)
+	expected, err := expectedIPTWithProjection(nil, target)
 	if err != nil {
 		return err
 	}
@@ -495,13 +495,15 @@ func (i *IPTables) UpdateDynamic(ctx context.Context, target *Target, prefixes [
 	return i.restoreSets(ctx, input.String())
 }
 
-// Apply stages both families before switching either one. Failed or uncertain
-// switches trigger bounded compensation independent of caller cancellation.
-func (i *IPTables) Apply(ctx context.Context, previous, candidate *Target) error {
+// Apply selects the candidate, preserving dynamic leases unless authority is supplied.
+func (i *IPTables) Apply(ctx context.Context, previous, candidate *Target, dynamic *DynamicState) error {
+	if err := validateDynamicState(candidate, dynamic); err != nil {
+		return err
+	}
 	if previous == nil && candidate == nil {
 		return ctx.Err()
 	}
-	expected, err := expectedIPT(previous, candidate)
+	expected, err := expectedIPTWithProjection(dynamic, previous, candidate)
 	if err != nil {
 		return err
 	}
@@ -543,7 +545,7 @@ func (i *IPTables) Apply(ctx context.Context, previous, candidate *Target) error
 
 func (i *IPTables) remove(ctx context.Context, remove, keep []*Target) error {
 	all := append(append([]*Target(nil), remove...), keep...)
-	expected, err := expectedIPT(all...)
+	expected, err := expectedIPTWithProjection(nil, all...)
 	if err != nil {
 		return err
 	}
@@ -551,11 +553,11 @@ func (i *IPTables) remove(ctx context.Context, remove, keep []*Target) error {
 	if err != nil {
 		return err
 	}
-	obsolete, err := expectedIPT(remove...)
+	obsolete, err := expectedIPTWithProjection(nil, remove...)
 	if err != nil {
 		return err
 	}
-	retained, err := expectedIPT(keep...)
+	retained, err := expectedIPTWithProjection(nil, keep...)
 	if err != nil {
 		return err
 	}

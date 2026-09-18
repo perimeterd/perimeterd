@@ -526,6 +526,15 @@ enforcement operation sequence above the applied watermark. Apply from this
 selected staged context while holding the same admission fence; do not publish
 it as the active store or admit its ordinary events yet.
 
+The native backend receives the selected projection separately from the durable
+target. `Preflight` uses it only for admission and cannot authorize a later
+write. `Apply` receives an activation projection only when installing or
+replacing dynamic authority: a nil projection preserves existing leases, while
+an explicit empty projection clears them. A static refresh admits against the
+current full projection but applies with nil, so it cannot renew or replay
+captured bans. Recovery also preserves existing leases until a fresh
+authoritative activation or dynamic update.
+
 On success, publish the selected epoch/store and operation watermark together,
 then resume incremental polling. Configuration-driven activation additionally
 waits for the durable configuration commit. On failure, the old epoch/store

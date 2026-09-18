@@ -29,6 +29,7 @@ type crowdFixtureDecision struct {
 type crowdFixture struct {
 	mu           sync.Mutex
 	decisions    map[int64]crowdFixtureDecision
+	pending      map[int64]struct{}
 	deleted      []int64
 	mode         string
 	startups     int
@@ -38,7 +39,10 @@ type crowdFixture struct {
 
 func newCrowdFixture(t *testing.T) (*crowdFixture, *httptest.Server) {
 	t.Helper()
-	fixture := &crowdFixture{decisions: make(map[int64]crowdFixtureDecision)}
+	fixture := &crowdFixture{
+		decisions: make(map[int64]crowdFixtureDecision),
+		pending:   make(map[int64]struct{}),
+	}
 	server := httptest.NewServer(http.HandlerFunc(fixture.serve))
 	t.Cleanup(server.Close)
 	return fixture, server
@@ -53,12 +57,18 @@ func (f *crowdFixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	query := r.URL.Query()
-	if r.URL.Path != "/v1/decisions/stream" || query.Get("dedup") != "false" || len(query["dedup"]) != 1 || query.Get("scopes") != "ip,range" {
+	startupValues := query["startup"]
+	if r.URL.Path != "/v1/decisions/stream" ||
+		query.Get("dedup") != "false" || len(query["dedup"]) != 1 ||
+		query.Get("scopes") != "ip,range" || len(query["scopes"]) != 1 ||
+		len(startupValues) != 1 ||
+		(startupValues[0] != "true" && startupValues[0] != "false") {
 		f.badRequest = true
 		http.Error(w, "unsupported stream request", http.StatusBadRequest)
 		return
 	}
-	if query.Get("startup") == "true" {
+	startup := startupValues[0] == "true"
+	if startup {
 		f.startups++
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -66,15 +76,18 @@ func (f *crowdFixture) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"new":[],"deleted":[],"new":[]}`))
 		return
 	}
-	if f.mode == "outage" {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
+
+	now := time.Now()
+	capacity := len(f.decisions)
+	if !startup {
+		capacity = len(f.pending)
 	}
-	newDecisions := make([]map[string]any, 0, len(f.decisions))
-	for _, decision := range f.decisions {
-		remaining := time.Until(decision.expires)
-		if remaining <= 0 {
-			continue
+	newDecisions := make([]map[string]any, 0, capacity)
+	appendDecision := func(decision crowdFixtureDecision) {
+		if !decision.expires.After(now) {
+			delete(f.decisions, decision.id)
+			delete(f.pending, decision.id)
+			return
 		}
 		scope := "ip"
 		if strings.Contains(decision.value, "/") {
@@ -82,13 +95,29 @@ func (f *crowdFixture) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		newDecisions = append(newDecisions, map[string]any{
 			"id": decision.id, "type": "ban", "scope": scope, "value": decision.value,
-			"duration": remaining.String(), "origin": "cscli", "scenario": "perimeterd-e2e",
+			"until":  decision.expires.UTC().Format(time.RFC3339Nano),
+			"origin": "cscli", "scenario": "perimeterd-e2e",
 		})
 	}
-	deleted := make([]map[string]any, 0, len(f.deleted))
-	for _, id := range f.deleted {
-		deleted = append(deleted, map[string]any{"id": id})
+	if startup {
+		for _, decision := range f.decisions {
+			appendDecision(decision)
+		}
+	} else {
+		for id := range f.pending {
+			if decision, ok := f.decisions[id]; ok {
+				appendDecision(decision)
+			}
+		}
 	}
+
+	deleted := make([]map[string]any, 0, len(f.deleted))
+	if !startup {
+		for _, id := range f.deleted {
+			deleted = append(deleted, map[string]any{"id": id})
+		}
+	}
+	clear(f.pending)
 	f.deleted = nil
 	_ = json.NewEncoder(w).Encode(map[string]any{"new": newDecisions, "deleted": deleted})
 }
@@ -97,12 +126,25 @@ func (f *crowdFixture) set(id int64, value string, lifetime time.Duration) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.decisions[id] = crowdFixtureDecision{id: id, value: value, expires: time.Now().Add(lifetime)}
+	if f.pending == nil {
+		f.pending = make(map[int64]struct{})
+	}
+	f.pending[id] = struct{}{}
 }
 
 func (f *crowdFixture) remove(id int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if _, ok := f.decisions[id]; !ok {
+		return
+	}
 	delete(f.decisions, id)
+	delete(f.pending, id)
+	for _, deletedID := range f.deleted {
+		if deletedID == id {
+			return
+		}
+	}
 	f.deleted = append(f.deleted, id)
 }
 

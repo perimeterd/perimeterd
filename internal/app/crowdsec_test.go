@@ -20,17 +20,25 @@ import (
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
-type crowdBackend struct {
-	recordingBackend
-	dynamicMu  sync.Mutex
-	containers map[string][]policy.TimedPrefix
-	current    string
-	writes     int
-	failWrites int
+type crowdWriteEvent struct {
+	generation string
+	projection []policy.TimedPrefix
+	err        error
 }
 
-func (b *crowdBackend) Apply(ctx context.Context, previous, candidate *firewall.Target) error {
-	if err := b.recordingBackend.Apply(ctx, previous, candidate); err != nil {
+type crowdBackend struct {
+	recordingBackend
+	dynamicMu   sync.Mutex
+	containers  map[string][]policy.TimedPrefix
+	current     string
+	writes      int
+	failWrites  int
+	engine      *Engine
+	writeEvents chan crowdWriteEvent
+}
+
+func (b *crowdBackend) Apply(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
+	if err := b.recordingBackend.Apply(ctx, previous, candidate, dynamic); err != nil {
 		return err
 	}
 	b.dynamicMu.Lock()
@@ -40,28 +48,61 @@ func (b *crowdBackend) Apply(ctx context.Context, previous, candidate *firewall.
 		return nil
 	}
 	b.current = candidate.DynamicGeneration
-	if candidate.Dynamic != nil {
-		b.containers[b.current] = append([]policy.TimedPrefix(nil), candidate.Dynamic.Prefixes...)
+	if dynamic != nil {
+		b.containers[b.current] = append([]policy.TimedPrefix(nil), dynamic.Prefixes...)
 	}
 	return nil
 }
 
 func (b *crowdBackend) UpdateDynamic(_ context.Context, target *firewall.Target, projection []policy.TimedPrefix) error {
 	b.dynamicMu.Lock()
-	defer b.dynamicMu.Unlock()
 	b.writes++
 	b.containers[target.DynamicGeneration] = append([]policy.TimedPrefix(nil), projection...)
+	var err error
 	if b.failWrites > 0 {
 		b.failWrites--
-		return errors.New("injected partial dynamic apply")
+		err = errors.New("injected partial dynamic apply")
 	}
-	return nil
+	event := crowdWriteEvent{
+		generation: target.DynamicGeneration,
+		projection: append([]policy.TimedPrefix(nil), projection...),
+		err:        err,
+	}
+	b.dynamicMu.Unlock()
+	b.writeEvents <- event
+	return err
+}
+
+func (b *crowdBackend) writeCount() int {
+	b.dynamicMu.Lock()
+	defer b.dynamicMu.Unlock()
+	return b.writes
 }
 
 func (b *crowdBackend) selectedProjection() []policy.TimedPrefix {
 	b.dynamicMu.Lock()
 	defer b.dynamicMu.Unlock()
 	return append([]policy.TimedPrefix(nil), b.containers[b.current]...)
+}
+
+func waitCrowdWrite(t *testing.T, backend *crowdBackend, timeout time.Duration, want func(crowdWriteEvent) bool) crowdWriteEvent {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case event := <-backend.writeEvents:
+			backend.engine.mu.Lock()
+			matched := want(event)
+			backend.engine.mu.Unlock()
+			if matched {
+				return event
+			}
+		case <-timer.C:
+			t.Fatal("timed out waiting for CrowdSec backend write")
+			return crowdWriteEvent{}
+		}
+	}
 }
 
 func crowdEngineFixture(t *testing.T, checkpoint func(string) error) (*Engine, *crowdBackend, config.Config) {
@@ -84,8 +125,12 @@ func crowdEngineFixture(t *testing.T, checkpoint func(string) error) (*Engine, *
 	}
 	cfg := parseEngineConfig(t, "203.0.113.1")
 	cfg.CrowdSec = config.CrowdSecConfig{Enabled: true, LAPIURL: server.URL, APIKeyFile: key, UpdateFrequency: time.Hour}
-	backend := &crowdBackend{containers: make(map[string][]policy.TimedPrefix)}
+	backend := &crowdBackend{
+		containers:  make(map[string][]policy.TimedPrefix),
+		writeEvents: make(chan crowdWriteEvent, 32),
+	}
 	engine, _ := newTestEngine(t, backend, checkpoint)
+	backend.engine = engine
 	t.Cleanup(engine.Close)
 	outcome, err := engine.Apply(context.Background(), admitCandidate(t, engine, cfg))
 	if err != nil || !outcome.Committed {
@@ -106,21 +151,22 @@ func TestCrowdReloadFailureRetainsCredentialAndAuthority(t *testing.T) {
 	if err == nil || outcome.Committed {
 		t.Fatalf("invalid same-path rotation accepted: %#v, %v", outcome, err)
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		engine.mu.Lock()
-		resynchronized := engine.crowd.active.epoch > oldEpoch
-		engine.mu.Unlock()
-		if resynchronized {
-			projection := backend.selectedProjection()
-			if len(projection) != 1 || projection[0].Prefix.String() != "198.51.100.9/32" {
-				t.Fatalf("old authority lost: %v", projection)
-			}
-			return
-		}
-		time.Sleep(time.Millisecond)
+	event := waitCrowdWrite(t, backend, 3*time.Second, func(event crowdWriteEvent) bool {
+		return event.err == nil && len(event.projection) == 1 &&
+			event.projection[0].Prefix == netip.MustParsePrefix("198.51.100.9/32")
+	})
+	engine.mu.Lock()
+	resynchronized := engine.crowd.active.epoch > oldEpoch
+	engine.mu.Unlock()
+	if !resynchronized {
+		t.Fatal("retained credential did not complete a replacement full synchronization")
 	}
-	t.Fatal("retained credential did not complete a replacement full synchronization")
+	if len(event.projection) != 1 || event.projection[0].Prefix.String() != "198.51.100.9/32" {
+		t.Fatalf("old authority lost: %v", event.projection)
+	}
+	if projection := backend.selectedProjection(); len(projection) != 1 || projection[0].Prefix.String() != "198.51.100.9/32" {
+		t.Fatalf("old authority lost from selected container: %v", projection)
+	}
 }
 
 func TestCrowdReconnectWriteFailureWakesEmptyStoreRetry(t *testing.T) {
@@ -145,47 +191,41 @@ func TestCrowdReconnectWriteFailureWakesEmptyStoreRetry(t *testing.T) {
 	}
 	cfg := parseEngineConfig(t, "203.0.113.1")
 	cfg.CrowdSec = config.CrowdSecConfig{Enabled: true, LAPIURL: server.URL, APIKeyFile: key, UpdateFrequency: 10 * time.Millisecond}
-	backend := &crowdBackend{containers: make(map[string][]policy.TimedPrefix)}
+	backend := &crowdBackend{
+		containers:  make(map[string][]policy.TimedPrefix),
+		writeEvents: make(chan crowdWriteEvent, 32),
+	}
 	engine, _ := newTestEngine(t, backend, nil)
+	backend.engine = engine
 	defer engine.Close()
 	if outcome, err := engine.Apply(context.Background(), admitCandidate(t, engine, cfg)); err != nil || !outcome.Committed {
 		t.Fatalf("initial apply: %#v, %v", outcome, err)
-	}
-	// The empty store has no expiry or lease-renewal timer. Consume the
-	// activation wake before failing a later reconnect and its compensation.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		engine.mu.Lock()
-		pending := len(engine.crowd.active.wake)
-		engine.mu.Unlock()
-		if pending == 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("empty-store worker did not consume its activation wake")
-		}
-		time.Sleep(time.Millisecond)
 	}
 	backend.dynamicMu.Lock()
 	backend.failWrites = 2
 	backend.dynamicMu.Unlock()
 	reconnect.Store(true)
 	expected := netip.MustParsePrefix("198.51.100.9/32")
-	deadline = time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) {
-		backend.dynamicMu.Lock()
-		retried := backend.writes > 2
-		backend.dynamicMu.Unlock()
-		projection := backend.selectedProjection()
-		if retried && engine.Healthy() && len(projection) == 1 && projection[0].Prefix == expected {
-			return
+	failures := 0
+	var final crowdWriteEvent
+	waitCrowdWrite(t, backend, 8*time.Second, func(event crowdWriteEvent) bool {
+		if event.err != nil {
+			failures++
+		} else if len(event.projection) == 1 && event.projection[0].Prefix == expected {
+			final = event
 		}
-		time.Sleep(10 * time.Millisecond)
+		return failures >= 2 && len(final.projection) == 1
+	})
+	event := final
+	if writes := backend.writeCount(); writes < 3 {
+		t.Fatalf("reconnect did not retry after transient native failures: writes=%d", writes)
 	}
-	backend.dynamicMu.Lock()
-	writes := backend.writes
-	backend.dynamicMu.Unlock()
-	t.Fatalf("reconnect did not recover after transient native failures: writes=%d healthy=%v projection=%v", writes, engine.Healthy(), backend.selectedProjection())
+	if !engine.Healthy() {
+		t.Fatal("successful reconnect left enforcement unhealthy")
+	}
+	if projection := backend.selectedProjection(); len(projection) != 1 || projection[0].Prefix != expected {
+		t.Fatalf("latest authority was not selected after retry: event=%v projection=%v", event.projection, projection)
+	}
 }
 
 func TestCrowdTransactionSelectionKeepsMatchingAuthority(t *testing.T) {
@@ -226,54 +266,95 @@ func TestCrowdTransactionSelectionKeepsMatchingAuthority(t *testing.T) {
 func TestCrowdRenewalAndFailedApplyUseCurrentStore(t *testing.T) {
 	engine, backend, _ := crowdEngineFixture(t, nil)
 	engine.mu.Lock()
-	defer engine.mu.Unlock()
 	c := engine.crowd
 	s := c.active
-	revision, watermark := s.store.Revision(), c.watermark
 	due := s.renewAt
 	if due.IsZero() || time.Until(due) < 11*time.Hour || time.Until(due) > 12*time.Hour {
+		engine.mu.Unlock()
 		t.Fatalf("renewal not scheduled at half lease: %v", due)
 	}
 	originalDeadline := s.store.Projection(time.Now())[0].Deadline
+	pollDone := s.pollDone
+	c.stopStateLocked(s, false)
+	engine.mu.Unlock()
+	if pollDone != nil {
+		<-pollDone
+	}
+	c.workers.Wait()
+
+	baseline := backend.writeCount()
+	engine.mu.Lock()
 	c.maintainLocked(context.Background(), s, due.Add(-time.Nanosecond))
-	if c.watermark != watermark {
-		t.Fatal("lease renewed before its half-grant boundary")
-	}
-	c.maintainLocked(context.Background(), s, due)
-	if s.store.Revision() != revision || c.watermark <= watermark {
-		t.Fatal("unchanged desired revision did not receive a fresh acknowledged operation")
-	}
-	if got := backend.selectedProjection()[0].Deadline; !got.Equal(originalDeadline) {
-		t.Fatal("renewal rebased source expiry")
+	engine.mu.Unlock()
+	if writes := backend.writeCount(); writes != baseline {
+		t.Fatalf("lease renewed before its half-grant boundary: writes=%d baseline=%d", writes, baseline)
 	}
 
+	baseline = backend.writeCount()
+	engine.mu.Lock()
+	c.maintainLocked(context.Background(), s, due)
+	engine.mu.Unlock()
+	renewal := waitCrowdWrite(t, backend, 3*time.Second, func(event crowdWriteEvent) bool {
+		return event.err == nil
+	})
+	if writes := backend.writeCount(); writes != baseline+1 {
+		t.Fatalf("unchanged desired state did not receive one fresh acknowledged write: writes=%d baseline=%d", writes, baseline)
+	}
+	if len(renewal.projection) != 1 || !renewal.projection[0].Deadline.Equal(originalDeadline) {
+		t.Fatalf("renewal rebased source expiry: %v", renewal.projection)
+	}
+
+	backend.dynamicMu.Lock()
 	backend.failWrites = 1
-	watermark = c.watermark
-	if err := c.reconcileLocked(context.Background(), s); err == nil {
+	backend.dynamicMu.Unlock()
+	baseline = backend.writeCount()
+	engine.mu.Lock()
+	err := c.reconcileLocked(context.Background(), s, false)
+	engine.mu.Unlock()
+	failed := waitCrowdWrite(t, backend, 3*time.Second, func(event crowdWriteEvent) bool {
+		return event.err != nil
+	})
+	if err == nil {
 		t.Fatal("partial write unexpectedly succeeded")
 	}
-	if c.watermark != watermark || engine.Healthy() {
-		t.Fatal("failed native operation was acknowledged")
+	if writes := backend.writeCount(); writes != baseline+1 {
+		t.Fatalf("failed native operation did not reach backend exactly once: writes=%d baseline=%d", writes, baseline)
 	}
-	s.sequence++
+	if failed.err == nil || engine.Healthy() {
+		t.Fatalf("failed native operation was acknowledged: event=%v healthy=%v", failed, engine.Healthy())
+	}
+
 	latest := netip.MustParsePrefix("203.0.113.128/25")
+	engine.mu.Lock()
+	s.sequence++
 	if err := s.store.Apply(crowd.Batch{Deleted: []int64{1}, New: []crowd.Decision{{ID: 2, Prefix: latest, Deadline: originalDeadline}}}, s.sequence, time.Now()); err != nil {
+		engine.mu.Unlock()
 		t.Fatal(err)
 	}
-	if err := c.reconcileLocked(context.Background(), s); err != nil {
-		t.Fatal(err)
-	}
-	projection := backend.selectedProjection()
-	if len(projection) != 1 || projection[0].Prefix != latest || !engine.Healthy() {
-		t.Fatalf("retry replayed stale desired state: %v", projection)
-	}
-	stale := &crowdState{epoch: s.epoch - 1, store: s.store}
-	writes := backend.writes
-	target, err := c.targetLocked()
+	engine.mu.Unlock()
+	baseline = backend.writeCount()
+	engine.mu.Lock()
+	err = c.reconcileLocked(context.Background(), s, false)
+	engine.mu.Unlock()
+	retry := waitCrowdWrite(t, backend, 3*time.Second, func(event crowdWriteEvent) bool {
+		return event.err == nil && len(event.projection) == 1 && event.projection[0].Prefix == latest
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.writeLocked(context.Background(), stale, target, false); !errors.Is(err, errStaleCandidate) || backend.writes != writes {
+	if writes := backend.writeCount(); writes != baseline+1 {
+		t.Fatalf("latest authority retry made unexpected backend writes: writes=%d baseline=%d", writes, baseline)
+	}
+	if len(retry.projection) != 1 || retry.projection[0].Prefix != latest || !engine.Healthy() {
+		t.Fatalf("retry replayed stale desired state: event=%v healthy=%v", retry.projection, engine.Healthy())
+	}
+
+	stale := &crowdState{epoch: s.epoch - 1, store: s.store}
+	baseline = backend.writeCount()
+	engine.mu.Lock()
+	err = c.reconcileLocked(context.Background(), stale, false)
+	engine.mu.Unlock()
+	if !errors.Is(err, errStaleCandidate) || backend.writeCount() != baseline {
 		t.Fatal("retired epoch reached backend")
 	}
 }
@@ -301,9 +382,9 @@ func TestCrowdUncertainCommitRetainsStagedAuthorityUntilRecovery(t *testing.T) {
 		engine.mu.Unlock()
 		t.Fatal("uncertain transaction lost either authority store")
 	}
-	writes := backend.writes
+	writes := backend.writeCount()
 	engine.crowd.maintainLocked(context.Background(), old, old.renewAt)
-	if backend.writes != writes {
+	if backend.writeCount() != writes {
 		engine.mu.Unlock()
 		t.Fatal("renewal crossed a pending static transaction")
 	}

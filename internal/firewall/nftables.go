@@ -49,16 +49,21 @@ func validateNFTTarget(target *Target) error {
 // expansion, with another 16 MiB of capture headroom. Prefixes can become host
 // strings or merged ranges, neither larger than this allowance. Sum both full
 // generations in each table because they coexist until durable retirement.
-func validateNFTCapacity(targets ...*Target) error {
+// The projection is used only for candidate admission/capacity accounting.
+func validateNFTCapacity(previous, candidate *Target, dynamic *DynamicState) error {
 	budgets := make(map[string]int)
-	for _, target := range targets {
+	for index, target := range []*Target{previous, candidate} {
 		if target == nil {
 			continue
 		}
 		if err := validateNFTTarget(target); err != nil {
 			return err
 		}
-		batch, err := commandBatch(target, nil, nil)
+		var projection *DynamicState
+		if index == 1 {
+			projection = dynamic
+		}
+		batch, err := commandBatch(target, nil, projection)
 		if err != nil {
 			return err
 		}
@@ -644,11 +649,14 @@ func (n *NFT) probe(ctx context.Context) error {
 
 // Preflight validates the typed target and inspects existing ownership before
 // callers publish durable intent or mutate the kernel.
-func (n *NFT) Preflight(ctx context.Context, previous, candidate *Target) error {
+func (n *NFT) Preflight(ctx context.Context, previous, candidate *Target, dynamic *DynamicState) error {
+	if err := validateDynamicState(candidate, dynamic); err != nil {
+		return err
+	}
 	if previous == nil && candidate == nil {
 		return n.probe(ctx)
 	}
-	if err := validateNFTCapacity(previous, candidate); err != nil {
+	if err := validateNFTCapacity(previous, candidate, dynamic); err != nil {
 		return err
 	}
 	if err := n.probe(ctx); err != nil {
@@ -685,11 +693,14 @@ func (n *NFT) Preflight(ctx context.Context, previous, candidate *Target) error 
 
 // Apply switches dispatch to candidate, or removes only previous owned base
 // chains when candidate is nil. All mutations for one switch use one JSON batch.
-func (n *NFT) Apply(ctx context.Context, previous, candidate *Target) error {
+func (n *NFT) Apply(ctx context.Context, previous, candidate *Target, dynamic *DynamicState) error {
+	if err := validateDynamicState(candidate, dynamic); err != nil {
+		return err
+	}
 	if previous == nil && candidate == nil {
 		return n.probe(ctx)
 	}
-	if err := validateNFTCapacity(previous, candidate); err != nil {
+	if err := validateNFTCapacity(previous, candidate, dynamic); err != nil {
 		return err
 	}
 	if candidate == nil {
@@ -716,7 +727,7 @@ func (n *NFT) Apply(ctx context.Context, previous, candidate *Target) error {
 	if err != nil {
 		return err
 	}
-	batch, err := commandBatch(candidate, inventory, previous)
+	batch, err := commandBatch(candidate, inventory, dynamic)
 	if err != nil {
 		return err
 	}

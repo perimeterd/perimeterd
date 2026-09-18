@@ -96,7 +96,10 @@ bypass admission or call a backend directly.
 
 Static reconciliation remains separate from the incremental CrowdSec
 path: individual decisions must not rebuild global or geo sets. Both paths use
-the same writer.
+the same writer. Each dynamic dispatch obtains one freshly validated durable
+view for both active-target selection and prepared-journal checks. Views are not
+retained across dispatches or failure retries; durable and source-cache
+validation remain trust boundaries.
 
 Kernel packet/byte accounting is implemented; periodic collection and Prometheus
 export of those counters are planned. The collector must be an observer, not a
@@ -212,10 +215,10 @@ sequence so unchanged bans can renew without admitting stale work. That
 contract owns store-event ordering, retry/coalescing, staged-client publication,
 and lease-timer dispatch; this section defines static candidate admission.
 
-Static refreshes never contain a captured copy of dynamic bans. Activation or
-migration selects the client's current store at the writer boundary, with
-subsequent events queued behind it. Configuration-driven activation waits for
-the same durable commit as the static candidate.
+Durable targets, revisions, and journals never contain captured dynamic bans.
+Activation or migration selects the client's current store at the writer
+boundary, with subsequent events queued behind it. Configuration-driven
+activation waits for the same durable commit as the static candidate.
 
 ## Durable apply and crash recovery
 

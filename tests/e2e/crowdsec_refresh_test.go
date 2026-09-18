@@ -20,6 +20,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/app"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
@@ -27,12 +28,13 @@ import (
 // refresh from one that has merely not reached the writer yet.
 type refreshCapacityBackend struct {
 	firewall.Backend
-	initial chan *firewall.Target
-	refresh chan error
+	initial           chan *firewall.Target
+	initialProjection chan []policy.TimedPrefix
+	refresh           chan error
 }
 
-func (b *refreshCapacityBackend) Preflight(ctx context.Context, previous, candidate *firewall.Target) error {
-	err := b.Backend.Preflight(ctx, previous, candidate)
+func (b *refreshCapacityBackend) Preflight(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
+	err := b.Backend.Preflight(ctx, previous, candidate, dynamic)
 	if previous != nil {
 		select {
 		case b.refresh <- err:
@@ -42,12 +44,19 @@ func (b *refreshCapacityBackend) Preflight(ctx context.Context, previous, candid
 	return err
 }
 
-func (b *refreshCapacityBackend) Apply(ctx context.Context, previous, candidate *firewall.Target) error {
-	err := b.Backend.Apply(ctx, previous, candidate)
+func (b *refreshCapacityBackend) Apply(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
+	err := b.Backend.Apply(ctx, previous, candidate, dynamic)
 	if err == nil && previous == nil && candidate != nil {
 		select {
 		case b.initial <- candidate:
 		default:
+		}
+		if dynamic != nil {
+			projection := append([]policy.TimedPrefix(nil), dynamic.Prefixes...)
+			select {
+			case b.initialProjection <- projection:
+			default:
+			}
 		}
 	}
 	return err
@@ -126,7 +135,7 @@ func TestE2ECrowdSecGeoRefreshCapacity(t *testing.T) {
 	}
 	grow := make(chan struct{})
 	fixture := &refreshCapacitySources{initial: countryBody(prefixes[:1]), enlarged: countryBody(prefixes), decisions: wire, grow: grow}
-	backend := &refreshCapacityBackend{Backend: firewall.NewNative(nil), initial: make(chan *firewall.Target, 1), refresh: make(chan error, 1)}
+	backend := &refreshCapacityBackend{Backend: firewall.NewNative(nil), initial: make(chan *firewall.Target, 1), initialProjection: make(chan []policy.TimedPrefix, 1), refresh: make(chan error, 1)}
 	key := filepath.Join(t.TempDir(), "key")
 	if err := os.WriteFile(key, []byte("test-key"), 0o600); err != nil {
 		t.Fatal(err)
@@ -199,8 +208,14 @@ policies:
 		t.Fatal(ctx.Err())
 	}
 	var initial *firewall.Target
+	var initialProjection []policy.TimedPrefix
 	select {
 	case initial = <-backend.initial:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	select {
+	case initialProjection = <-backend.initialProjection:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
@@ -247,7 +262,7 @@ policies:
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18796", "reject", "tcp")
 	renewCtx, renewCancel := context.WithTimeout(context.Background(), time.Minute)
 	defer renewCancel()
-	if err := backend.UpdateDynamic(renewCtx, view.Active.Target, initial.Dynamic.Prefixes); err != nil {
+	if err := backend.UpdateDynamic(renewCtx, view.Active.Target, initialProjection); err != nil {
 		t.Fatalf("preserved CrowdSec authority cannot be renewed: %v", err)
 	}
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18797", "reject", "tcp")

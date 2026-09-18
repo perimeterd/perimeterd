@@ -58,14 +58,13 @@ crowdsec:
 		{Prefix: netip.MustParsePrefix(fixtureIPv4Peer + "/32"), Deadline: deadline},
 		{Prefix: netip.MustParsePrefix(fixtureIPv6Peer + "/128"), Deadline: deadline},
 	}
-	first.Dynamic = &firewall.DynamicState{Prefixes: projection}
 	backend := firewall.NewNative(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if err := backend.Preflight(ctx, nil, first); err != nil {
+	if err := backend.Preflight(ctx, nil, first, &firewall.DynamicState{Prefixes: projection}); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Apply(ctx, nil, first); err != nil {
+	if err := backend.Apply(ctx, nil, first, &firewall.DynamicState{Prefixes: projection}); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -92,13 +91,13 @@ crowdsec:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if refreshed.Dynamic != nil || refreshed.DynamicGeneration != first.DynamicGeneration {
-		t.Fatal("static refresh captured decisions or replaced the active lease container")
+	if refreshed.DynamicGeneration != first.DynamicGeneration {
+		t.Fatal("static refresh replaced the active lease container")
 	}
-	if err := backend.Preflight(ctx, first, refreshed); err != nil {
+	if err := backend.Preflight(ctx, first, refreshed, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Apply(ctx, first, refreshed); err != nil {
+	if err := backend.Apply(ctx, first, refreshed, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := backend.Retire(ctx, first, refreshed); err != nil {

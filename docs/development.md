@@ -210,7 +210,83 @@ GitHub Actions in the existing workflows are pinned to immutable commit SHAs
 with comments naming their releases. No current workflow downloads an
 unpinned `latest` binary.
 
-## Static and dependency analysis
+## Opt-in scale measurements
+
+The scale profiles are repeatable measurements rather than correctness tests.
+They use deterministic synthetic inputs and never fetch live continent feeds or
+inject the accepted upstream CrowdSec issue
+[#4691](https://github.com/crowdsecurity/crowdsec/issues/4691). Run the
+control-plane/serialization profiles without privileges:
+
+```sh
+make bench-scale-small
+make bench-scale-large
+# Repeat a profile when comparing noisy hosts:
+SCALE_BENCHTIME=10x make bench-scale-large
+```
+
+`bench-scale-small` selects the `baseline` sub-benchmarks. `bench-scale-large`
+selects `large-100k` and `large-250k` sub-benchmarks. The commands use
+`-benchmem` and one iteration by default so the large profile is practical to
+run explicitly. The benchmark names and measured quantities are:
+
+- `internal/crowdsec`: `BenchmarkLAPISnapshotAdmission` builds complete LAPI
+  JSON with SDK-matching decision metadata at one decision and 250,000
+  decisions. It reports serialized input bytes, decision count, time/op,
+  allocations/op, admitted operations, capacity-rejected operations, and
+  Linux `/proc` `VmHWM` when available. `BenchmarkAuthorityProjection`
+  measures authoritative store admission and timed projection at one and
+  100,000 decisions.
+- `internal/crowdsec`:
+  `BenchmarkCrowdSecReconnectRenewalRefresh` measures cold startup/reconnect,
+  unchanged renewal projection, and a changed source refresh at one and
+  100,000 decisions. It is an authority/projection control-plane measurement;
+  native reconciliation is covered by the app benchmark and isolated harness.
+- `internal/app`: `BenchmarkSyntheticGeoNormalization` and
+  `BenchmarkSyntheticGeoCompileAndTarget` use normalized synthetic country data
+  containing 1,024 or approximately 100,000 disjoint IPv4 prefixes. They report
+  input and normalized prefix counts, serialized input/target sizes,
+  time/op, and allocations/op.
+- `internal/app`:
+  `BenchmarkAppReconcileCombinedAuthorityAndGeo` constructs a durable revision
+  with the synthetic geo snapshot and a 250,000-decision CrowdSec authority,
+  then repeatedly calls the production `reconcileLocked(ctx, state, false)`
+  path. Its own no-event backend records projection size, so the benchmark
+  measures state reads, admission/reconciliation, and lease bookkeeping
+  without native commands.
+
+The LAPI stream remains bounded by the implementation's 32 MiB safety limit.
+The 250,000-decision fixture intentionally contains realistic metadata and may
+be rejected at admission when its serialized envelope exceeds that limit. A
+capacity rejection is reported as `capacity-rejected/op`; malformed or other
+unexpected errors fail the benchmark instead of being treated as support for
+the workload. Allocations reported by `-benchmem` and the optional `VmHWM`
+sample are process measurements, not peak kernel memory, native set memory, or
+an end-to-end RSS attribution. `VmHWM` is cumulative for the process, including
+fixture setup and earlier profiles; it cannot be attributed to one dispatch.
+
+Native execution is a separate, explicit measurement and runs only inside the
+existing namespace fixture:
+
+```sh
+make bench-native-scale-small
+make bench-native-scale-large
+```
+
+These targets build the normal binary, check the native tool prerequisites, and
+run the verbose `TestE2ECrowdSecNativeMeasurement` binary through the same
+`E2E_SUDO` convention as `test-e2e`. The test re-executes in disposable mount,
+network, and PID namespaces, adding a user namespace for unprivileged runs,
+before creating any native objects; it never uses the host firewall. The large
+profile combines approximately 100,000
+synthetic static geo prefixes with 250,000 CrowdSec source decisions. It supplies
+authority directly, independently of the LAPI byte limit. Each profile reports
+the phases it reaches: source admission, activation preflight/apply, unchanged
+renewal, cold reconnect, and geo-refresh preflight/apply/retire/reconcile
+(including nil dynamic activation). Capacity rejection stops that profile;
+later dependent phases are not exercised. Phase timings have no performance
+assertions. Successful native execution does not establish LAPI admission for
+the equivalent JSON payload.
 
 Formatting uses `gofumpt` followed by `goimports`; `.golangci.yml` separately
 enables the `gci` import-order formatter for its diff check. The pinned

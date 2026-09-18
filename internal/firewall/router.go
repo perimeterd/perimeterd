@@ -47,8 +47,11 @@ func targetBackend(previous, candidate *Target) string {
 }
 
 // Preflight validates both ownership scopes before a backend migration.
-func (n *Native) Preflight(ctx context.Context, previous, candidate *Target) error {
+func (n *Native) Preflight(ctx context.Context, previous, candidate *Target, dynamic *DynamicState) error {
 	if err := validateTargetPair(previous, candidate); err != nil {
+		return err
+	}
+	if err := validateDynamicState(candidate, dynamic); err != nil {
 		return err
 	}
 	kind := targetBackend(previous, candidate)
@@ -56,17 +59,20 @@ func (n *Native) Preflight(ctx context.Context, previous, candidate *Target) err
 		return ctx.Err()
 	}
 	if previous == nil || candidate == nil || previous.Backend() == candidate.Backend() {
-		return n.implementation(kind).Preflight(ctx, previous, candidate)
+		return n.implementation(kind).Preflight(ctx, previous, candidate, dynamic)
 	}
-	if err := n.implementation(previous.Backend()).Preflight(ctx, previous, nil); err != nil {
+	if err := n.implementation(previous.Backend()).Preflight(ctx, previous, nil, nil); err != nil {
 		return fmt.Errorf("migration previous target: %w", err)
 	}
-	return n.implementation(kind).Preflight(ctx, nil, candidate)
+	return n.implementation(kind).Preflight(ctx, nil, candidate, dynamic)
 }
 
 // Apply installs the candidate without retiring a different previous backend.
-func (n *Native) Apply(ctx context.Context, previous, candidate *Target) error {
+func (n *Native) Apply(ctx context.Context, previous, candidate *Target, dynamic *DynamicState) error {
 	if err := validateTargetPair(previous, candidate); err != nil {
+		return err
+	}
+	if err := validateDynamicState(candidate, dynamic); err != nil {
 		return err
 	}
 	kind := targetBackend(previous, candidate)
@@ -74,14 +80,14 @@ func (n *Native) Apply(ctx context.Context, previous, candidate *Target) error {
 		return ctx.Err()
 	}
 	if previous == nil || candidate == nil || previous.Backend() == candidate.Backend() {
-		return n.implementation(kind).Apply(ctx, previous, candidate)
+		return n.implementation(kind).Apply(ctx, previous, candidate, dynamic)
 	}
 	// Both targets are recorded by this point, including during reverse apply
 	// after a failed migration. Never remove the previous enforcement first.
-	if err := n.implementation(previous.Backend()).Preflight(ctx, previous, nil); err != nil {
+	if err := n.implementation(previous.Backend()).Preflight(ctx, previous, nil, nil); err != nil {
 		return fmt.Errorf("migration previous target: %w", err)
 	}
-	return n.implementation(kind).Apply(ctx, nil, candidate)
+	return n.implementation(kind).Apply(ctx, nil, candidate, dynamic)
 }
 
 // Retire removes obsolete ownership after durable candidate publication.

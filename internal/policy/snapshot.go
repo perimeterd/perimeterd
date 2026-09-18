@@ -30,6 +30,15 @@ type Selector struct {
 	Value string
 }
 
+// Less reports the canonical selector order used by policy snapshots and source
+// manifests: namespace first, then the canonical value, both lexicographically.
+func (s Selector) Less(other Selector) bool {
+	if s.Kind != other.Kind {
+		return s.Kind < other.Kind
+	}
+	return s.Value < other.Value
+}
+
 // CanonicalSelector validates and canonicalizes one source identity.
 // Countries and RIR names are case-insensitive; ASNs must already use the
 // canonical AS<number> spelling used by normalized configuration.
@@ -228,9 +237,6 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 
 func sortSelectors(selectors []Selector) {
 	sort.Slice(selectors, func(i, j int) bool {
-		if selectors[i].Kind != selectors[j].Kind {
-			return selectors[i].Kind < selectors[j].Kind
-		}
-		return selectors[i].Value < selectors[j].Value
+		return selectors[i].Less(selectors[j])
 	})
 }

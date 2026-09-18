@@ -396,7 +396,7 @@ func canonicalRecords(records []Record) ([]Record, error) {
 		seen[canonical.Selector] = struct{}{}
 		out[i] = canonical
 	}
-	sort.Slice(out, func(i, j int) bool { return selectorLess(out[i].Selector, out[j].Selector) })
+	sort.Slice(out, func(i, j int) bool { return out[i].Selector.Less(out[j].Selector) })
 	return out, nil
 }
 
@@ -479,7 +479,7 @@ func validateManifest(manifest manifestFile) error {
 			return err
 		}
 		selector := manifestSelector(entry)
-		if i > 0 && !selectorLess(manifestSelector(manifest.Entries[i-1]), selector) {
+		if i > 0 && !manifestSelector(manifest.Entries[i-1]).Less(selector) {
 			return errors.New("manifest selectors are not strictly sorted")
 		}
 	}
@@ -542,13 +542,6 @@ func validateObject(object objectFile) (Record, error) {
 
 func manifestSelector(entry manifestEntry) policy.Selector {
 	return policy.Selector{Kind: policy.SelectorKind(entry.Selector.Kind), Value: entry.Selector.Value}
-}
-
-func selectorLess(a, b policy.Selector) bool {
-	if a.Kind != b.Kind {
-		return a.Kind < b.Kind
-	}
-	return a.Value < b.Value
 }
 
 func prefixStrings(values []netip.Prefix) []string {

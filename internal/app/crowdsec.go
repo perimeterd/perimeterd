@@ -249,7 +249,7 @@ func (c *crowdRuntime) finishApplyLocked(outcome Outcome, selected *crowdState) 
 func (c *crowdRuntime) recoverLocked(ctx context.Context, revision *state.Revision) error {
 	if c.transaction != "" && revision != nil && revision.ID == c.transaction {
 		if c.staged != nil {
-			if err := c.writeLocked(ctx, c.staged, revision.Target, true); err != nil {
+			if err := c.reconcileLocked(ctx, c.staged, true); err != nil {
 				return err
 			}
 		}
@@ -266,7 +266,7 @@ func (c *crowdRuntime) recoverLocked(ctx context.Context, revision *state.Revisi
 		c.activateLocked(nil)
 		return nil
 	}
-	return c.writeLocked(ctx, c.active, revision.Target, false)
+	return c.reconcileLocked(ctx, c.active, false)
 }
 
 func (c *crowdRuntime) signalLocked(s *crowdState) {
@@ -304,7 +304,9 @@ func (c *crowdRuntime) failedWriteLocked(now time.Time) {
 
 // A dispatch is constructed and admitted under the same writer fence. Retries
 // construct a new operation from the latest store, never replay an old payload.
-func (c *crowdRuntime) writeLocked(ctx context.Context, s *crowdState, target *firewall.Target, activation bool) error {
+// Target selection and transaction checks share one freshly validated durable
+// view; no view is carried across dispatches or failure retries.
+func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState, activation bool) error {
 	if c.engine.closing.Load() {
 		return errEngineClosed
 	}
@@ -323,6 +325,11 @@ func (c *crowdRuntime) writeLocked(ctx context.Context, s *crowdState, target *f
 		c.failedWriteLocked(time.Now())
 		return errEngineDegraded
 	}
+	if view.Active == nil || view.Active.Target == nil || view.Active.Target.DynamicGeneration == "" {
+		c.failedWriteLocked(time.Now())
+		return errors.New("CrowdSec active container is unavailable")
+	}
+	target := view.Active.Target
 	now := time.Now()
 	s.store.Expire(now)
 	epoch, revision := s.epoch, s.store.Revision()
@@ -346,26 +353,6 @@ func (c *crowdRuntime) writeLocked(ctx context.Context, s *crowdState, target *f
 	c.enforced.Store(true)
 	c.recordLeasesLocked(s, projection, now)
 	return nil
-}
-
-func (c *crowdRuntime) targetLocked() (*firewall.Target, error) {
-	view, err := c.engine.store.Read()
-	if err != nil {
-		return nil, err
-	}
-	if view.Active == nil || view.Active.Target == nil || view.Active.Target.DynamicGeneration == "" {
-		return nil, errors.New("CrowdSec active container is unavailable")
-	}
-	return view.Active.Target, nil
-}
-
-func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState) error {
-	target, err := c.targetLocked()
-	if err != nil {
-		c.failedWriteLocked(time.Now())
-		return err
-	}
-	return c.writeLocked(ctx, s, target, false)
 }
 
 func (c *crowdRuntime) startPollLocked(s *crowdState, full bool) {
@@ -422,13 +409,9 @@ func (c *crowdRuntime) pollLoop(ctx context.Context, s *crowdState, full bool) {
 				err = errEngineDegraded
 			}
 			if err == nil {
-				var target *firewall.Target
-				target, err = c.targetLocked()
-				if err == nil {
-					err = c.writeLocked(ctx, next, target, true)
-					if err != nil {
-						_ = c.writeLocked(ctx, s, target, false)
-					}
+				err = c.reconcileLocked(ctx, next, true)
+				if err != nil {
+					_ = c.reconcileLocked(ctx, s, false)
 				}
 			}
 			if err == nil {
@@ -449,7 +432,7 @@ func (c *crowdRuntime) pollLoop(ctx context.Context, s *crowdState, full bool) {
 					if before != s.store.Revision() {
 						c.signalLocked(s)
 						if !c.dirty {
-							_ = c.reconcileLocked(ctx, s)
+							_ = c.reconcileLocked(ctx, s, false)
 						}
 					}
 				}
@@ -535,7 +518,7 @@ func (c *crowdRuntime) maintainLocked(ctx context.Context, s *crowdState, now ti
 	} else if !expired && (s.renewAt.IsZero() || now.Before(s.renewAt)) {
 		return
 	}
-	_ = c.reconcileLocked(ctx, s)
+	_ = c.reconcileLocked(ctx, s, false)
 }
 
 func (c *crowdRuntime) closeLocked() {

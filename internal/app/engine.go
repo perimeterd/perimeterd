@@ -69,13 +69,13 @@ func NewEngine(store *state.Store, backend firewall.Backend, checkpoint func(str
 	return engine
 }
 
-func (e *Engine) applyBackendLocked(ctx context.Context, previous, candidate *firewall.Target) error {
+func (e *Engine) applyBackendLocked(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
 	if (previous != nil && previous.DynamicGeneration != "") || (candidate != nil && candidate.DynamicGeneration != "") {
 		if _, err := e.crowd.nextOperationLocked(); err != nil {
 			return err
 		}
 	}
-	return e.backend.Apply(ctx, previous, candidate)
+	return e.backend.Apply(ctx, previous, candidate, dynamic)
 }
 
 // Admit reserves a monotonically increasing request epoch. Admission itself is
@@ -194,7 +194,7 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 	if err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
-	var dynamic *firewall.DynamicState
+	var admission, activation *firewall.DynamicState
 	if candidate.cfg.CrowdSec.Enabled {
 		if selected == nil || selected.store == nil {
 			return Outcome{Active: previous}, errors.New("CrowdSec activation was not synchronized")
@@ -203,24 +203,17 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 			candidateTarget.DynamicGeneration = transaction
 			candidateTarget.Generation = transaction
 		}
-		dynamic = &firewall.DynamicState{Prefixes: selected.store.Projection(time.Now())}
+		admission = &firewall.DynamicState{Prefixes: selected.store.Projection(time.Now())}
 		if previousTarget == nil || candidateTarget.DynamicGeneration != previousTarget.DynamicGeneration {
-			candidateTarget.Dynamic = dynamic
+			activation = admission
 		}
 	}
-	// Admission must include the authority that a refresh preserves. Keep the
-	// activation target unchanged: a shared dynamic generation must not be
-	// rewritten or have its lease-renewal clock rebased by a static refresh.
-	preflightTarget := candidateTarget
-	if dynamic != nil && candidateTarget.Dynamic == nil {
-		capacityTarget := *candidateTarget
-		capacityTarget.Dynamic = dynamic
-		preflightTarget = &capacityTarget
-	}
-	if err := firewall.ValidateTarget(preflightTarget); err != nil {
+	// Capacity admission includes retained authority; activation replaces it only
+	// for a new container. Static refresh must not renew a shared generation.
+	if err := firewall.ValidateTarget(candidateTarget); err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
-	if err := e.backend.Preflight(ctx, previousTarget, preflightTarget); err != nil {
+	if err := e.backend.Preflight(ctx, previousTarget, candidateTarget, admission); err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
 	candidateRevision := &state.Revision{
@@ -241,10 +234,10 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 	if err := e.check("after-prepare"); err != nil {
 		return e.rollbackLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
 	}
-	if candidateTarget != nil && candidateTarget.Dynamic != nil {
+	if activation != nil {
 		e.crowd.grantAt = time.Now()
 	}
-	if err := e.applyBackendLocked(ctx, previousTarget, candidateTarget); err != nil {
+	if err := e.applyBackendLocked(ctx, previousTarget, candidateTarget, activation); err != nil {
 		return e.rollbackLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
 	}
 	if err := e.check("after-switch"); err != nil {
@@ -285,7 +278,7 @@ func (e *Engine) rollbackLocked(ctx context.Context, previous, candidate *state.
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, original
 	}
-	if err := e.applyBackendLocked(ctx, candidateTarget, previousTarget); err != nil {
+	if err := e.applyBackendLocked(ctx, candidateTarget, previousTarget, nil); err != nil {
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, errors.Join(original, fmt.Errorf("restore previous firewall target: %w", err))
 	}
@@ -408,7 +401,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		if err := e.store.Prepare(view.Active, view.Active); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		if err := e.applyBackendLocked(ctx, targetOf(view.Active), targetOf(view.Active)); err != nil {
+		if err := e.applyBackendLocked(ctx, targetOf(view.Active), targetOf(view.Active), nil); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		if err := e.store.MarkPhase("switched"); err != nil {
@@ -458,7 +451,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 	}
 	prevTarget, candidateTarget := targetOf(previous), targetOf(candidate)
 	if view.Active != nil && view.Active.ID == journal.ID {
-		if err := e.applyBackendLocked(ctx, prevTarget, candidateTarget); err != nil {
+		if err := e.applyBackendLocked(ctx, prevTarget, candidateTarget, nil); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		if err := e.store.Commit(candidate); err != nil {
@@ -477,7 +470,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		e.adoptActiveEpochLocked(candidate)
 		return candidate, nil
 	}
-	if err := e.applyBackendLocked(ctx, candidateTarget, prevTarget); err != nil {
+	if err := e.applyBackendLocked(ctx, candidateTarget, prevTarget, nil); err != nil {
 		return nil, e.recoveryFailureLocked(err)
 	}
 	if err := e.backend.Retire(ctx, candidateTarget, prevTarget); err != nil {

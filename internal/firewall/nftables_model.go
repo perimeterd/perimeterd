@@ -502,8 +502,11 @@ func setElementsComplete(observed nftObject, family policy.Family, expected []ne
 	return true
 }
 
-func commandBatch(target *Target, inventory *nftInventory, old *Target) (nftBatch, error) {
+func commandBatch(target *Target, inventory *nftInventory, dynamic *DynamicState) (nftBatch, error) {
 	if err := ValidateTarget(target); err != nil {
+		return nftBatch{}, err
+	}
+	if err := validateDynamicState(target, dynamic); err != nil {
 		return nftBatch{}, err
 	}
 	var batch nftBatch
@@ -528,8 +531,8 @@ func commandBatch(target *Target, inventory *nftInventory, old *Target) (nftBatc
 			name := setName(target, family.Family, set.ID)
 			if set.Kind == policy.DynamicCrowdSecSet {
 				if inventory != nil && inventory.hasSet(name) {
-					if target.Dynamic != nil {
-						commands, err := dynamicSetCommands(target, family.Family, inventory.sets[name], target.Dynamic.Prefixes, now)
+					if dynamic != nil {
+						commands, err := dynamicSetCommands(target, family.Family, inventory.sets[name], dynamic.Prefixes, now)
 						if err != nil {
 							return nftBatch{}, err
 						}
@@ -539,8 +542,8 @@ func commandBatch(target *Target, inventory *nftInventory, old *Target) (nftBatc
 				}
 				definition := dynamicSetDefinition(target, family.Family, name)
 				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"set": definition}})
-				if target.Dynamic != nil {
-					commands, err := dynamicSetCommands(target, family.Family, nftObject{}, target.Dynamic.Prefixes, now)
+				if dynamic != nil {
+					commands, err := dynamicSetCommands(target, family.Family, nftObject{}, dynamic.Prefixes, now)
 					if err != nil {
 						return nftBatch{}, err
 					}

@@ -210,8 +210,8 @@ type runBackend struct {
 	applied chan struct{}
 }
 
-func (b *runBackend) Apply(ctx context.Context, previous, candidate *firewall.Target) error {
-	err := b.recordingBackend.Apply(ctx, previous, candidate)
+func (b *runBackend) Apply(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
+	err := b.recordingBackend.Apply(ctx, previous, candidate, dynamic)
 	b.applied <- struct{}{}
 	return err
 }

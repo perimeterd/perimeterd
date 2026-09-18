@@ -59,8 +59,8 @@ func TestNFTLargeTimedProjectionFitsBoundedAtomicBatch(t *testing.T) {
 		binary.BigEndian.PutUint32(bytes[12:], uint32(index)*4)
 		values[index] = policy.TimedPrefix{Prefix: netip.PrefixFrom(netip.AddrFrom16(bytes), 127), Deadline: now.Add(time.Hour)}
 	}
-	target.Dynamic = &DynamicState{Prefixes: values}
-	if err := validateNFTCapacity(target); err != nil {
+	dynamic := &DynamicState{Prefixes: values}
+	if err := validateNFTCapacity(nil, target, dynamic); err != nil {
 		t.Fatalf("100000 timed IPv6 ranges failed bounded preflight: %v", err)
 	}
 	commands, err := dynamicSetCommands(target, policy.IPv6, nftObject{}, values, now)
@@ -74,5 +74,35 @@ func TestNFTLargeTimedProjectionFitsBoundedAtomicBatch(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("logical update used %d native transactions, want one", calls)
+	}
+}
+
+func TestDynamicOperationRequiresCandidateContainer(t *testing.T) {
+	nft := &NFT{exec: func(context.Context, []string, []byte) ([]byte, error) {
+		t.Fatal("invalid dynamic operation reached nft")
+		return nil, nil
+	}}
+	iptables := &IPTables{exec: func(context.Context, string, []string, []byte) ([]byte, error) {
+		t.Fatal("invalid dynamic operation reached iptables/ipset")
+		return nil, nil
+	}}
+	backends := []Backend{nft, iptables, &Native{nft: nft, iptables: iptables}}
+	// An empty projection is still authoritative, not permission to ignore a
+	// missing candidate or attach CrowdSec authority to a static-only target.
+	for _, backend := range backends {
+		staticTarget := testTarget(t, testGenA)
+		if backend == iptables {
+			staticTarget.Table = "filter"
+			staticTarget.Priority = 0
+			staticTarget.IPTables = &IPTablesTarget{Attachments: []config.Attachment{{Chain: "INPUT", Direction: "ingress"}}}
+		}
+		for _, candidate := range []*Target{nil, staticTarget} {
+			if err := backend.Preflight(context.Background(), nil, candidate, &DynamicState{}); err == nil {
+				t.Fatal("preflight accepted authority without a dynamic candidate")
+			}
+			if err := backend.Apply(context.Background(), nil, candidate, &DynamicState{}); err == nil {
+				t.Fatal("apply accepted authority without a dynamic candidate")
+			}
+		}
 	}
 }

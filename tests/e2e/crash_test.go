@@ -92,8 +92,8 @@ type failAfterApplyBackend struct {
 	armed *bool
 }
 
-func (b *failAfterApplyBackend) Apply(ctx context.Context, previous, candidate *firewall.Target) error {
-	if err := b.Backend.Apply(ctx, previous, candidate); err != nil {
+func (b *failAfterApplyBackend) Apply(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
+	if err := b.Backend.Apply(ctx, previous, candidate, dynamic); err != nil {
 		return err
 	}
 	if *b.armed {

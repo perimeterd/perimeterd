@@ -370,7 +370,7 @@ func findPath(plan policy.FamilyPlan, direction policy.Direction) (policy.Path, 
 	return policy.Path{}, false
 }
 
-func buildIPTFamily(target *Target, family policy.Family) (iptFamilyModel, error) {
+func buildIPTFamily(target *Target, family policy.Family, dynamic *DynamicState) (iptFamilyModel, error) {
 	model := iptFamilyModel{Family: family}
 	if target == nil {
 		return model, fmt.Errorf("iptables model: nil target")
@@ -393,25 +393,25 @@ func buildIPTFamily(target *Target, family policy.Family) (iptFamilyModel, error
 	sort.SliceStable(sets, func(i, j int) bool { return sets[i].ID < sets[j].ID })
 	setNames := make(map[string]string, len(sets))
 	for _, set := range sets {
-		dynamic := set.Kind == policy.DynamicCrowdSecSet
-		if !dynamic && set.Kind != policy.StaticSet {
+		isDynamic := set.Kind == policy.DynamicCrowdSecSet
+		if !isDynamic && set.Kind != policy.StaticSet {
 			return model, fmt.Errorf("iptables model: set %q has unsupported kind %q", set.ID, set.Kind)
 		}
 		var prefixes []netip.Prefix
 		var timed []policy.TimedPrefix
-		if dynamic {
+		if isDynamic {
 			name := iptDynamicSetName(target, family)
-			if target.Dynamic != nil {
-				if err := ValidateDynamic(target.Dynamic.Prefixes); err != nil {
+			if dynamic != nil {
+				if err := ValidateDynamic(dynamic.Prefixes); err != nil {
 					return model, err
 				}
-				timed = loweredIPTTimedPrefixes(target.Dynamic.Prefixes, family)
+				timed = loweredIPTTimedPrefixes(dynamic.Prefixes, family)
 				prefixes = make([]netip.Prefix, 0, len(timed))
 				for _, value := range timed {
 					prefixes = append(prefixes, value.Prefix)
 				}
 			}
-			model.Sets = append(model.Sets, iptSet{Name: name, Family: family, Prefixes: prefixes, Dynamic: true, DynamicProjection: target.Dynamic != nil, Timed: timed})
+			model.Sets = append(model.Sets, iptSet{Name: name, Family: family, Prefixes: prefixes, Dynamic: true, DynamicProjection: dynamic != nil, Timed: timed})
 			setNames[set.ID] = name
 			continue
 		}

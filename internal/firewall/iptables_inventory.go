@@ -196,7 +196,7 @@ func (i *IPTables) inspectSets(ctx context.Context, expected map[string]iptSet, 
 	return nil
 }
 
-func targetFamilies(target *Target) (map[policy.Family]iptFamilyModel, error) {
+func targetFamilies(target *Target, dynamic *DynamicState) (map[policy.Family]iptFamilyModel, error) {
 	result := make(map[policy.Family]iptFamilyModel)
 	if target == nil {
 		return result, nil
@@ -207,8 +207,11 @@ func targetFamilies(target *Target) (map[policy.Family]iptFamilyModel, error) {
 	if err := ValidateTarget(target); err != nil {
 		return nil, err
 	}
+	if err := validateDynamicState(target, dynamic); err != nil {
+		return nil, err
+	}
 	for _, family := range target.Families {
-		model, err := buildIPTFamily(target, family.Family)
+		model, err := buildIPTFamily(target, family.Family, dynamic)
 		if err != nil {
 			return nil, err
 		}
@@ -226,8 +229,14 @@ type iptExpected struct {
 	rules   map[iptChainKey]map[string]bool
 }
 
-func expectedIPT(targets ...*Target) (*iptExpected, error) {
+// expectedIPTWithProjection lowers retained targets without a projection and
+// applies dynamic only to the final target, which is always the candidate.
+func expectedIPTWithProjection(dynamic *DynamicState, targets ...*Target) (*iptExpected, error) {
 	result := &iptExpected{chains: make(map[iptChainKey][]iptChain), sets: make(map[string]iptSet), parents: make(map[iptChainKey][]iptRule), owners: make(map[string]bool), models: make(map[*Target]map[policy.Family]iptFamilyModel), rules: make(map[iptChainKey]map[string]bool)}
+	var candidate *Target
+	if len(targets) != 0 {
+		candidate = targets[len(targets)-1]
+	}
 	for _, target := range targets {
 		if target == nil {
 			continue
@@ -236,7 +245,13 @@ func expectedIPT(targets ...*Target) (*iptExpected, error) {
 			continue
 		}
 		result.owners[target.Owner] = true
-		models, err := targetFamilies(target)
+		var projection *DynamicState
+		// A shared previous/candidate pointer is lowered only once, with the
+		// candidate's admission or activation projection.
+		if target == candidate {
+			projection = dynamic
+		}
+		models, err := targetFamilies(target, projection)
 		if err != nil {
 			return nil, err
 		}

@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 // Unprivileged callers also create a user namespace to obtain namespace root.
 // The outer process never invokes a firewall tool; all such calls happen after
 // the child verifies that its namespace differs from the caller's namespace.
-func runIsolated(t *testing.T, testName, scenario string) {
+func runIsolated(t *testing.T, testName, scenario string) []byte {
 	t.Helper()
 	parentNet, err := os.Readlink("/proc/self/ns/net")
 	if err != nil {
@@ -75,6 +75,7 @@ func runIsolated(t *testing.T, testName, scenario string) {
 		}
 		t.Fatalf("isolated %s failed: %v\n%s", scenario, err, output.String())
 	}
+	return output.Bytes()
 }
 
 func requireIsolatedChild(t *testing.T) {

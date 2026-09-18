@@ -34,7 +34,6 @@ func nativeScaleTarget(t *testing.T, kind string, static []netip.Prefix) *firewa
 	if err != nil {
 		t.Fatal(err)
 	}
-	target.Dynamic = &firewall.DynamicState{Prefixes: []policy.TimedPrefix{}}
 	return target
 }
 
@@ -129,10 +128,10 @@ func TestE2ECrowdSecNativeScale(t *testing.T) {
 	backend := firewall.NewNative(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if err := backend.Preflight(ctx, nil, target); err != nil {
+	if err := backend.Preflight(ctx, nil, target, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Apply(ctx, nil, target); err != nil {
+	if err := backend.Apply(ctx, nil, target, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, ipv6 := range []bool{false, true} {
@@ -194,17 +193,22 @@ func TestE2ECrowdSecNativeScale(t *testing.T) {
 	if err := backend.Cleanup(ctx, []*firewall.Target{target}); err != nil {
 		t.Fatal(err)
 	}
-	target.Dynamic.Prefixes = largeNativeProjection(true)
-	if err := backend.Preflight(ctx, nil, target); err != nil {
+	large := largeNativeProjection(true)
+	if err := backend.Preflight(ctx, nil, target, &firewall.DynamicState{Prefixes: large}); err != nil {
 		t.Fatalf("preflight large initial projection: %v", err)
 	}
-	if err := backend.Apply(ctx, nil, target); err != nil {
+	if err := backend.Apply(ctx, nil, target, nil); err != nil {
+		t.Fatalf("apply after admission-only projection: %v", err)
+	}
+	assertNativeProjectionCount(t, target, 0)
+	if err := backend.Apply(ctx, nil, target, &firewall.DynamicState{Prefixes: large}); err != nil {
 		t.Fatalf("install large initial projection: %v", err)
 	}
-	assertNativeProjectionCount(t, target, len(target.Dynamic.Prefixes))
-	if err := backend.Cleanup(ctx, []*firewall.Target{target}); err != nil {
-		t.Fatal(err)
+	assertNativeProjectionCount(t, target, len(large))
+	if err := backend.Apply(ctx, target, target, &firewall.DynamicState{}); err != nil {
+		t.Fatalf("clear shared leases with explicit empty activation: %v", err)
 	}
+	assertNativeProjectionCount(t, target, 0)
 }
 
 func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
@@ -233,10 +237,10 @@ func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
 	backend := firewall.NewNative(nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	if err := backend.Preflight(ctx, nil, target); err != nil {
+	if err := backend.Preflight(ctx, nil, target, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.Apply(ctx, nil, target); err != nil {
+	if err := backend.Apply(ctx, nil, target, nil); err != nil {
 		t.Fatal(err)
 	}
 	retained := []policy.TimedPrefix{{Prefix: netip.MustParsePrefix(fixtureIPv4Peer + "/32"), Deadline: time.Now().Add(time.Hour)}}
@@ -290,13 +294,13 @@ func TestE2ECrowdSecIPSetInterruptedWrites(t *testing.T) {
 		t.Run("partial-static-"+recovery, func(t *testing.T) {
 			target := nativeScaleTarget(t, "iptables", []netip.Prefix{netip.MustParsePrefix(fixtureIPv4Peer + "/32"), netip.MustParsePrefix("203.0.113.3/32")})
 			writeFailureMode(t, tools, "set-partial")
-			if err := backend.Apply(ctx, nil, target); err == nil {
+			if err := backend.Apply(ctx, nil, target, nil); err == nil {
 				t.Fatal("partial restore was not interrupted")
 			}
 			waitForFailureMarker(t, tools, ".set-partial")
 			writeFailureMode(t, tools, "")
 			if recovery == "retry" {
-				if err := backend.Apply(ctx, nil, target); err != nil {
+				if err := backend.Apply(ctx, nil, target, nil); err != nil {
 					t.Fatalf("repair partial static set: %v", err)
 				}
 				probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18792", "reject", "tcp")
@@ -312,7 +316,7 @@ func TestE2ECrowdSecIPSetInterruptedWrites(t *testing.T) {
 	for _, cut := range []string{"set-before-swap", "set-after-swap"} {
 		t.Run(cut, func(t *testing.T) {
 			target := nativeScaleTarget(t, "iptables", nil)
-			if err := backend.Apply(ctx, nil, target); err != nil {
+			if err := backend.Apply(ctx, nil, target, nil); err != nil {
 				t.Fatal(err)
 			}
 			values := largeNativeProjection(false)
@@ -355,7 +359,7 @@ func TestE2ECrowdSecIPSetInterruptedWrites(t *testing.T) {
 				t.Fatal(err)
 			}
 			command(t, 10*time.Second, "ipset", "create", spare, "hash:net", "family", "inet", "timeout", "86400")
-			if err := backend.Preflight(ctx, nil, target); err == nil {
+			if err := backend.Preflight(ctx, nil, target, nil); err == nil {
 				t.Fatal("initial preflight adopted a foreign resize-spare collision")
 			}
 			command(t, 10*time.Second, "ipset", "destroy", spare)
@@ -401,29 +405,27 @@ func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 		t.Fatalf("unexpected source projection: %d prefixes", len(values))
 	}
 	target := nativeScaleTarget(t, "iptables", nil)
-	target.Dynamic.Prefixes = values
-	if err := backend.Preflight(ctx, nil, target); err != nil {
+	projection := &firewall.DynamicState{Prefixes: values}
+	if err := backend.Preflight(ctx, nil, target, projection); err != nil {
 		t.Fatalf("admit chunked initial snapshot: %v", err)
 	}
-	if err := backend.Apply(ctx, nil, target); err != nil {
+	if err := backend.Apply(ctx, nil, target, nil); err != nil {
+		t.Fatalf("admission projection leaked into activation: %v", err)
+	}
+	assertNativeProjectionCount(t, target, 0)
+	if err := backend.Apply(ctx, nil, target, projection); err != nil {
 		t.Fatalf("install chunked initial snapshot: %v", err)
 	}
 	assertNativeProjectionCount(t, target, len(values))
-	if err := backend.Cleanup(ctx, []*firewall.Target{target}); err != nil {
-		t.Fatal(err)
+	if err := backend.Apply(ctx, target, target, &firewall.DynamicState{}); err != nil {
+		t.Fatalf("explicit empty activation did not clear shared leases: %v", err)
 	}
-
-	target.Dynamic.Prefixes = nil
-	if err := backend.Apply(ctx, nil, target); err != nil {
-		t.Fatal(err)
-	}
+	assertNativeProjectionCount(t, target, 0)
 	if err := backend.UpdateDynamic(ctx, target, values); err != nil {
 		t.Fatalf("grow empty live set: %v", err)
 	}
 	assertNativeProjectionCount(t, target, len(values))
-	shadow := *target
-	shadow.Dynamic = &firewall.DynamicState{Prefixes: values}
-	if err := backend.Preflight(ctx, target, &shadow); err != nil {
+	if err := backend.Preflight(ctx, target, target, projection); err != nil {
 		t.Fatalf("admit unchanged authority: %v", err)
 	}
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18796", "reject", "tcp")

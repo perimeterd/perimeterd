@@ -1,15 +1,13 @@
 package state
 
 import (
-	"net/netip"
 	"testing"
-	"time"
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
-func TestRestartRetainsDynamicContainerButNotDecisionAuthority(t *testing.T) {
+func TestRestartRetainsDynamicContainerAndCredentialLocation(t *testing.T) {
 	store, dir := openTestStore(t, nil)
 	cfg := storeTestConfig(t)
 	cfg.CrowdSec.Enabled = true
@@ -24,9 +22,6 @@ func TestRestartRetainsDynamicContainerButNotDecisionAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	target.Dynamic = &firewall.DynamicState{Prefixes: []policy.TimedPrefix{{
-		Prefix: netip.MustParsePrefix("8.20.0.2/32"), Deadline: time.Now().Add(48 * time.Hour),
-	}}}
 	revision := &Revision{Version: 1, ID: id, Epoch: 1, ConfigPath: "/missing/configuration", Config: cfg, Target: target}
 	if err := store.Prepare(nil, revision); err != nil {
 		t.Fatal(err)
@@ -47,9 +42,6 @@ func TestRestartRetainsDynamicContainerButNotDecisionAuthority(t *testing.T) {
 	}
 	if view.Active.Target.DynamicGeneration != target.DynamicGeneration || view.Active.Target.DynamicGeneration == "" {
 		t.Fatal("restart lost ownership of the retained kernel lease containers")
-	}
-	if view.Active.Target.Dynamic != nil {
-		t.Fatal("restart recovered cached CrowdSec decisions instead of requiring authoritative synchronization")
 	}
 	if view.Active.Config.CrowdSec.APIKeyFile != cfg.CrowdSec.APIKeyFile {
 		t.Fatal("restart lost credential location needed for authoritative synchronization")

@@ -1124,10 +1124,10 @@ func TestE2EIPTablesOptionOperands(t *testing.T) {
 			before[inspect] = command(t, 10*time.Second, inspect, "-S")
 		}
 		active := activeIPTablesRevision()
-		if err := backend.Preflight(context.Background(), target, target); err == nil {
+		if err := backend.Preflight(context.Background(), target, target, nil); err == nil {
 			t.Fatal("preflight accepted a hidden foreign jump into an owned chain")
 		}
-		if err := backend.Apply(context.Background(), target, target); err == nil {
+		if err := backend.Apply(context.Background(), target, target, nil); err == nil {
 			t.Fatal("apply accepted a hidden foreign jump into an owned chain")
 		}
 		if err := runCleanupExpectFailure(t); err == nil {
@@ -1204,10 +1204,10 @@ func TestE2EIPTablesSetReferences(t *testing.T) {
 			}
 			saved := command(t, 10*time.Second, "ipset", "save", ownedSet)
 			active := activeIPTablesRevision()
-			if err := backend.Preflight(context.Background(), target, target); err == nil {
+			if err := backend.Preflight(context.Background(), target, target, nil); err == nil {
 				t.Fatal("preflight accepted an unaccounted native set reference")
 			}
-			if err := backend.Apply(context.Background(), target, target); err == nil {
+			if err := backend.Apply(context.Background(), target, target, nil); err == nil {
 				t.Fatal("apply accepted an unaccounted native set reference")
 			}
 			if err := runCleanupExpectFailure(t); err == nil {

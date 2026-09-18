@@ -287,7 +287,7 @@ func TestIPTablesPreflightRejectsExactCandidateSetCollision(t *testing.T) {
 	target := testTarget(t, testGenA)
 	target.Table, target.Priority = "filter", 0
 	target.IPTables = &IPTablesTarget{Attachments: []config.Attachment{{Chain: "INPUT", Direction: "ingress"}}}
-	expected, err := expectedIPT(target)
+	expected, err := expectedIPTWithProjection(nil, target)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,11 +323,11 @@ func TestIPTablesPreflightRejectsExactCandidateSetCollision(t *testing.T) {
 		}
 		return nil, errors.New("unexpected native query")
 	}}
-	if err := backend.Preflight(context.Background(), nil, target); err != nil {
+	if err := backend.Preflight(context.Background(), nil, target, nil); err != nil {
 		t.Fatal(err)
 	}
 	present = true
-	if err := backend.Preflight(context.Background(), nil, target); err == nil {
+	if err := backend.Preflight(context.Background(), nil, target, nil); err == nil {
 		t.Fatal("candidate adopted an existing unrecorded set with matching contents")
 	}
 }

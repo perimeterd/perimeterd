@@ -28,11 +28,11 @@ type recordingBackend struct {
 	retire              int
 }
 
-func (b *recordingBackend) Preflight(context.Context, *firewall.Target, *firewall.Target) error {
+func (b *recordingBackend) Preflight(context.Context, *firewall.Target, *firewall.Target, *firewall.DynamicState) error {
 	return nil
 }
 
-func (b *recordingBackend) Apply(_ context.Context, previous, candidate *firewall.Target) error {
+func (b *recordingBackend) Apply(_ context.Context, previous, candidate *firewall.Target, _ *firewall.DynamicState) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.applies++

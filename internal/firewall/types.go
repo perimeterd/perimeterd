@@ -32,14 +32,24 @@ type Target struct {
 	Counters          []CounterSpec       `json:"counters"`
 	IPTables          *IPTablesTarget     `json:"iptables,omitempty"`
 	DynamicGeneration string              `json:"dynamic_generation,omitempty"`
-	Dynamic           *DynamicState       `json:"-"`
 }
 
-// DynamicState supplies an in-memory projection for activation. Its absence
-// preserves existing kernel leases during static recovery or refresh. Decisions
-// are never serialized as durable authority.
+// DynamicState is an explicitly ephemeral projection supplied for admission or
+// activation. Its absence preserves existing kernel leases during static
+// recovery or refresh; a nonnil empty projection clears them. Decisions are
+// never serialized as durable authority.
 type DynamicState struct {
 	Prefixes []policy.TimedPrefix
+}
+
+func validateDynamicState(candidate *Target, value *DynamicState) error {
+	if value == nil {
+		return nil
+	}
+	if candidate == nil || candidate.DynamicGeneration == "" {
+		return fmt.Errorf("firewall dynamic projection requires a dynamic candidate")
+	}
+	return ValidateDynamic(value.Prefixes)
 }
 
 // IPTablesTarget records the owned integration boundary. Its presence selects
@@ -65,9 +75,10 @@ type FamilyProgress func(policy.Family, string) error
 
 // Backend applies and retires complete desired firewall targets. Every pair is
 // (previous, candidate); a nil candidate is the canonical unhook operation.
+// DynamicState is admission-only for Preflight and activation-only for Apply.
 type Backend interface {
-	Preflight(context.Context, *Target, *Target) error
-	Apply(context.Context, *Target, *Target) error
+	Preflight(context.Context, *Target, *Target, *DynamicState) error
+	Apply(context.Context, *Target, *Target, *DynamicState) error
 	Retire(context.Context, *Target, *Target) error
 	Cleanup(context.Context, []*Target) error
 	UpdateDynamic(context.Context, *Target, []policy.TimedPrefix) error
@@ -198,14 +209,6 @@ func ValidateTarget(value *Target) error {
 	}
 	if value.DynamicGeneration != "" && !validTargetID(value.DynamicGeneration) {
 		return fmt.Errorf("firewall target: invalid dynamic generation")
-	}
-	if value.Dynamic != nil {
-		if value.DynamicGeneration == "" {
-			return fmt.Errorf("firewall target: dynamic projection requires a dynamic generation")
-		}
-		if err := ValidateDynamic(value.Dynamic.Prefixes); err != nil {
-			return err
-		}
 	}
 	seenFamilies := make(map[policy.Family]struct{}, len(value.Families))
 	expectedCounters := make(map[string]CounterSpec)
