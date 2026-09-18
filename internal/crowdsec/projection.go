@@ -85,12 +85,12 @@ func (s *Store) projection(now time.Time) []policy.TimedPrefix {
 	}
 
 	result := make([]policy.TimedPrefix, 0, len(decisions))
-	result = append(result, projectFamily(decisions, true, now)...)
-	result = append(result, projectFamily(decisions, false, now)...)
+	result = projectFamily(result, decisions, true, now)
+	result = projectFamily(result, decisions, false, now)
 	return result
 }
 
-func projectFamily(decisions []Decision, ipv4 bool, now time.Time) []policy.TimedPrefix {
+func projectFamily(result []policy.TimedPrefix, decisions []Decision, ipv4 bool, now time.Time) []policy.TimedPrefix {
 	events := make([]projectionEvent, 0, len(decisions)*2)
 	for index, decision := range decisions {
 		prefix := decision.Prefix
@@ -110,7 +110,7 @@ func projectFamily(decisions []Decision, ipv4 bool, now time.Time) []policy.Time
 		)
 	}
 	if len(events) == 0 {
-		return nil
+		return result
 	}
 	sort.Slice(events, func(i, j int) bool {
 		return compareBoundary(events[i].at, events[j].at) < 0
@@ -153,9 +153,8 @@ func projectFamily(decisions []Decision, ipv4 bool, now time.Time) []policy.Time
 		index = nextIndex
 	}
 
-	var result []policy.TimedPrefix
 	for _, value := range ranges {
-		result = append(result, decomposeRange(value.start, value.end, value.deadline, ipv4)...)
+		result = decomposeRange(result, value.start, value.end, value.deadline, ipv4)
 	}
 	return result
 }
@@ -257,12 +256,11 @@ func aligned(start uint128, sizeBits, width int) bool {
 	return start.lo == 0 && start.hi&((uint64(1)<<uint(sizeBits-64))-1) == 0
 }
 
-func decomposeRange(start uint128, end projectionBoundary, deadline time.Time, ipv4 bool) []policy.TimedPrefix {
+func decomposeRange(result []policy.TimedPrefix, start uint128, end projectionBoundary, deadline time.Time, ipv4 bool) []policy.TimedPrefix {
 	width := 128
 	if ipv4 {
 		width = 32
 	}
-	var result []policy.TimedPrefix
 	for {
 		if end.top {
 			if start.hi == 0 && start.lo == 0 {

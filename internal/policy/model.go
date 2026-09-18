@@ -3,6 +3,7 @@ package policy
 
 import (
 	"net/netip"
+	"slices"
 
 	"github.com/perimeterd/perimeterd/internal/prefix"
 )
@@ -188,7 +189,7 @@ func (s State) Families() []FamilyPlan {
 		}
 		for j, set := range family.Sets {
 			families[i].Sets[j] = set
-			families[i].Sets[j].Prefixes = clonePrefixes(set.Prefixes)
+			families[i].Sets[j].Prefixes = slices.Clone(set.Prefixes)
 		}
 		if family.Paths != nil {
 			families[i].Paths = make([]Path, len(family.Paths))
@@ -200,26 +201,12 @@ func (s State) Families() []FamilyPlan {
 			}
 			for k, rule := range path.Rules {
 				families[i].Paths[j].Rules[k] = rule
-				families[i].Paths[j].Rules[k].Match.Traffic.TCP = clonePortRanges(rule.Match.Traffic.TCP)
-				families[i].Paths[j].Rules[k].Match.Traffic.UDP = clonePortRanges(rule.Match.Traffic.UDP)
+				families[i].Paths[j].Rules[k].Match.Traffic.TCP = slices.Clone(rule.Match.Traffic.TCP)
+				families[i].Paths[j].Rules[k].Match.Traffic.UDP = slices.Clone(rule.Match.Traffic.UDP)
 			}
 		}
 	}
 	return families
-}
-
-func clonePrefixes(values []netip.Prefix) []netip.Prefix {
-	if values == nil {
-		return nil
-	}
-	return append(make([]netip.Prefix, 0, len(values)), values...)
-}
-
-func clonePortRanges(values []PortRange) []PortRange {
-	if values == nil {
-		return nil
-	}
-	return append(make([]PortRange, 0, len(values)), values...)
 }
 
 // GeoEligible returns the fixed, release-pinned geo-eligible prefix set for a

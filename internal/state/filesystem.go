@@ -176,7 +176,7 @@ func atomicPublish(path string, data []byte, record string, checkpoint func(stri
 		_ = temp.Close()
 		return err
 	}
-	if err := writeFull(temp, data); err != nil {
+	if _, err := temp.Write(data); err != nil {
 		_ = temp.Close()
 		return err
 	}
@@ -205,20 +205,6 @@ func atomicPublish(path string, data []byte, record string, checkpoint func(stri
 		return err
 	}
 	return checkpointCall(checkpoint, record+":after-dir-sync")
-}
-
-func writeFull(file *os.File, data []byte) error {
-	for len(data) > 0 {
-		n, err := file.Write(data)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }
 
 func syncRegular(path string) (err error) {

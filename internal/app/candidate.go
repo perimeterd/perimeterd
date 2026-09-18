@@ -2,7 +2,7 @@
 package app
 
 import (
-	"net/netip"
+	"slices"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
@@ -39,8 +39,8 @@ func NewCandidate(epoch uint64, path string, cfg config.Config, snapshot source.
 }
 
 func cloneConfig(value config.Config) config.Config {
-	value.Global.Allowlist = clonePrefixes(value.Global.Allowlist)
-	value.Global.Blocklist = clonePrefixes(value.Global.Blocklist)
+	value.Global.Allowlist = slices.Clone(value.Global.Allowlist)
+	value.Global.Blocklist = slices.Clone(value.Global.Blocklist)
 	value.Groups = cloneGroups(value.Groups)
 	value.Policies = clonePolicies(value.Policies)
 	value.Firewall.IPTables.Attachments = cloneAttachments(value.Firewall.IPTables.Attachments)
@@ -53,17 +53,8 @@ func cloneGroups(values map[string][]string) map[string][]string {
 	}
 	result := make(map[string][]string, len(values))
 	for key, entries := range values {
-		result[key] = cloneStrings(entries)
+		result[key] = slices.Clone(entries)
 	}
-	return result
-}
-
-func cloneStrings(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	result := make([]string, len(values))
-	copy(result, values)
 	return result
 }
 
@@ -74,8 +65,8 @@ func clonePolicies(values []config.Policy) []config.Policy {
 	result := make([]config.Policy, len(values))
 	for index, value := range values {
 		result[index] = value
-		result[index].Traffic.TCP = clonePortRanges(value.Traffic.TCP)
-		result[index].Traffic.UDP = clonePortRanges(value.Traffic.UDP)
+		result[index].Traffic.TCP = slices.Clone(value.Traffic.TCP)
+		result[index].Traffic.UDP = slices.Clone(value.Traffic.UDP)
 		result[index].Include = cloneSelector(value.Include)
 		result[index].Exclude = cloneSelector(value.Exclude)
 	}
@@ -83,11 +74,11 @@ func clonePolicies(values []config.Policy) []config.Policy {
 }
 
 func cloneSelector(value config.Selector) config.Selector {
-	value.Countries = cloneStrings(value.Countries)
-	value.RIRs = cloneStrings(value.RIRs)
-	value.Groups = cloneStrings(value.Groups)
-	value.ASNs = cloneStrings(value.ASNs)
-	value.ExpandedCountries = cloneStrings(value.ExpandedCountries)
+	value.Countries = slices.Clone(value.Countries)
+	value.RIRs = slices.Clone(value.RIRs)
+	value.Groups = slices.Clone(value.Groups)
+	value.ASNs = slices.Clone(value.ASNs)
+	value.ExpandedCountries = slices.Clone(value.ExpandedCountries)
 	return value
 }
 
@@ -98,26 +89,8 @@ func cloneAttachments(values []config.Attachment) []config.Attachment {
 	result := make([]config.Attachment, len(values))
 	for index, value := range values {
 		result[index] = value
-		result[index].InputInterfaces = cloneStrings(value.InputInterfaces)
-		result[index].OutputInterfaces = cloneStrings(value.OutputInterfaces)
+		result[index].InputInterfaces = slices.Clone(value.InputInterfaces)
+		result[index].OutputInterfaces = slices.Clone(value.OutputInterfaces)
 	}
-	return result
-}
-
-func clonePrefixes(values []netip.Prefix) []netip.Prefix {
-	if values == nil {
-		return nil
-	}
-	result := make([]netip.Prefix, len(values))
-	copy(result, values)
-	return result
-}
-
-func clonePortRanges(values []config.PortRange) []config.PortRange {
-	if values == nil {
-		return nil
-	}
-	result := make([]config.PortRange, len(values))
-	copy(result, values)
 	return result
 }

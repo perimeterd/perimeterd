@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -344,7 +345,7 @@ func (c *Cache) loadObject(entry manifestEntry) (Record, error) {
 	if err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
-	if object.Selector != entry.Selector || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !equalParameters(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt {
+	if object.Selector != entry.Selector || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt {
 		return Record{}, errors.New("manifest metadata does not match selector object")
 	}
 	return record, nil
@@ -417,7 +418,7 @@ func canonicalRecord(record Record) (Record, error) {
 		return Record{}, errors.New("unsupported selector endpoint or API version")
 	}
 	parameters := cloneParameters(record.Parameters)
-	if !equalParameters(parameters, expectedParams) {
+	if !maps.Equal(parameters, expectedParams) {
 		return Record{}, errors.New("selector request parameters do not match its identity")
 	}
 	queryStart, err := canonicalTimestamp(record.QueryStart, "query_start")
@@ -588,27 +589,7 @@ func cloneParameters(values map[string]string) map[string]string {
 	if values == nil {
 		return map[string]string{}
 	}
-	return mapsClone(values)
-}
-
-func mapsClone(values map[string]string) map[string]string {
-	out := make(map[string]string, len(values))
-	for key, value := range values {
-		out[key] = value
-	}
-	return out
-}
-
-func equalParameters(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for key, value := range a {
-		if b[key] != value {
-			return false
-		}
-	}
-	return true
+	return maps.Clone(values)
 }
 
 func cloneRecord(record Record) Record {
@@ -686,7 +667,7 @@ func (c *Cache) installImmutable(path string, data []byte, kind string) error {
 	}
 	tempPath := temp.Name()
 	defer func() { _ = os.Remove(tempPath) }()
-	if err := writeCacheFull(temp, data); err != nil {
+	if _, err := temp.Write(data); err != nil {
 		_ = temp.Close()
 		return err
 	}
@@ -727,20 +708,6 @@ func (c *Cache) installImmutable(path string, data []byte, kind string) error {
 		return err
 	}
 	return c.checkpointCall(kind + ":after-dir-sync")
-}
-
-func writeCacheFull(file *os.File, data []byte) error {
-	for len(data) > 0 {
-		n, err := file.Write(data)
-		if err != nil {
-			return err
-		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }
 
 func (c *Cache) checkpointCall(name string) error {

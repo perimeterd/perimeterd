@@ -23,9 +23,6 @@ type recordingBackend struct {
 	persistentApplyErr  bool
 	mutateBeforeFailure bool
 	retireErr           error
-	cleanupErr          error
-	applies             int
-	retire              int
 }
 
 func (b *recordingBackend) Preflight(context.Context, *firewall.Target, *firewall.Target, *firewall.DynamicState) error {
@@ -35,7 +32,6 @@ func (b *recordingBackend) Preflight(context.Context, *firewall.Target, *firewal
 func (b *recordingBackend) Apply(_ context.Context, previous, candidate *firewall.Target, _ *firewall.DynamicState) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.applies++
 	if b.applyFailures > 0 {
 		b.applyFailures--
 		if b.mutateBeforeFailure {
@@ -71,12 +67,11 @@ func (b *recordingBackend) UpdateDynamic(context.Context, *firewall.Target, []po
 func (b *recordingBackend) Retire(context.Context, *firewall.Target, *firewall.Target) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.retire++
 	return b.retireErr
 }
 
 func (b *recordingBackend) Cleanup(context.Context, []*firewall.Target) error {
-	return b.cleanupErr
+	return nil
 }
 
 func (b *recordingBackend) selection() string {

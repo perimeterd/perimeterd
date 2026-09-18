@@ -21,7 +21,6 @@ import (
 )
 
 type crowdWriteEvent struct {
-	generation string
 	projection []policy.TimedPrefix
 	err        error
 }
@@ -64,7 +63,6 @@ func (b *crowdBackend) UpdateDynamic(_ context.Context, target *firewall.Target,
 		err = errors.New("injected partial dynamic apply")
 	}
 	event := crowdWriteEvent{
-		generation: target.DynamicGeneration,
 		projection: append([]policy.TimedPrefix(nil), projection...),
 		err:        err,
 	}

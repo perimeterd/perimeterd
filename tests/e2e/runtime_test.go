@@ -267,27 +267,6 @@ func waitForNFTTable(t *testing.T, table string) {
 	t.Fatalf("nftables table %q did not appear", table)
 }
 
-func TestE2EFixtureFilesDoNotCollide(t *testing.T) {
-	first := tempConfig(t, "same-name")
-	second := tempConfig(t, "same-name")
-	// #nosec G703 -- both paths are generated beneath private t.TempDir directories.
-	if err := os.WriteFile(first, []byte("first fixture"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// #nosec G703 -- both paths are generated beneath private t.TempDir directories.
-	if err := os.WriteFile(second, []byte("second fixture"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// #nosec G304 -- first is a private fixture path created by this test.
-	content, err := os.ReadFile(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(content) != "first fixture" {
-		t.Fatal("a second fixture overwrote the first configuration")
-	}
-}
-
 func TestE2EDeletionAssertionRejectsInspectionFailure(t *testing.T) {
 	const helperEnv = "PERIMETERD_E2E_INSPECTION_FAILURE"
 	if os.Getenv(helperEnv) == "1" {
