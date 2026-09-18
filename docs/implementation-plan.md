@@ -4,8 +4,9 @@ This is the authoritative status record for the first release. Completed
 milestones summarize delivered behavior; pending milestones retain their
 acceptance criteria. Detailed contracts live in the linked reference documents.
 
-Both firewall backends, CrowdSec, coexistence, operational behavior, and release
-gates remain part of the first-release scope.
+The first release includes both native backends, CrowdSec, Docker coexistence,
+operational integration, and release gates. Implemented does not mean
+production-ready; the remaining gates below still apply.
 
 ## Status at a glance
 
@@ -21,137 +22,85 @@ gates remain part of the first-release scope.
 
 ## 1. Foundation and offline configuration validation
 
-**Status:** implemented: the offline validator, version command, example
-configuration, and foundation build/verification tooling are available.
+**Status:** implemented.
 
-Delivered without requiring root access or network access for validation:
+- Go module, pinned tooling, and build metadata.
+- `version` and strict offline `validate` commands with defaults and normalization.
+- Annotated configuration and local/CI formatting, lint, unit/race, and
+  dependency checks.
 
-- Go module and pinned development tooling.
-- `cmd/perimeterd` with command dispatch separate from configuration logic.
-- `perimeterd version` with build metadata.
-- `perimeterd validate --config …`: strict YAML parsing, defaults,
-  normalization, and local semantic validation.
-- The full-schema annotated example configuration.
-- Local and CI build, formatting, lint, unit/race, and dependency checks.
-
-**Acceptance:** the binary builds; the example validates; invalid configurations
-fail with actionable errors; validation neither contacts sources nor touches the
-firewall.
-
-Future packages and commands should follow the same rule: create them only with
-real behavior. [Planned additions](development.md#planned-additions) are not
-empty interfaces, placeholder implementations, or successful no-op commands.
+Validation checks syntax and local semantics without reading credentials,
+contacting sources, or mutating the firewall. See
+[configuration](configuration.md) and [local commands](development.md#local-commands).
 
 ## 2. Pure policy compiler
 
-**Status:** implemented: immutable prefix algebra and selector snapshots feed
-the backend-neutral compiler, including the pinned geo classifier, ordered
-rules, accounting roles, and boundary/precedence regression coverage.
+**Status:** implemented.
 
-The backend-neutral compiler consumes normalized selectors and immutable prefix
-snapshots. Implemented behavior includes:
+The compiler consumes normalized configuration and immutable selector snapshots
+without network, filesystem, or kernel I/O. It provides prefix algebra,
+allow/block precedence, the pinned geo classifier, ingress/egress traffic scopes,
+policy priority, IPv4/IPv6 family boundaries, disabled policies, and accounting
+roles.
 
-- Allow/block precedence and built-in local-range safety.
-- Ingress/egress traffic scopes, ports, and policy priority.
-- IPv4/IPv6 boundaries and family-empty behavior.
-- Disabled policies and the canonical empty desired state.
-
-Source fetching remains outside the compiler; deterministic snapshots provide
-compiler inputs in tests.
-
-**Acceptance:** concrete inputs produce the documented policy semantics, with
-focused tests for ambiguous boundaries and precedence. Use the existing
-[verification matrix](development.md#verification-matrix), not a second test-plan
-document.
+[Configuration](configuration.md#evaluation-semantics) owns the policy contract;
+the [verification matrix](development.md#verification-matrix) owns its regression
+requirements.
 
 ## 3. First safe kernel-backed vertical slice
 
-**Status:** implemented. This milestone first delivered direct global IP/CIDR
-enforcement on nftables with geo modes and CrowdSec disabled. `run` and `cleanup`
-share lifetime ownership; immutable revisions and prepared journals precede
-kernel mutation, and durable active-state publication controls recovery.
+**Status:** implemented.
 
-Verified with `make verify`, `make test-race`, and `make test-e2e`. The isolated
-native gate covers IPv4/IPv6 TCP/UDP enforcement, allow precedence, parent-path
-returns, established flows, rejected reloads, family removal, stable counters,
-priority changes, table migration, crash boundaries, recovery fencing, retained
-rules on shutdown, and owned-only cleanup. The development host's firewall is
-not used for these scenarios.
+nftables established the lifecycle and persistence boundaries before source-backed
+policy or the second backend was added:
 
-nftables was implemented first to establish persistence and recovery before
-adding source-backed policy or the second backend. The slice delivered:
+- Exclusive lifecycle ownership and one serialized writer.
+- Immutable revisions, prepared journals, durable active-state publication,
+  startup recovery, and staged reload.
+- Retained rules on shutdown and explicit owned-only cleanup.
+- Isolated IPv4/IPv6 packet-path and crash-recovery tests.
 
-- Lifecycle ownership and the single serialized writer.
-- Durable transaction preparation and active-state publication.
-- nftables reconciliation and ownership tracking.
-- Startup recovery, reload, shutdown, and explicit cleanup.
-- A disposable network-namespace harness with IPv4/IPv6 traffic probes.
-
-**Acceptance:** traffic follows policy; rejected reloads preserve active
-enforcement; restart recovers interrupted work; shutdown leaves rules in place;
-cleanup removes only owned artifacts.
-
-Kernel state versus durable state remains the high-risk boundary. Continue to
-verify interrupted commits and failed recovery in isolated namespaces or a
-disposable VM, never against the development host's firewall.
+The [architecture](architecture.md#durable-apply-and-crash-recovery) defines the
+commit boundary. The [native gate](development.md#privileged-end-to-end-suite)
+verifies enforcement, recovery, and ownership without using the development
+host's firewall.
 
 ## 4. Complete static source-backed policy
 
-**Status:** implemented for nftables and iptables/ipset. The RIPEstat adapter
-resolves countries and ASNs; RIR and built-in/custom groups expand into country
-selectors. Immutable content-addressed objects and manifests are bound to
-durable revisions, and refresh/reload reuse the serialized writer and recovery.
+**Status:** implemented for nftables and iptables/ipset.
 
-Local HTTP fixtures cover official wire compatibility, malformed/partial
-responses, visibility intervals, request limits, and whole-snapshot fallback.
-Commit tests preserve cache/firewall selection across failed and successful
-publication. Isolated native packet tests cover all selector kinds, exclusions,
-priority, family-empty policies, and retained enforcement after source failure.
+RIPEstat country and ASN resolution, country-based RIR/group expansion,
+content-addressed cache objects and manifests, and refresh/reload feed the same
+compiler and writer. Snapshot selection follows the durable revision: incomplete
+responses cannot replace committed policy, and failed refreshes retain the
+selected snapshot.
 
-The same resolver and cache feed both backends through the pure compiler.
-
-**Acceptance:** country/RIR/group/ASN selectors work end to end; incomplete or
-unacceptable source data cannot replace the committed policy; cache publication
-remains consistent with revision commit.
-
-Use local fixture servers to make failure scenarios reproducible without depending
-on the public service.
+[Data sources](data-sources.md) owns provider validation and fallback. Local HTTP
+fixtures, durable-publication tests, and isolated native packet tests exercise
+the [source requirements](development.md#sources-and-compatibility).
 
 ## 5. CrowdSec, second backend, and coexistence
 
-These remain separate milestones under one writer and revision lifecycle:
-
-| Milestone | Status | Required proof |
+| Milestone | Status | Delivered behavior or remaining acceptance |
 | --- | --- | --- |
-| CrowdSec | Implemented | Authoritative startup synchronization, decision updates/removals, expiry and renewable kernel leases, reload handover, and pinned real-LAPI compatibility |
-| iptables/ipset | Implemented | Equivalent packet-policy behavior, family-by-family commit and compensation, failure recovery, and backend migration |
-| Coexistence | Custom attachments implemented; Docker milestone pending | Documented Docker/custom-chain attachments and preservation of foreign firewall state |
+| CrowdSec | Implemented | Authoritative startup synchronization, decision updates/removals, expiry, renewable leases, reload handover, and pinned real-LAPI compatibility |
+| iptables/ipset | Implemented | Packet-policy parity, family-by-family commit and compensation, ownership fencing, recovery, and backend migration |
+| Coexistence | Custom attachments implemented; Docker pending | Verify Docker-specific attachment ordering and preservation of foreign firewall state |
 
-**iptables/ipset status:** implemented under the existing serialized writer and
-durable revision lifecycle. Native namespace tests exercise both legacy and
-nf_tables tool families: direct and source-backed IPv4/IPv6 policy, `/0`
-lowering, interface-constrained custom attachments, original-destination ports,
-stable processed accounting, and owned-only cleanup. The failure matrix covers
-second-family failure, successful and failed compensation, unhealthy enforcement,
-crashes between family switches and after commit, and bidirectional migration
-with precommit and retirement failures.
+**iptables/ipset:** both legacy and nf_tables tool families support direct and
+source-backed IPv4/IPv6 policy, `/0` lowering, interface-constrained custom
+attachments, original-destination ports, stable native accounting, and owned
+cleanup. Isolated tests cover second-family failures, compensation, crashes, and
+bidirectional backend migration.
 
-**CrowdSec status:** implemented under the same serialized writer. The adapter
-validates bounded response envelopes before SDK decoding, preserves decision
-identity and absolute expiry, and projects overlapping bans into disjoint timed
-prefixes. Both backends use finite, renewable leases capped at 24 hours.
-Reloads stage a separate authority epoch and native references; reconnects
-replace authority only after successful reconciliation. Decisions and credentials
-are never persisted as recovery authority.
-
-Regression coverage exercises stale epochs, failed dynamic writes, same-path
-credential rotation, uncertain durable commit, and renewal without a desired-state
-change. Isolated native tests cover IPv4/IPv6 bans, removals, overlap, `/0`,
-allow precedence, ingress-only behavior, retained leases, expiry without the
-daemon, reload/restart, and owned cleanup on nftables and both iptables variants.
-`make test-crowdsec` and its CI job run the digest-pinned v1.8.1 LAPI streaming
-compatibility gate, including incremental updates without replaying the active
-snapshot.
+**CrowdSec:** bounded wire validation preserves decision identity and absolute
+expiry. The writer admits current authority separately from durable targets;
+renewal does not require a desired-state change, and decisions and credential
+contents are never persisted as recovery authority. Both backends use finite
+leases capped at 24 hours. Tests cover staged reload/reconnect, failed writes,
+credential rotation, uncertain commit, packet enforcement, expiry without the
+daemon, and cleanup. `make test-crowdsec` runs the digest-pinned v1.8.1 stream
+compatibility gate.
 
 The Docker-specific coexistence milestone remains pending. The known LAPI
 query-error behavior is an accepted temporary upstream risk tracked in
@@ -161,29 +110,29 @@ It is not fault-tested or worked around with full-list polling; see
 
 ## 6. Operational and release gates
 
-**Status:** partially implemented. Source builds provide stdout logging,
-enforcement health, committed-prefix timestamp and CrowdSec connection gauges,
-native packet/byte accounting, and bounded systemd readiness notifications. The complete Prometheus
-exporter, installed systemd/tmpfiles payloads, RPM/DEB lifecycle, remaining
-architecture verification, and signed releases are still required.
+**Status:** partially implemented.
 
-Package and release workflows must run real checks, not advertise unimplemented
-gates.
+Source builds provide stdout logging, three Prometheus gauges, native packet/byte
+accounting, and bounded systemd readiness notifications. Remaining work:
 
-**Acceptance:** the applicable service, packaging, observability, CI, and release
-contracts in [development](development.md) and [operations](operations.md) are
-implemented and verified before release.
+- Full metrics collection and export.
+- Installed systemd/tmpfiles payloads and verified service lifecycle.
+- RPM/DEB package lifecycle and remaining architecture coverage.
+- Signed release artifacts and release CI.
+
+The [development](development.md#version-1-verification-and-delivery-requirements)
+and [operations](operations.md) contracts define acceptance. Add packaging and
+release scaffolding only with working artifacts and executable checks.
 
 ## Immediate next task
 
-Continue step 5 with CrowdSec authoritative startup synchronization and decision
-lifecycle. Keep CrowdSec changes inside the existing serialized writer and durable
-revision boundaries.
+Complete the Docker-specific coexistence milestone in step 5: verify the
+[Docker attachment contract](firewall-backends.md#docker-docker-user-attachment),
+packet ordering, and preservation of foreign state. Then complete the remaining
+operational and release gates in step 6.
 
-Static source-backed policy is complete for nftables and iptables/ipset.
-CrowdSec, Docker/coexistence, and operational/release integrations retain their
-remaining acceptance criteria; do not bypass ownership or transaction boundaries.
-
-Track subsequent milestones as issues with acceptance criteria drawn from the
-existing docs. Update the docs when implementation exposes a concrete
-contradiction; otherwise, treat them as the baseline and build.
+Static source-backed policy, both native backends, and CrowdSec synchronization
+and decision lifecycle are already implemented. Keep their existing writer,
+recovery, packet-path, and compatibility gates passing while adding the remaining
+features. Track new work as issues using acceptance criteria from the owning
+documents rather than maintaining another implementation or test plan.

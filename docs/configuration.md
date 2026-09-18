@@ -11,13 +11,16 @@ policy rules, evaluation, and examples follow. [Data sources](data-sources.md)
 owns external resolution and compatibility; [firewall backends](firewall-backends.md)
 owns the kernel realization.
 
-The package configuration path is `/etc/perimeterd/perimeterd.yaml`. State and
-prefix caches live under `/var/lib/perimeterd`. Parsing accepts exactly one YAML
-document. Each schema-defined mapping rejects unknown and duplicate fields;
-`groups` is intentionally a map whose keys are user-defined group names.
-Scalar types are checked without coercion, and `version` must be exactly `1`.
-Explicit nulls, aliases, and merge keys are rejected rather than silently
-defaulted or expanded.
+The CLI default configuration path is `/etc/perimeterd/perimeterd.yaml`;
+`--config PATH` overrides it for `run` and `validate`. A source build does not
+install that path. The planned package uses it as its configuration location.
+The runtime defaults state and prefix caches to `/var/lib/perimeterd` and
+creates missing directories when invoked as root. Parsing accepts exactly one
+YAML document. Each schema-defined mapping rejects unknown and duplicate
+fields; `groups` is intentionally a map whose keys are user-defined group
+names. Scalar types are checked without coercion, and `version` must be
+exactly `1`. Explicit nulls, aliases, and merge keys are rejected rather than
+silently defaulted or expanded.
 
 ## Document and fragment forms
 
@@ -103,7 +106,7 @@ and are always validated; only the selected backend is applied.
 | `firewall.ipv6` | bool | `true` | Enable IPv6 |
 | `firewall.nftables.table` | text | `perimeterd` | Table name |
 | `firewall.nftables.priority` | int | `-10` | Filter hook priority; `-199` through `2147483647` inclusive |
-| `firewall.iptables.attachments` | list | `INPUT/OUTPUT` | Parent jumps |
+| `firewall.iptables.attachments` | list | `INPUT`/ingress and `OUTPUT`/egress when omitted | Parent jumps |
 | `attachments[].chain` | text | — | Required parent chain |
 | `attachments[].direction` | text | — | Ingress or egress |
 | `attachments[].input_interfaces` | list | `[]` | Input matches |
@@ -414,11 +417,15 @@ artifacts, including allow-only rules and accounting objects, through the
 normal journaled apply/cleanup path. Configured and built-in allows alone do
 not require a firewall path.
 
+Disabling CrowdSec retires its owned dynamic containers; configured static
+policy remains unless the no-artifacts predicate also holds. This is separate
+from clearing a currently enabled CrowdSec decision store; see the
+[dynamic authority contract](data-sources.md#ephemeral-backend-inputs).
+
 An empty policy list does not suppress a remaining global block. When CrowdSec
 is enabled, keep its dynamic path even when its current decision store is empty.
-Do not infer the no-artifacts
-state from a temporarily empty source response or from allows shadowing
-configured denies.
+Do not infer the no-artifacts state from a temporarily empty source response or
+from allows shadowing configured denies.
 
 When the no-artifacts predicate is false, compilation requires at least one
 enabled address family. Disabling both `firewall.ipv4` and `firewall.ipv6` does
@@ -674,34 +681,6 @@ policies:
 **Expected:** TCP/22 is decided entirely by `ssh-override`; an Asian source
 cannot fall through to `ingress-default` after matching that scope. Every other
 new ingress protocol/port reaches the broad priority-100 policy.
-
-## Concrete compiler traces
-
-These cases are normative checks of the preceding ordering:
-
-1. **Global allow precedence:** a new flow from a built-in local range or the
-   configured home address returns even if the same address appears in the
-   global blocklist, a CrowdSec ban, or a matching geo blocklist.
-2. **Global direct block:** a new ingress source or egress destination matching
-   the offensive address is denied before CrowdSec and geo evaluation.
-3. **SSH country allowlist:** new ingress TCP/22 from the allowed country
-   matches the priority-10 allowlist and returns; another global source matches
-   the same scope and is denied.
-4. **Asia-minus-Japan web policy:** new ingress TCP/443 or UDP/443 from an Asia
-   prefix is denied. A Japanese prefix was subtracted from `effective`, so the
-   same traffic returns.
-5. **Host-originated reply:** a host starts an outbound connection to an
-   address that an ingress policy would block. The reply is
-   `ESTABLISHED,RELATED` in ingress and returns before all denial checks.
-6. **Accepted-inbound reply:** an inbound connection is accepted by the
-   surrounding firewall. Its outbound reply is established and returns before
-   an egress country blocklist.
-7. **SSH-only reset:** changing only `ssh-admin` to `disabled`, or removing it,
-   removes its static rule/set artifacts. Web policy and CrowdSec dynamic sets
-   are unchanged.
-8. **CrowdSec precedence:** a new ingress flow not globally listed but from a
-   CrowdSec-banned address is
-   denied before geo evaluation even when a geo allowlist contains it.
 
 ## Validation phases
 

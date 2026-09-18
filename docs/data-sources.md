@@ -18,6 +18,7 @@
 
 - [RIPEstat scope and accuracy](#ripestat-scope-and-accuracy)
   - [Normative provider contract](#normative-provider-contract)
+  - [Accuracy and interpretation](#accuracy-and-interpretation)
   - [Evaluated alternative: sapics/ip-location-db](#evaluated-alternative-sapicsip-location-db)
 - [Resolution transaction](#resolution-transaction)
   - [Normative resolution steps](#normative-resolution-steps)
@@ -34,6 +35,7 @@
   - [Decision acceptance and expiry](#decision-acceptance-and-expiry)
   - [Authoritative stream and decision identity](#authoritative-stream-and-decision-identity)
   - [Stream synchronization and activation](#stream-synchronization-and-activation)
+  - [Ephemeral backend inputs](#ephemeral-backend-inputs)
   - [Overlap, expiry, and backend projection](#overlap-expiry-and-backend-projection)
   - [Renewable kernel leases](#renewable-kernel-leases)
 - [CrowdSec availability, endpoint changes, and secrets](#crowdsec-availability-endpoint-changes-and-secrets)
@@ -232,34 +234,27 @@ cache files.
 
 ### Cache publication and durable-commit coupling
 
-Static candidate admission, journal preparation, active-record publication, and
-crash recovery follow the canonical
-[durable-apply contract](architecture.md#durable-apply-and-crash-recovery).
-The source-specific coupling rules are:
+The [durable-apply contract](architecture.md#durable-apply-and-crash-recovery)
+owns revision admission, journal phases, active-record publication, and crash
+recovery. Source-specific rules are deliberately narrower:
 
-1. Stage and validate every needed object, then write and `fsync` the complete
-   manifest and atomically install it, followed by a directory `fsync`.
-2. Carry the manifest identifier in the candidate and in the durable apply
-   journal before any firewall mutation. The journal record includes the
-   transaction ID, previous and candidate snapshot manifest identifiers,
-   target, generation, compiled static model, ownership, and phase. The journal
-   phase alone is not the commit point.
-3. Change the active committed record, including its transaction ID and
-   candidate manifest identifier, only after complete enforcement succeeds.
-   Atomically and durably installing that active record is the commit point.
-   Previous generations and their referenced objects remain until that commit
-   is durable.
-4. Garbage-collect an object or manifest only after no active, journaled, or
-   retained generation references it. Garbage collection never changes an
-   active pointer.
+1. Stage and validate every needed object, then install and `fsync` the complete
+   manifest and its directory before it is named as a candidate.
+2. Bind the manifest to the immutable candidate revision and journal before
+   firewall mutation. Compiled static state and ownership live in the referenced
+   revisions; the journal phase is not the commit point.
+3. Change the active record only after complete enforcement succeeds. Keep the
+   previous manifest and its objects reachable until that record is durably
+   installed.
+4. Collect an object or manifest only after no active record, journal, or
+   retained generation references it; collection never changes an active pointer.
 
-A failed refresh leaves any staged objects and uncommitted manifest as orphans;
-the active manifest is unchanged. Manifest loading is exact and all-or-nothing:
-it validates every referenced object and never combines independently selected
-cache files or substitutes a newly fetched generation during recovery. The
-architecture contract decides whether precommit recovery restores the previous
-selection or a durable active record finishes retirement; source validation is
-required before either path admits new work.
+A failed refresh may leave staged objects or an uncommitted manifest as
+orphans, but it cannot change the active manifest. Loading is exact and
+all-or-nothing: every referenced object is validated, and independent cache
+files are never combined. Recovery validates its recorded references before
+admitting work; it does not substitute a newly fetched generation for missing
+recovery evidence.
 
 ### Fresh reuse and stale fallback
 
@@ -526,15 +521,6 @@ enforcement operation sequence above the applied watermark. Apply from this
 selected staged context while holding the same admission fence; do not publish
 it as the active store or admit its ordinary events yet.
 
-The native backend receives the selected projection separately from the durable
-target. `Preflight` uses it only for admission and cannot authorize a later
-write. `Apply` receives an activation projection only when installing or
-replacing dynamic authority: a nil projection preserves existing leases, while
-an explicit empty projection clears them. A static refresh admits against the
-current full projection but applies with nil, so it cannot renew or replay
-captured bans. Recovery also preserves existing leases until a fresh
-authoritative activation or dynamic update.
-
 On success, publish the selected epoch/store and operation watermark together,
 then resume incremental polling. Configuration-driven activation additionally
 waits for the durable configuration commit. On failure, the old epoch/store
@@ -552,6 +538,26 @@ uses at most a `30s` context timeout; while initial readiness is pending, clip
 that timeout to the remaining bounded-startup budget. This request deadline is
 independent of a decision lease. Expiry processing continues during outages; an
 outage never extends a decision's expiry.
+
+### Ephemeral backend inputs
+
+The durable `Target` contains static packet-path state and the identity of the
+owned dynamic containers (`DynamicGeneration`), not CrowdSec decisions,
+deadlines, or authority. The current timed projection is an ephemeral
+`DynamicState` passed at one writer boundary:
+
+| Backend operation | Dynamic input | Meaning |
+| --- | --- | --- |
+| `Preflight` | selected projection | Admission and capacity/ownership checks only; it does not authorize a later write. |
+| `Apply` for static refresh or recovery | `nil` | Selects static state while preserving existing dynamic leases. It must not renew or replay a captured projection. |
+| `Apply` for activation/replacement | selected projection, including explicit empty | Installs or replaces dynamic authority; an empty projection clears dynamic leases. |
+| `UpdateDynamic` | current projection | Reconciles already-owned dynamic containers without rebuilding static generations. |
+
+An explicit empty projection clears entries from the selected dynamic containers;
+`nil` alone is not an instruction to clear them. Disabling CrowdSec instead
+selects a target without `DynamicGeneration` and retires its dynamic containers.
+Each non-`nil` projection is validated, but never serialized as durable authority.
+Recovery preserves surviving leases until a fresh activation or dynamic update.
 
 ### Overlap, expiry, and backend projection
 
@@ -668,69 +674,60 @@ snapshot validation. The global allowlist still has precedence over this
 projection: a retained decision may be present in `D` but cannot deny while
 covered by the effective allowlist.
 
-The authoritative store computes additions and deletions for dedicated dynamic
-IPv4 and IPv6 firewall sets and sends those deltas to the serialized writer; it
-does not invoke a backend itself. Successful updates are incremental and do not
-rebuild static global or geo sets.
+The writer derives the complete current projection from the authoritative store
+and passes it to the backend. The backend reconciles its owned dynamic IPv4 and
+IPv6 sets without rebuilding static global or geo sets. Incremental LAPI events
+do not imply that every native write is an element-by-element delta.
 
-If a backend delta fails or may have been partially applied, inspect the current
+If a dynamic write fails or may have been partially applied, inspect the current
 owned dynamic sets and reconcile them to the latest timed `P(D)`. Do not replay
 an obsolete event or assume an earlier batch was wholly unapplied. Fold later
 events and expiry into the next projection, including deadline changes as well
 as membership changes. A failed deletion remains pending until the unwanted
 element is gone; a failed addition retains its authoritative decision. Runtime
-delta failure sets enforcement health to zero until current-state reconciliation
+write failure sets enforcement health to zero until current-state reconciliation
 succeeds. Native expiry remains effective even while a static transaction's
 degraded recovery blocks dynamic mutations.
 
 ## CrowdSec availability, endpoint changes, and secrets
 
-CrowdSec is optional. When enabled:
-
-- the key file must exist, be readable, and contain a usable credential;
-- initial LAPI authentication, authoritative full synchronization, exact
-  projection, and its backend apply must succeed before readiness;
-- later disconnects retain currently valid decisions and enforcement, mark the
-  integration unhealthy, obtain a full snapshot on reconnect, and use bounded
-  exponential backoff;
-- expiry processing and current `P(D)` projection reconciliation continue
-  while disconnected; and
-- replacement credentials are authenticated as a staged reload resource.
+CrowdSec is optional. When enabled, the credential file must be readable and
+usable; initial authentication, authoritative `startup=true` synchronization,
+projection, and backend activation must succeed before readiness. A later
+disconnect marks the integration unhealthy but retains valid decisions and
+finite leases while expiry and projection reconciliation continue. Reconnect
+uses a full snapshot with bounded backoff. See [operations](operations.md) for
+credential-file modes and observability.
 
 Credential replacement, endpoint replacement, and disabling the integration
-follow [staged reload](architecture.md#staged-reload). The source-specific
-handover rules are:
+follow [staged reload](architecture.md#staged-reload):
 
-- each replacement obtains a full `startup=true` snapshot into a separate
-  store;
-- the old store and its expiry processing remain authoritative until durable
-  configuration commit promotes the new client epoch;
-- two clients must not poll one LAPI stream cursor concurrently: pause old
-  polling at a batch boundary while synchronizing its replacement, retaining
-  its store and enforcement; and
-- if staging fails, resume the old client via a full synchronization rather
-  than assuming its incremental cursor is unchanged.
+- Authenticate each replacement and obtain a separate full `startup=true`
+  snapshot before promotion.
+- Keep the old client, store, expiry processing, and enforcement authoritative
+  until the durable configuration commit promotes the new epoch.
+- Pause the old poller at a batch boundary while staging a replacement; never
+  poll one LAPI cursor concurrently from two clients.
+- If staging fails, resume the old client with a full synchronization rather
+  than assuming its incremental cursor remains valid.
 
-The [durable-apply contract](architecture.md#durable-apply-and-crash-recovery)
-governs the writer boundary, commit point, compensation, and precommit
-recovery. At that boundary, an endpoint change treats the new endpoint's
-snapshot as the sole candidate authority and never unions old-endpoint
-decisions into it. Disabling CrowdSec stages an empty projection. Apply the
-selected projection with the candidate static state, retire the old client and
-store only after durable commit, and compensate a failed apply from the old
-client's current unexpired projection. Failed compensation enters degraded
-recovery rather than claiming old enforcement survived untouched. Precommit
-crash recovery restores the prior static selection and re-synchronizes its
-configured LAPI before readiness. These changes do not independently commit
-outside the configuration transaction.
+At the writer boundary, an endpoint change uses only the new endpoint's
+snapshot; it never unions decisions from different endpoints. Disabling
+CrowdSec omits dynamic generation so target migration retires the old dynamic
+containers. Where a dynamic generation remains selected, an explicit empty
+projection clears its leases; `nil` preserves them. [Architecture](architecture.md)
+owns the journal commit point, compensation, and crash recovery. Old resources
+are retired only after durable commit; failed compensation enters degraded
+recovery rather than claiming that old enforcement survived untouched. A
+precommit restart restores the prior static selection and re-synchronizes its
+configured LAPI before readiness. These source changes do not commit outside
+the enclosing configuration transaction.
 
-The API key is read from `crowdsec.api_key_file`. Its value must never appear
-in the main YAML example, logs, metrics, process arguments, error wrapping, or
-diagnostic dumps. Logs also omit complete prefix lists; metrics use bounded
-source/result labels only. CrowdSec decisions are not persisted as secrets or
-as an authority across restart: restart performs a new authoritative LAPI
-snapshot and reconciliation. See [operations](operations.md) for credential
-file modes and observability.
+The API key comes from `crowdsec.api_key_file`; its value must never appear in
+examples, logs, metrics, process arguments, error wrapping, or diagnostics.
+Logs omit complete prefix lists and metrics use bounded source/result labels.
+CrowdSec decisions are not persisted as secrets or authority across restart:
+startup performs a new authoritative snapshot and reconciliation.
 
 
 ## Source failure matrix
@@ -739,10 +736,8 @@ The rows below describe implemented source-backed and dynamic policy behavior.
 
 ### RIPEstat and cache (implemented)
 
-| Failure | Required behavior |
-| --- | --- |
 | Required cache missing and RIPEstat unavailable | First start fails before firewall mutation and readiness. An active daemon keeps its committed manifest and enforcement and retries. |
-| Malformed, partial, status-failed, or identity-mismatched RIPEstat response | Reject the whole candidate. An active daemon exposes failure and age without replacing its committed manifest. |
+| Malformed, partial, status-failed, or identity-mismatched RIPEstat response | Reject the whole candidate. An active daemon reports the refresh failure without replacing its committed manifest. |
 | Corrupt staged objects or orphaned/uncommitted manifests | Ignore them and fetch or use a complete valid committed manifest. First start fails if a complete candidate cannot be built. |
 | Corrupt objects referenced by recovery state | Do not silently substitute a newly fetched generation. Recovery validates the journal and committed references before admitting work; missing recovery evidence requires repair as specified in [architecture](architecture.md#durable-apply-and-crash-recovery). |
 | Initial backend application failure | Withhold readiness and perform backend-specific compensation; preserve recovery evidence if it fails. |

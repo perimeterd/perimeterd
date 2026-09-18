@@ -25,9 +25,9 @@ The current binary implements:
 - immutable source snapshots, refresh, cache fallback, durable revision/journal
   recovery, backend and target migration, and custom iptables attachments;
 - CrowdSec ingress bans with authoritative synchronization, expiry, renewable
-  kernel leases, and staged credential/endpoint replacement; and
-- native processed and terminal-denial packet/byte accounting plus enforcement
-  health and CrowdSec connection gauges.
+  kernel leases, and staged credential/endpoint replacement;
+- backend-owned native processed and terminal-denial counter objects; and
+- enforcement-health, CrowdSec connection, and committed-prefix timestamp gauges.
 
 Docker-specific coexistence is not a verified runtime milestone; the `DOCKER-USER` material in
 [firewall backends](firewall-backends.md#docker-docker-user-attachment) is
@@ -62,208 +62,178 @@ and reconcile again; never change `PATH` underneath recorded ownership.
 
 A source-backed policy needs network access to the fixed RIPEstat endpoints on
 its first resolution unless an acceptable committed snapshot covers every
-required selector. Direct-only configurations make no source requests.
+required selector. Configurations with neither geo selectors nor CrowdSec make
+no source requests.
 
 ### Build, validate, and run
 
+Build the source tree, then validate and run the same complete configuration.
+`run` and `validate` accept `--config PATH`; when omitted, both use
+`/etc/perimeterd/perimeterd.yaml`. The source build does not create that path.
+
 ```sh
 make build
-bin/perimeterd validate --config /etc/perimeterd/perimeterd.yaml
-sudo bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
+CONFIG=/etc/perimeterd/perimeterd.yaml
+bin/perimeterd validate --config "$CONFIG"
+sudo bin/perimeterd run --config "$CONFIG"
 ```
 
-`validate` is local-only: it parses the YAML and performs schema and semantic
-checks without reading credentials, resolving selectors, contacting RIPEstat,
-or touching firewall state. A successful validation therefore does not prove
-that source data, credentials, LAPI compatibility, or native backend tools are
-available. Only `run` can synchronize and enforce CrowdSec decisions.
+`validate` is local-only: it parses one YAML document and performs schema and
+semantic checks without reading credentials, resolving selectors, contacting
+RIPEstat or CrowdSec, binding the metrics listener, or touching firewall state.
+It does not require root, but the selected file must be readable. A successful
+validation therefore does not prove that source data, credentials, LAPI
+compatibility, or native backend tools are available. Only `run` synchronizes
+and enforces source-backed or CrowdSec decisions.
 
-The minimum direct-rule configuration below is suitable for a disposable test
-(the address is only an example):
-
-```yaml
-version: 1
-global:
-  allowlist: []
-  blocklist: ["8.20.0.2/32"]
-firewall:
-  backend: nftables
-  ipv4: true
-  ipv6: true
-policies: []
-crowdsec:
-  enabled: false
-```
-
-`run` stays in the foreground. `SIGHUP` stages a complete reload; a rejected
-reload leaves the active revision in place. `SIGTERM` or `SIGINT` stops the
-process without removing enforcement. `cleanup` takes no configuration path:
-it reads durable ownership records and removes only recorded perimeterd
-artifacts. Stop `run` and confirm it is inactive before invoking cleanup.
-
-Default persistent paths are `/var/lib/perimeterd` for revisions, journals,
+The default persistent paths are `/var/lib/perimeterd` for revisions, journals,
 and immutable prefix snapshots, and `/run/perimeterd/owner.lock` for the
-lifecycle lock. The runtime creates missing directories when invoked as root.
-Do not delete either path, its records, or the lock inode to bypass recovery or
+lifecycle lock. Invoked as root, the runtime creates missing directories. Do
+not delete either path, its records, or the lock inode to bypass recovery or
 ownership checks. A committed static policy remains in the kernel after a
 normal stop. CrowdSec entries retain only their remaining finite kernel lease;
 without the daemon, they can expire before the original decision deadline.
 
-Source-backed candidates carry immutable, content-addressed manifests under
+Source-backed candidates use immutable, content-addressed manifests under
 `/var/lib/perimeterd/prefixes/`; the committed revision selects its manifest.
 Do not edit these files or choose one by modification time. Startup validates
-referenced cache evidence before mutating the firewall. Unreferenced cache files
-are collected only after startup recovery or explicit cleanup, not while source
-workers may be staging candidates.
+referenced cache evidence before mutating the firewall. Unreferenced cache
+files are collected only after startup recovery or explicit cleanup, not while
+source workers may be staging candidates.
 
-Refresh uses the configured `geo.refresh_interval` (default `24h`) plus sampled
-jitter up to `geo.refresh_jitter` (default `10m`). Each request defaults to a
-`30s` timeout, with at most four source requests in flight and at most 512
-selectors. Incomplete, malformed, oversized, or otherwise unacceptable source
+Refresh uses `geo.refresh_interval` (default `24h`) plus sampled jitter up to
+`geo.refresh_jitter` (default `10m`). Each request defaults to a `30s` timeout;
+at most four source requests are in flight and at most 512 selectors are
+accepted. Incomplete, malformed, oversized, or otherwise unacceptable source
 data leaves the committed policy unchanged. A committed snapshot is reused
 only when it covers every required selector; a newly introduced selector must
 resolve successfully. Failed refreshes retain the active policy and retry on
 the normal schedule.
 
-State and native-input limits are safety fences, not tuning knobs. Encoded
-state is limited to 16 MiB. nftables preflight requires each complete target to
-fit the 32 MiB installation limit and budgets inspection of both retained
-generations at 48 MiB per table. iptables/ipset command input is limited to
-16 MiB per invocation; ipset restore streams are split at command boundaries
-without reordering population and swaps. The aggregate ipset target may exceed
-one invocation's limit. Preflight reserves retained-generation and complete-rule
-inventory capacity within a 48 MiB budget. ipset accounting includes finite
-timeout fields and the live/spare peak during resizing; in-place replacements
-do not reserve a duplicate live set or an unused spare. Each backend captures
-at most 64 MiB of native output per command, and selected ipset contents share
-that cap.
-Oversized candidates are rejected before replacing the committed revision.
-CrowdSec nftables updates also budget the retained native contents together
-with the replacement dynamic contents before mutation. Replaced elements are
-not counted twice during renewal. An oversized update leaves the existing
-kernel enforcement unchanged rather than making the table uninspectable.
-Static refresh admission includes the current CrowdSec projection even when
-activation preserves the same dynamic generation. A refresh must not select
-static contents that prevent renewal of already-admitted authority. The
-capacity-only projection is neither applied nor persisted by that refresh.
+Encoded-state and native-input limits are safety fences, not tuning knobs.
+Admission accounts for the candidate and required retained state; rejection
+before execution performs no native writes. Do not interpret every later
+execution failure as unchanged enforcement: partial or ambiguous results follow
+the backend's compensation and recovery contract. See
+[firewall backends](firewall-backends.md) and
+[durable admission](architecture.md#durable-apply-and-crash-recovery).
 
 ## Operator sequence
 
-This sequence is for the current source build. It does not assume a package,
+This is the current source-build runbook. It does not assume a package,
 installed systemd unit, tmpfiles payload, or automatic service startup.
 
 ### Prerequisites
 
-1. Build the binary and install the selected backend tools listed above.
-2. Prepare an isolated test host or namespace and verify that configured
-   iptables parent chains exist.
-3. Write the configuration as root with mode `0600`. Keep credentials outside
-   the YAML and mode `0600` when a future integration requires them.
-4. Run `perimeterd validate --config PATH`, remembering that validation does
-   not perform runtime backend or source checks.
+1. Build the binary and install the selected backend tools listed in
+   [Source-build prerequisites](#source-build-prerequisites).
+2. Use a disposable VM or isolated network namespace. Verify that configured
+   iptables parent chains already exist.
+3. Write the complete configuration as root with mode `0600`. Keep credentials
+   outside the YAML in root-owned files with mode `0600`.
+4. Run the `validate` command from [Build, validate, and run](#build-validate-and-run).
+   It checks only the local document and does not attest runtime prerequisites.
 
 ### Configure and validate
 
-Use `--config PATH` with `run` and `validate`; if omitted, the CLI uses
-`/etc/perimeterd/perimeterd.yaml`. `firewall.backend` is required. Choose
-`nftables` or `iptables` explicitly; there is no capability auto-selection or
-fallback after an apply error.
+Set `firewall.backend` explicitly to `nftables` or `iptables`; there is no
+capability auto-selection or fallback after an apply error. Use a complete
+configuration document, not one of the root-level fragments in
+[Configuration](configuration.md#document-and-fragment-forms).
 
-An explicit `firewall.iptables.attachments: []` is accepted by local validation.
-When iptables is selected and the desired policy is non-empty, runtime
-reconciliation rejects the candidate before mutation because it has no managed
-packet path. nftables ignores this list. Only the canonical
-[empty desired state](configuration.md#empty-desired-state) may converge to no
-owned artifacts. Do not infer active enforcement from administrator-managed
-jumps.
+An explicit `firewall.iptables.attachments: []` clears the default attachment
+jumps and is accepted by local validation. When iptables is selected, a
+non-empty desired policy then fails runtime reconciliation before mutation
+because it has no managed packet path. nftables ignores this list. Only the
+canonical [empty desired state](configuration.md#empty-desired-state) may
+converge to no owned artifacts; do not infer active enforcement from
+administrator-managed jumps. See the
+[iptables attachment contract](firewall-backends.md#iptables-attachment-contract).
 
 ### Start and check health
 
-Run as root and watch stdout/stderr (or the terminal where the foreground
-process is attached). If `metrics.listen` is non-empty, the listener binds
-before the first firewall commit; the default is loopback-only
-`127.0.0.1:2112`. Initial bind failure prevents readiness of the process's
-startup protocol. `GET /metrics` is unauthenticated, so expose a non-loopback
-address only behind suitable network access control.
+Start with the `run` command shown in
+[Build, validate, and run](#build-validate-and-run), in the foreground, and
+watch its stdout/stderr. If `metrics.listen` is non-empty, the listener binds
+before the first firewall commit; its default is loopback-only `127.0.0.1:2112`.
+A bind failure prevents startup readiness. `GET /metrics` is unauthenticated,
+so expose a non-loopback address only behind suitable network access control.
 
 The current endpoint emits `perimeterd_enforcement_health`,
 `perimeterd_crowdsec_connected`, and, for an active source-backed revision,
-`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The CrowdSec
-connection gauge is zero when disabled or awaiting a valid synchronization;
-LAPI unavailability does not extend retained decisions. Native
-processed and terminal-denial counters are available through the selected
-backend's owned counter objects; their semantics and inspection paths are in
+`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The latter
+is the oldest required selector retrieval time, not manifest publication time.
+The CrowdSec gauge is zero when disabled or awaiting valid synchronization;
+LAPI unavailability does not extend retained decisions. The selected backend's
+native counter objects are not collected or exported by this endpoint; their
+semantics and inspection paths are in
 [Packet and byte accounting](firewall-backends.md#packet-and-byte-accounting).
-The broader Prometheus metric surface remains a planned release artifact (see
+The broader Prometheus metric surface remains planned (see
 [Prometheus metrics](#prometheus-metrics)).
 
 ### Reload, recover, and cleanup
 
-1. Edit a complete configuration, then send `SIGHUP`.
+1. Edit a complete configuration and send `SIGHUP` to the foreground process.
 2. If resolution, compilation, preflight, apply, or durable publication fails,
-   keep the old configuration and inspect the structured log. Do not delete
-   state to force a reload.
+   keep the active revision and inspect structured logs. Do not delete state to
+   force a reload.
 3. If enforcement becomes unhealthy, stop ordinary changes. Preserve the
    journal, active record, revisions, source manifests, and ownership metadata;
-   restart `run` or invoke explicit cleanup only after stopping the daemon.
+   restart `run` and let recovery proceed, or invoke explicit cleanup only
+   after stopping the daemon.
 4. For intentional decommissioning, stop the process, confirm it is inactive,
-   run `sudo bin/perimeterd cleanup`, and purge state only after cleanup
-   reports success.
+   run `sudo bin/perimeterd cleanup`, and purge state only after cleanup reports
+   success.
 
-The backend-specific mixed-family window, migration overlap, retained
-ownership, and degraded-recovery behavior are defined in
+Backend-specific mixed-family windows, migration overlap, retained ownership,
+and degraded recovery are defined in
 [architecture](architecture.md#durable-apply-and-crash-recovery) and
 [firewall backend failure behavior](firewall-backends.md#failure-and-cleanup-behavior).
 
 ## Supported CrowdSec LAPI prerequisite
 
 **Implemented source-build integration.** CrowdSec LAPI v1.8.1 is the
-supported baseline, using its normal chunked decision stream. No
-`chunked_decisions_stream` feature-flag changes or older-server pin are
-required. See the [supported LAPI contract](data-sources.md#supported-lapi-contract).
+supported baseline and uses its normal chunked decision stream; no feature-flag
+change or older-server pin is required. The wire protocol, synchronization,
+expiry, and lease details belong to the [supported LAPI
+contract](data-sources.md#supported-lapi-contract).
 
-Routine polls fetch incremental additions and deletions, not the full active
-blocklist. Full snapshots are reserved for initial synchronization, reconnect,
-and staged client replacement, including credential or endpoint reloads.
-This avoids repeatedly downloading external blocklists with around 100,000
-IPs/CIDRs.
+Register a bouncer in that LAPI deployment and store its API key in a
+root-readable file with mode `0600`. Configure `crowdsec.enabled: true`,
+`lapi_url`, and `api_key_file`, then run or reload the daemon. Initial
+synchronization must succeed before readiness. A same-path key rotation is
+reread on `SIGHUP`; a failed replacement retains the old authenticated client
+and its bans. The default update frequency is `10s`; request deadlines are at
+most `30s`. Failures do not extend a decision's absolute expiry. Lease renewal
+continues from retained authority while the writer can safely reconcile it.
 
-The known upstream database-query error behavior is accepted temporarily:
-a successful-looking empty or partial full snapshot may remove CrowdSec bans.
-Restoration may require a later full synchronization; static global and geo
-policy are unaffected. This is tracked in
-[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691),
-not worked around or tested as a compatibility blocker in perimeterd.
-
-Register a bouncer in that LAPI deployment and place its API key in a
-root-readable credential file. Configure `crowdsec.enabled: true`, `lapi_url`,
-and `api_key_file`, then run or reload the daemon. Initial synchronization
-must succeed before readiness. A same-path key rotation is reread on `SIGHUP`;
-a failed replacement retains the old authenticated client and its bans.
-The default incremental poll interval is `10s`; request deadlines are at most
-`30s`, and failures back off independently of local expiry and lease renewal.
-No decision snapshot or key contents are written into durable revisions.
+The known upstream database-query behavior is accepted: a successful-looking
+empty or partial full snapshot may remove CrowdSec bans. Restoration may
+require a later full synchronization; static global and geo policy are
+unaffected. This is tracked in
+[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691)
+and is not worked around as a compatibility blocker. Decision snapshots and
+key contents are not written into durable revisions.
 
 ## Lifecycle lock and recovery
 
-`run` and `cleanup` acquire an exclusive, nonblocking `flock` on
-`/run/perimeterd/owner.lock` before reading or mutating persisted ownership,
-recovery state, or firewall state. They hold it for their whole lifetime. A
-second daemon, or cleanup while the daemon is active, fails without mutation.
-The lock inode is never unlinked or replaced. The lifecycle lock is distinct
-from the host-wide xtables lock: xtables serializes compatible iptables restore
-commands only and does not coordinate nftables, migrations, or durable state.
+`run` and `cleanup` acquire the exclusive, nonblocking `flock` at
+`/run/perimeterd/owner.lock` and hold it for their whole lifetime. A second
+daemon, or cleanup while the daemon is active, fails without mutation. Never
+unlink or replace this inode. It is distinct from `/run/xtables.lock`, which
+serializes compatible iptables restore commands only and does not coordinate
+nftables, migrations, or durable state.
 
-Recovery is authoritative from the immutable revisions, prepared journal, and
-published `active.json`; it is not inferred from current YAML or a partially
-observed kernel listing. Startup recovers pending work before loading and
-validating YAML. A precommit failure restores the prior recorded selection; a
-committed transaction remains authoritative even if retirement is delayed. An
-uncertain publication or failed compensation retains all evidence, reports
-unhealthy enforcement, and fences ordinary mutations until recovery succeeds.
-See the canonical [exclusive lifecycle ownership](architecture.md#exclusive-lifecycle-ownership),
+Recovery is authoritative from durable revisions, the prepared journal, and the
+published active record, not from current YAML or a partial kernel listing.
+Startup recovers pending work before loading current YAML. If recovery reports
+uncertain publication, failed compensation, or unhealthy enforcement, preserve
+the journal, active record, revisions, source manifests, and ownership
+metadata; do not force a reload or delete state. Follow the canonical
+[exclusive lifecycle ownership](architecture.md#exclusive-lifecycle-ownership),
 [durable apply and crash recovery](architecture.md#durable-apply-and-crash-recovery),
-and [backend migration](architecture.md#backend-and-target-migration) contracts.
+and [backend migration](architecture.md#backend-and-target-migration)
+procedures.
 
 ## Installed layout
 
@@ -398,11 +368,22 @@ runtime watchdog and does not change reload semantics.
 /metrics` emits:
 
 - `perimeterd_enforcement_health` (unlabeled gauge): `1` only when the selected
-  enforcement is healthy; it becomes `0` for degraded recovery or listener
-  failure; and
+  enforcement is healthy; it becomes `0` during degraded recovery. A listener
+  failure terminates `run`, so the endpoint is no longer served.
 - `perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}` (gauge),
   when a source-backed revision is active. It is the oldest required selector's
   retrieval time, not manifest publication time.
+- `perimeterd_crowdsec_connected` (unlabeled gauge): the active integration's
+  synchronization/poll outcome. It is `0` when disabled, not yet synchronized,
+  or after a failed poll/reconnect, and `1` after successful polling/activation.
+  It is separate from enforcement health and does not count current bans.
+
+`perimeterd_enforcement_health` reports the last acknowledged enforcement and
+recovery outcome, not an atomicity guarantee for an in-flight native operation.
+Failed dynamic writes, degraded recovery, or incomplete target cleanup set it
+to `0`; successful reconciliation and required cleanup restore it.
+`READY=1` is a one-time systemd activation notification, not a revocable health
+assertion. Later failures cannot retract it.
 
 The endpoint allows only `GET` on `/metrics`; other paths return 404 and other
 methods return 405. Read headers are limited to 5s, complete request reads and
@@ -411,9 +392,10 @@ uses a 5s graceful-shutdown deadline and force-closes an expired listener.
 Metrics are unauthenticated and must not be exposed beyond a trusted network
 boundary.
 
-Native packet accounting is implemented independently of the listener. Both
-backends retain processed path-traversal and terminal-denial counters in owned
-kernel objects; disabling HTTP exposition does not change enforcement. See
+The selected backends create native processed-path and terminal-denial
+packet/byte counter objects independently of this listener. The current source
+build does not collect or export those counters over HTTP; disabling metrics
+exposition does not change enforcement. See
 [firewall accounting](firewall-backends.md#packet-and-byte-accounting) for
 traversal and denial semantics.
 
@@ -428,7 +410,6 @@ exports them:
 - `perimeterd_prefixes{family,source,type}` (gauge): active prefix count.
 - `perimeterd_source_requests_total{source,result}` (counter): request outcomes.
 - `perimeterd_crowdsec_decisions{family}` (gauge): active unexpired bans.
-- `perimeterd_crowdsec_connected` (gauge): `1` while connected.
 - `perimeterd_backend_apply_total{backend,result}` (counter): apply outcomes.
 - `perimeterd_firewall_processed_packets_total{backend,family,direction}` and
   `perimeterd_firewall_processed_bytes_total{backend,family,direction}`
@@ -447,16 +428,6 @@ remain bounded: firewall `reason` is `global_blocklist`, `crowdsec`, or
 `geo_policy`; `action` is `drop` or `reject`; and counter-read `result` is
 `success` or `error`. No metric label may contain an address, ASN, country,
 policy name, raw error, or unbounded remote revision.
-
-The release contract extends the current unlabeled `perimeterd_enforcement_health`
-gauge to the planned dynamic projection: it is `1` only when the committed
-static selection and current desired dynamic projection are
-known applied and required cleanup is complete. It is `0` during partial apply,
-pending failed dynamic updates, degraded recovery, or incomplete target
-cleanup. `READY=1` is a systemd activation notification, not a revocable
-health assertion; post-readiness failures set this metric to `0` without
-retracting `READY=1`. Health returns to `1` only after serialized recovery
-confirms committed enforcement and required cleanup.
 
 The planned fixed 15-second background sampler reads native counters through the
 serialized backend path and serves last in-memory values without querying the

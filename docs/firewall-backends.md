@@ -7,9 +7,27 @@ publication, recovery, and the cross-target migration algorithm;
 [operations](operations.md) owns procedures and observability.
 
 > **Status boundary.** Static source-backed policy, CrowdSec dynamic bans, both
-> native backends, target migration, custom attachments, and native packet
-> accounting are implemented. Docker-specific coexistence remains first-release
-> work rather than a current support claim.
+> native backends, target migration, custom attachments, and native accounting
+> objects are implemented. Aggregated counter collection/export remains planned.
+> Docker-specific coexistence remains first-release work rather than a current
+> support claim.
+
+## Contents
+
+- [Common invariants](#common-invariants)
+- [Logical packet path](#logical-packet-path)
+- [Packet and byte accounting](#packet-and-byte-accounting)
+- [nftables](#nftables)
+  - [Same-table priority reload](#same-table-priority-reload)
+  - [Static generations and dynamic updates](#static-generations-and-dynamic-updates)
+- [iptables and ipset](#iptables-and-ipset)
+  - [Per-family commit and rollback](#per-family-commit-and-rollback)
+  - [ipset prefix representation](#ipset-prefix-representation)
+- [iptables attachment contract](#iptables-attachment-contract)
+- [Docker `DOCKER-USER` attachment](#docker-docker-user-attachment)
+- [Coexistence](#coexistence)
+- [Ownership inspection and reference fences](#ownership-inspection-and-reference-fences)
+- [Failure and cleanup behavior](#failure-and-cleanup-behavior)
 
 ## Common invariants
 
@@ -33,12 +51,13 @@ Both implemented backends obey these rules:
 - Keep IPv4 and IPv6 sets distinct. nftables switches both families together
   in one netlink transaction; iptables commits each family independently.
 
-**Dynamic integration.** Stable CrowdSec containers use the source-owned
-[timed projection and renewable lease
-contract](data-sources.md#renewable-kernel-leases). Credential or endpoint
-replacement and disable stage separate dynamic-set references, retaining
-old references and live lease state through durable commit. Ordinary static
-refreshes reuse active dynamic sets. A backend must not invent another
+**Dynamic integration.** Stable CrowdSec sets consume the source-owned
+[projection and renewable lease contract](data-sources.md#renewable-kernel-leases).
+The [ephemeral backend input contract](data-sources.md#ephemeral-backend-inputs)
+keeps timed authority out of the serializable `Target`: `Preflight` receives a
+projection only for admission, while `Apply(nil)` preserves existing leases and
+an explicit empty projection clears them. Static refreshes therefore reuse
+dynamic containers without replaying captured bans. Backends do not invent a
 ban cap, renewal schedule, or expiry policy; daemon downtime can let leases
 expire before the retained source deadline.
 
@@ -95,14 +114,16 @@ executed on that traversal. It is classified by `global_blocklist`,
 `crowdsec`, or `geo_policy`, and by `drop` or `reject`. Intermediate
 match/jump counters and terminal rules that were not executed are not included;
 a generated rejection response is not another denied packet.
-
-The backend retains raw native counters and the writer is the only path that
-reads them. The current source build does not export the planned aggregated
-Prometheus counter names or run the planned 15-second sampler; operators can
-inspect the native counters using the ownership rules below. A future sampler
-must preserve generation deltas, monotonic process totals, and last-good values
-on failed reads. Counter gaps after a crash, external rule replacement, or
-external counter reset are operational telemetry loss, not an audit result.
+Backends retain raw native counters for ownership inspection; iptables inventory
+reads machine-oriented `iptables-save --counters`/
+`ip6tables-save --counters`, while nftables validates counter objects and
+ownership. The source build does not aggregate or export the planned
+Prometheus counter names and does not run the planned 15-second sampler.
+Operators may inspect native counters using the ownership rules below. A future
+sampler must preserve generation deltas, monotonic process totals, and
+last-good values on failed reads. Counter gaps after a crash, external rule
+replacement, or external counter reset are operational telemetry loss, not an
+audit result.
 
 ## nftables
 
@@ -145,13 +166,13 @@ precommit/postcommit decision; this section defines the native atomic boundary.
 
 ### Static generations and dynamic updates
 
-A static reconcile builds all candidate sets and packet-path chains, then
-switches the stable dispatch in one netlink transaction. If any operation
-fails, the visible dispatch and prior generation remain unchanged. The
-transaction never changes a set referenced by the old rules. Ordinary static
-refreshes therefore preserve the table, base chains, stable entry chains,
-named counters, and dynamic sets. A configured priority change is the explicit
-base-chain replacement exception above.
+A static reconcile builds candidate sets and packet-path chains, then switches
+the stable dispatch in one atomic netlink transaction. A kernel-rejected batch
+leaves the previous selection intact; a lost or ambiguous command result still
+requires ownership inspection and recovery. The transaction does not change
+static sets referenced by old rules. Ordinary refreshes preserve the table,
+base chains, stable entry chains, named counters, and dynamic sets. A configured
+priority change is the explicit base-chain replacement exception above.
 
 Do not garbage-collect the old generation in the packet-switch transaction.
 Only after durable active-record commit may a later cleanup remove it. Delayed
@@ -209,6 +230,11 @@ commit followed by an IPv6 failure (or the reverse) can expose a mixed-
 generation window that compensation cannot erase. The writer does not publish
 the candidate until both families enforce it, and immediately attempts a
 compensating restore of every family whose switch was attempted.
+A restore command can fail after the kernel has committed its attempted
+family switch. Compensation therefore includes every attempted family, not only
+those whose successful exit was observed; an ambiguous result is treated as
+possibly partially applied and remains fenced until compensation or recovery
+establishes ownership.
 
 If compensation succeeds, the previous committed target remains authoritative;
 failed candidate ownership stays recorded for cleanup. If compensation fails,
@@ -241,11 +267,13 @@ projection on partial updates; do not delete a member still required by that
 projection. Non-`/0` prefixes retain their shape. nftables represents `/0`
 natively with the same logical semantics.
 
-Dynamic ipsets are created with at least 65,536 entries of capacity and grow geometrically.
-Growth populates a deterministic, generation-owned spare, atomically swaps it
-with the attached live set, and removes the old contents. Interrupted growth
-retains recorded ownership of both names; reconciliation uses the latest
-projection rather than replaying stale decisions. A spare with unrecorded
+Dynamic ipsets start with at least 65,536 entries and grow geometrically.
+`ipset restore` is bounded and non-transactional: a resize populates a
+deterministic, generation-owned spare, then issues a kernel `swap` before
+destroying the old name. The swap itself is atomic, but an interrupted
+restore can leave a partial spare, both names, or a completed swap without
+cleanup. Recorded ownership of every possible name is retained; reconciliation
+uses the latest projection, never stale decisions. A spare with unrecorded
 native references is never modified or removed.
 
 An interrupted static restore may leave an unreferenced, recorded staging set
@@ -392,8 +420,8 @@ rather than being adopted.
 Architecture owns the complete journal and recovery state machine. The native
 boundaries are:
 
-- nftables switches dispatch atomically in one netlink transaction; failed
-  staging or apply leaves old references selected;
+- nftables switches dispatch atomically in one netlink transaction; rejected
+  batches leave old references selected, but ambiguous results require recovery;
 - iptables stages both families before switching either, then commits each
   family separately and compensates on failure; the mixed window is real and
   failed compensation degrades and fences enforcement; and
@@ -401,15 +429,15 @@ boundaries are:
   replacement, then retire only recorded old ownership. Retirement failure
   retains both targets and the committed replacement.
 
-A failed candidate never mutates an active generation. The canonical empty
-state removes all owned artifacts, including counters and allow-only rules;
-enabled CrowdSec (once implemented) prevents that predicate even with zero
-current decisions.
+Previous static sets remain immutable while referenced. An attempted switch can
+still change enforcement before a failure is reported, as described above.
+The canonical empty state removes all owned artifacts, including counters and
+allow-only rules; enabled CrowdSec prevents it even with zero current decisions.
 
-Normal shutdown leaves rules active. `run` and `perimeterd cleanup` share the
-same nonblocking lifecycle lock at `/run/perimeterd/owner.lock`; cleanup while
-`run` holds it fails without mutation. Cleanup reads durable active, prepared,
-and retired target metadata for current and migration targets, removes tagged
-parent jumps before child objects, and never derives scope from current YAML.
-Already-absent custom parents do not block removal of remaining recorded
+Normal shutdown leaves rules active. The lifecycle lock, journal recovery, and
+operator cleanup sequence belong to [architecture](architecture.md) and
+[operations](operations.md#reload-recover-and-cleanup). Native cleanup still
+reads durable active/prepared/retired target metadata, removes tagged parent
+jumps before child objects, and never derives scope from current YAML. An
+already-absent custom parent does not block removal of remaining recorded
 ownership, but a parent must exist for an attachment in the desired policy.

@@ -95,11 +95,14 @@ isolated packet interpreter is test-only.
 
 ## Local commands
 
-The `Makefile` is the source of truth for executable local gates. It provides
-`fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`, `test-e2e`, `build`, and
-`verify`. Use Go 1.27.1, or enable automatic toolchain selection when the
-installed Go is older. The race target requires a native C compiler and enables
-CGO for that command.
+The `Makefile` is the source of truth for executable local gates and scale
+profiles. It provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`,
+`build`, `build-e2e`, `test-e2e`, `test-crowdsec`, `verify`, and the four opt-in
+scale targets. Use Go 1.27.1, or enable automatic toolchain selection when the
+installed Go is older. The race target requires a native C compiler and
+enables CGO for that command.
+
+### Correctness and build gates
 
 ```sh
 export GOTOOLCHAIN=auto
@@ -108,6 +111,16 @@ make verify
 make test-race
 bin/perimeterd validate --config configs/perimeterd.yaml
 ```
+
+`make fmt` rewrites the Go sources selected with the `e2e,crowdsec` build
+tags. `make fmt-check` checks the same source set without modifying files.
+`make lint` runs the pinned `golangci-lint` formatting diff and lint policy;
+the lint pass uses the `e2e,crowdsec` build tags. `make vuln` runs
+`govulncheck`. `make test` runs shuffled unit tests and writes `coverage.out`;
+`make test-race` runs the package tests with the race
+detector and shuffled order. The coverage artifact is diagnostic and has no
+vanity threshold: behavior coverage in the [verification
+matrix](#verification-matrix), not a percentage, is the release gate.
 
 `make build` writes `bin/perimeterd` with `GOOS=linux`, the host `GOARCH`, and
 `CGO_ENABLED=0` by default. Override these variables when a different local
@@ -118,7 +131,13 @@ defaults to `dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and
 `BUILD_TIME` at build time. CI supplies its revision and UTC build timestamp.
 
 `perimeterd validate` is an offline local check. It does not fetch sources or
-touch the firewall. Run the opt-in native gate separately:
+touch the firewall. `make verify` runs `go mod verify`, `fmt-check`, `lint`,
+`vuln`, `build`, and `test`; it intentionally excludes the race, native, and
+real-LAPI gates below.
+
+### Native namespace gate
+
+Run the opt-in native gate separately:
 
 ```sh
 make test-e2e
@@ -126,26 +145,26 @@ make test-e2e
 make test-e2e E2E_SUDO=sudo
 ```
 
-The `test-e2e` target first builds the binary, then checks for `nft`, `ip`,
-`ipset`, `unshare`, `nsenter`, `iptables-nft`, `ip6tables-nft`,
-`iptables-legacy`, and `ip6tables-legacy`. The harness requires Linux and also
-invokes the corresponding frontends and save/restore tools inside its isolated fixture.
-Install `iptables` and `ipset` on Debian-family systems; Fedora provides the
-variants in `iptables-nft` and `iptables-legacy`. The host kernel must support
-`hash:net`, `hash:ip`, xtables set matches, and IPv4/IPv6 filter and NAT tables.
-Load the required modules before using an unprivileged user namespace.
+The target first builds the binary, then checks for `nft`, `ip`, `ipset`,
+`unshare`, `nsenter`, `iptables-nft`, `ip6tables-nft`, `iptables-legacy`, and
+`ip6tables-legacy`. The harness requires Linux and invokes the corresponding
+frontends and save/restore tools inside its isolated fixture. Install
+`iptables` and `ipset` on Debian-family systems; Fedora provides the variants
+in `iptables-nft` and `iptables-legacy`. The host kernel must support
+`hash:net`, `hash:ip`, xtables set matches, and IPv4/IPv6 filter and NAT
+tables. Load the required modules before using an unprivileged user namespace.
 
 The fixture creates disposable mount, network, PID, and (for unprivileged
 callers) user namespaces, verifies isolation before mutation, and mounts
-private runtime/state directories. Root callers, including CI with `sudo`,
-retain their existing user namespace while executing binaries beneath private
-checkout-owned directories. The fixture process is PID-namespace init, so its
-exit or timeout terminates descendants. It exercises real CLI lifecycle,
-IPv4/IPv6 TCP/UDP packets, reloads, kernel counters, ownership collisions, and
-interrupted transactions, and never applies test rules to the development
-host's firewall. Tagged E2E sources are formatted and linted by the ordinary
-gates but execute only through this target. CI runs this native gate in a
-separate Linux job.
+private `/run/perimeterd` and `/var/lib/perimeterd` directories. Root callers,
+including CI with `sudo`, retain their existing user namespace while
+executing binaries beneath private checkout-owned directories. The fixture
+process is PID-namespace init, so its exit or timeout terminates descendants.
+It exercises real CLI lifecycle, IPv4/IPv6 TCP/UDP packets, reloads, kernel
+counters, ownership collisions, and interrupted transactions, and never
+applies test rules to the development host's firewall. Tagged E2E sources are
+formatted and linted by the ordinary gates but execute only through this
+target. CI runs this native gate in a separate Linux job.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent
@@ -154,6 +173,8 @@ explicit deadlines. Configuration files and readiness sockets use private,
 unique temporary directories, and table-deletion assertions require successful
 ruleset inspection plus explicit absence; command failures, timeouts, and
 malformed inspection output fail the assertion.
+
+### Real-LAPI compatibility gate
 
 The real-LAPI gate needs Docker (or a compatible Podman CLI):
 
@@ -172,8 +193,10 @@ authoritative emptiness. The fixture is destroyed afterward.
 The known query-error behavior in
 [crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691)
 is an accepted temporary upstream risk, not a compatibility-test condition.
-Do not inject database faults or introduce full-list polling to work around
-it. See the [supported LAPI contract](data-sources.md#supported-lapi-contract).
+Do not inject database faults or introduce full-list polling to work around it.
+See the [supported LAPI contract](data-sources.md#supported-lapi-contract).
+
+### Target inventory and pinned tools
 
 The executable target inventory is:
 
@@ -181,21 +204,27 @@ The executable target inventory is:
 | --- | --- |
 | `fmt` | Rewrite Go sources selected with `e2e,crowdsec` build tags using pinned `gofumpt` followed by `goimports` |
 | `fmt-check` | Check pinned `gofumpt` and `goimports` formatting without modifying files |
-| `lint` | Run golangci-lint's pinned `gci` diff check and lint policy with `e2e,crowdsec` build tags |
+| `lint` | Run golangci-lint's pinned `gci` diff check, then lint with `e2e,crowdsec` build tags |
 | `vuln` | Run pinned `govulncheck ./...` |
 | `test` | Run shuffled unit tests and write `coverage.out` |
 | `test-race` | Run all package tests with the race detector and shuffled order |
-| `test-e2e` | Build and run the explicitly privileged Linux namespace/backend scenarios |
-| `test-crowdsec` | Run the digest-pinned real LAPI streaming compatibility scenarios |
 | `build` | Build the current CLI with version metadata |
+| `build-e2e` | Build the E2E binary and check native tool prerequisites |
+| `test-e2e` | Build and run the isolated Linux namespace/backend scenarios |
+| `test-crowdsec` | Run the digest-pinned real LAPI streaming compatibility scenarios |
 | `verify` | Run `go mod verify`, `fmt-check`, `lint`, `vuln`, `build`, and `test` |
+| `bench-scale-small` | Run baseline control-plane/serialization benchmarks with `-benchmem` |
+| `bench-scale-large` | Run large-100k/large-250k control-plane/serialization benchmarks with `-benchmem` |
+| `bench-native-scale-small` | Run the isolated small native scale profile |
+| `bench-native-scale-large` | Run the isolated large native scale profile |
 
-`verify` intentionally does not run `test-race`, `test-e2e`, or `test-crowdsec`;
-those are separate gates. `package` is a planned GoReleaser/nFPM snapshot-packaging
-command, not an implemented target or a successful no-op.
+`verify` intentionally does not run `test-race`, `test-e2e`, or
+`test-crowdsec`; those are separate gates. `package` is a planned
+GoReleaser/nFPM snapshot-packaging command, not an implemented target or a
+successful no-op.
 
 Tool dependencies and exact versions are pinned in the `tool` and module
-requirements in [`go.mod`](../go.mod). The Make targets invoke them with `go tool`,
+requirements in [`go.mod`](../go.mod). Make targets invoke them with `go tool`,
 so a globally installed tool or a version copied into this guide is not the
 authority.
 
@@ -206,15 +235,17 @@ authority.
 | `golangci-lint` | `github.com/golangci/golangci-lint/v2` | `lint` |
 | `govulncheck` | `golang.org/x/vuln` | `vuln` |
 
-GitHub Actions in the existing workflows are pinned to immutable commit SHAs
-with comments naming their releases. No current workflow downloads an
-unpinned `latest` binary.
+Formatting uses `gofumpt` followed by `goimports`; `.golangci.yml` separately
+enables the `gci` import-order formatter for its diff check. The pinned
+golangci-lint policy enables `govet`, `staticcheck`, `errcheck`, `revive`,
+`gosec`, and US spelling checks. `make verify` also runs module verification
+and `govulncheck`.
 
 ## Opt-in scale measurements
 
-The scale profiles are repeatable measurements rather than correctness tests.
-They use deterministic synthetic inputs and never fetch live continent feeds or
-inject the accepted upstream CrowdSec issue
+These profiles are repeatable measurements, not correctness tests or release
+performance gates. They use deterministic synthetic inputs and never fetch live
+continent feeds or inject the accepted upstream CrowdSec issue
 [#4691](https://github.com/crowdsecurity/crowdsec/issues/4691). Run the
 control-plane/serialization profiles without privileges:
 
@@ -225,45 +256,50 @@ make bench-scale-large
 SCALE_BENCHTIME=10x make bench-scale-large
 ```
 
-`bench-scale-small` selects the `baseline` sub-benchmarks. `bench-scale-large`
-selects `large-100k` and `large-250k` sub-benchmarks. The commands use
-`-benchmem` and one iteration by default so the large profile is practical to
-run explicitly. The benchmark names and measured quantities are:
+`bench-scale-small` selects the `baseline` sub-benchmarks.
+`bench-scale-large` selects `large-100k` and `large-250k` sub-benchmarks.
+Both commands use `-benchmem`; `SCALE_BENCHTIME` defaults to one measured
+iteration so the large profile remains practical to run explicitly. The
+profiles report measurements for comparison, but impose no time, allocation,
+RSS, or throughput threshold.
+
+The benchmark scope and reported quantities are:
 
 - `internal/crowdsec`: `BenchmarkLAPISnapshotAdmission` builds complete LAPI
-  JSON with SDK-matching decision metadata at one decision and 250,000
-  decisions. It reports serialized input bytes, decision count, time/op,
-  allocations/op, admitted operations, capacity-rejected operations, and
-  Linux `/proc` `VmHWM` when available. `BenchmarkAuthorityProjection`
-  measures authoritative store admission and timed projection at one and
-  100,000 decisions.
-- `internal/crowdsec`:
-  `BenchmarkCrowdSecReconnectRenewalRefresh` measures cold startup/reconnect,
-  unchanged renewal projection, and a changed source refresh at one and
-  100,000 decisions. It is an authority/projection control-plane measurement;
-  native reconciliation is covered by the app benchmark and isolated harness.
+  JSON with SDK-matching decision metadata for one and 250,000 decisions. It
+  reports serialized input bytes, decision count, time/op, allocations/op,
+  admitted operations, capacity-rejected operations, and Linux `/proc`
+  `VmHWM` when available. `BenchmarkAuthorityProjection` measures
+  authoritative-store admission and timed projection for one and 100,000
+  decisions. `BenchmarkCrowdSecReconnectRenewalRefresh` measures
+  authority-only cold startup/reconnect, unchanged renewal projection, and
+  changed-source refresh for one and 100,000 decisions; it does not execute
+  native reconciliation.
 - `internal/app`: `BenchmarkSyntheticGeoNormalization` and
-  `BenchmarkSyntheticGeoCompileAndTarget` use normalized synthetic country data
-  containing 1,024 or approximately 100,000 disjoint IPv4 prefixes. They report
-  input and normalized prefix counts, serialized input/target sizes,
-  time/op, and allocations/op.
-- `internal/app`:
-  `BenchmarkAppReconcileCombinedAuthorityAndGeo` constructs a durable revision
-  with the synthetic geo snapshot and a 250,000-decision CrowdSec authority,
-  then repeatedly calls the production `reconcileLocked(ctx, state, false)`
-  path. Its own no-event backend records projection size, so the benchmark
-  measures state reads, admission/reconciliation, and lease bookkeeping
-  without native commands.
+  `BenchmarkSyntheticGeoCompileAndTarget` use normalized synthetic country
+  data containing 1,024 or approximately 100,000 disjoint IPv4 prefixes. They
+  report input and normalized prefix counts, serialized input/target sizes,
+  time/op, and allocations/op. `BenchmarkAppReconcileCombinedAuthorityAndGeo`
+  constructs a durable revision with the synthetic geo snapshot and a
+  250,000-decision CrowdSec authority, then repeatedly calls the production
+  `reconcileLocked(ctx, state, false)` path. Its no-event backend records
+  projection size, so the benchmark measures state reads,
+  admission/reconciliation, and lease bookkeeping without native commands.
 
-The LAPI stream remains bounded by the implementation's 32 MiB safety limit.
-The 250,000-decision fixture intentionally contains realistic metadata and may
-be rejected at admission when its serialized envelope exceeds that limit. A
-capacity rejection is reported as `capacity-rejected/op`; malformed or other
-unexpected errors fail the benchmark instead of being treated as support for
-the workload. Allocations reported by `-benchmem` and the optional `VmHWM`
-sample are process measurements, not peak kernel memory, native set memory, or
-an end-to-end RSS attribution. `VmHWM` is cumulative for the process, including
-fixture setup and earlier profiles; it cannot be attributed to one dispatch.
+The LAPI safety fence caps both the raw HTTP response read and, when
+compressed, the decompressed response read at 32 MiB. The 250,000-decision
+fixture intentionally retains realistic metadata and may be rejected at
+admission when its serialized envelope exceeds that limit. Such a capacity
+rejection is reported as `capacity-rejected/op`; malformed or other unexpected
+errors fail the benchmark rather than being treated as support for the
+workload. These LAPI wire/read limits are separate from encoded-state and
+native backend input/inspection budgets; those operational limits are described
+in the [operator sequence](operations.md#operator-sequence).
+
+`-benchmem` allocations and the optional `VmHWM` sample are process
+measurements, not peak kernel memory, native set memory, or end-to-end RSS
+attribution. `VmHWM` is cumulative for the process, including fixture setup
+and earlier profiles, so it cannot be attributed to one dispatch.
 
 Native execution is a separate, explicit measurement and runs only inside the
 existing namespace fixture:
@@ -273,38 +309,23 @@ make bench-native-scale-small
 make bench-native-scale-large
 ```
 
-These targets build the normal binary, check the native tool prerequisites, and
+These targets build the normal binary, check native tool prerequisites, and
 run the verbose `TestE2ECrowdSecNativeMeasurement` binary through the same
 `E2E_SUDO` convention as `test-e2e`. The test re-executes in disposable mount,
 network, and PID namespaces, adding a user namespace for unprivileged runs,
 before creating any native objects; it never uses the host firewall. The large
-profile combines approximately 100,000
-synthetic static geo prefixes with 250,000 CrowdSec source decisions. It supplies
-authority directly, independently of the LAPI byte limit. Each profile reports
-the phases it reaches: source admission, activation preflight/apply, unchanged
-renewal, cold reconnect, and geo-refresh preflight/apply/retire/reconcile
-(including nil dynamic activation). Capacity rejection stops that profile;
-later dependent phases are not exercised. Phase timings have no performance
-assertions. Successful native execution does not establish LAPI admission for
-the equivalent JSON payload.
+profile combines approximately 100,000 synthetic static geo prefixes with
+250,000 CrowdSec source decisions. It supplies authority directly, independently
+of the LAPI response-body limit, and therefore does not establish that the
+equivalent JSON payload would be admitted by LAPI.
 
-Formatting uses `gofumpt` followed by `goimports`; `.golangci.yml` separately
-enables the `gci` import-order formatter for its diff check. The pinned
-golangci-lint policy enables `govet`, `staticcheck`, `errcheck`, `revive`,
-`gosec`, and US spelling checks. `make verify` also runs `go mod verify` and
-`govulncheck`.
-
-Unit tests run shuffled to expose ordering assumptions, while race tests run
-in a separate command. `make test` writes `coverage.out`; coverage is
-diagnostic and has no vanity threshold. Behavior-focused review of the
-[verification matrix](#verification-matrix), not coverage percentage, is the
-release gate.
-
-CodeQL scans Go on pull requests and pushes to `main`, plus its configured
-weekly schedule. Renovate currently tracks Go modules and GitHub Actions,
-including the pinned development tools; it does not track a nonexistent
-GoReleaser workflow. GitHub Actions updates must retain immutable
-commit SHAs and refresh their human-readable release comments.
+Each native profile reports only the phases it reaches: authority admission,
+activation preflight/apply, unchanged renewal, cold reconnect, and geo-refresh
+preflight/apply/retire/reconcile (including nil dynamic activation). Native
+capacity rejection stops that profile; later dependent phases are not
+exercised. Native phase timings have no performance assertions. The native
+input/inspection budgets and capacity errors are correctness boundaries, not
+implicit timing or throughput targets.
 
 ## Version 1 verification and delivery requirements
 
@@ -429,37 +450,32 @@ than one layer when the real boundary matters.
 
 ## Privileged end-to-end suite
 
-The current `tests/e2e/` suite exercises direct-global and source-backed geo
-policy on nftables and both iptables tool families in disposable Linux namespaces.
-The shared packet matrix covers country/RIR/group/ASN selectors, exclusions,
-priority, family-empty behavior, and retained policy after source failure.
-The iptables suite additionally verifies per-family compensation, crash recovery,
-backend migration, custom attachment/interface matching, original-destination
-ports, and preservation of foreign chains, rules, and ipsets.
-Prerequisites are described under [local commands](#local-commands).
-Unit/integration source tests use local HTTP servers and checked-in official
-RIPEstat responses with provenance metadata.
+The current `tests/e2e/` suite is the executable native boundary for direct
+global and source-backed geo policy on nftables and both iptables tool
+families. Its shared packet scenarios cover country/RIR/group/ASN selectors,
+exclusions, priority, family-empty behavior, and retained policy after source
+failure. Backend-specific scenarios cover iptables family compensation,
+crash recovery, migration, custom attachment/interface and
+original-destination matching, foreign-object preservation, nftables
+capacity, and runtime refresh/lease boundaries. CrowdSec scenarios cover
+startup synchronization, reload/restart handover, finite leases, overlap,
+native expiry, and ingress precedence.
 
-CrowdSec scenarios additionally verify startup synchronization, reload and
-restart handover, finite leases, overlap, native expiry, and ingress precedence
-on both backends. Native scale cases install, renew, and replace 100,000-entry
-IPv4 and IPv6 projections, including mapped-IPv6 residuals. ipset recovery
-cases interrupt static population and both sides of the resize swap, retry
-with newer authority, and reject foreign references and spare-name collisions.
-An nftables capacity case rejects an oversized combined static/dynamic inventory
-before mutation, preserves the existing packet-path decision, and verifies
-subsequent admissible replacement, renewal, removal, and owned cleanup.
-A runtime refresh case expands 100,000 source decisions into 200,000 timed
-prefixes and rejects geo growth that would prevent their renewal. It verifies
-the retained revision, packet denial, and renewal of the same absolute authority.
-Docker scenarios remain required by the matrix above.
+Run prerequisites and isolation through the [local commands](#local-commands);
+the verification matrix remains the authoritative list of required behavior.
+Unit and source-integration tests use local HTTP servers and checked-in
+official RIPEstat responses with provenance metadata. The opt-in native scale
+profiles own the large synthetic measurements described in
+[scale measurements](#opt-in-scale-measurements), rather than this section
+repeating their phase inventory.
 
-The planned separate Docker job must execute the [Docker coexistence row](#kernel-backend-and-coexistence).
-The CrowdSec compatibility job uses the pinned real supported LAPI
-rather than fixtures, with deployment and server-source review as specified in
-the [sources and compatibility matrix](#sources-and-compatibility).
-That gate also verifies admission of server-accepted mapped IPv4 addresses and
-CIDRs as IPv4 authority without rejecting unrelated decisions in the same batch.
+The real-LAPI compatibility job uses the pinned supported LAPI rather than
+fixtures, with deployment and server-source review as specified in the
+[sources and compatibility matrix](#sources-and-compatibility). It verifies
+normal chunked streaming, duplicate-prefix IDs, mapped IPv4 authority,
+incremental updates, overlap deletion, reconnect, and authoritative
+emptiness. Docker coexistence remains a planned separate job; it must execute
+the [Docker coexistence row](#kernel-backend-and-coexistence).
 
 Shared namespace, mount, fixture, cleanup, host-isolation, availability, and
 iptables-family prerequisites are the [test-isolation contract in the service
@@ -468,7 +484,7 @@ and packaging matrix](#service-and-packaging).
 ## Pull-request and branch CI
 
 The existing `.github/workflows/ci.yml` triggers for pull requests targeting
-`main` and pushes to `main`. It has three current jobs:
+`main` and pushes to `main`. It has four current jobs:
 
 - `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
   `coverage.out`.
@@ -476,20 +492,27 @@ The existing `.github/workflows/ci.yml` triggers for pull requests targeting
 - `privileged firewall E2E` installs the namespace prerequisites and runs
   `E2E_SUDO=sudo make test-e2e`, covering the nftables and both iptables tool
   families selected by the suite.
+- `real CrowdSec LAPI compatibility` runs `make test-crowdsec` against the
+  digest-pinned v1.8.1 container.
 
 The separate `.github/workflows/codeql.yml` scans Go for the same pull-request
-and `main` push events plus its weekly schedule. These workflows are the
-current executable CI gates; the matrix below remains the full first-release
-verification contract.
+and `main` push events plus its weekly schedule. Renovate tracks Go modules
+and GitHub Actions, including the pinned development tools; it does not track
+a nonexistent GoReleaser workflow. Actions updates must retain immutable
+commit SHAs and refresh their human-readable release comments. These are the
+current executable CI gates; the [verification matrix](#verification-matrix)
+remains the full first-release contract. Scale targets are opt-in, not CI gates.
 
-Before version 1, CI must also implement the matrix's Docker, pinned CrowdSec
-compatibility, package installation/upgrade, and systemd-VM gates. Listing them
-as requirements does not mean those jobs exist.
+Before version 1, CI and release orchestration must additionally implement the
+matrix's Docker coexistence, package installation/upgrade, and systemd-VM
+gates. The pinned CrowdSec compatibility gate already exists in branch CI but
+must also be included in the release workflow. Listing planned jobs as
+requirements does not mean those jobs exist.
 
 Workflow permissions are read-only by default and elevated only for a job's
-required security or artifact operation. Superseded runs for the same branch or
-pull request use concurrency cancellation. The planned release workflow must
-never cancel an earlier release because a later tag arrived.
+required security or artifact operation. Superseded CI runs for the same
+branch or pull request use concurrency cancellation. The planned release
+workflow must never cancel an earlier release because a later tag arrived.
 
 ## Release workflow
 

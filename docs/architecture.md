@@ -1,23 +1,18 @@
 # Architecture
 
-This document owns component boundaries, static revision admission, writer
-ownership, and durable recovery. Static policy and CrowdSec integration are
-implemented for both native backends; deployment extensions below remain
-first-release or future requirements.
+This document owns component boundaries, writer ownership, revision admission,
+and durable recovery for the implemented native runtimes. Service packaging and
+the [future deployment boundaries](#future-deployment-boundaries) are not
+implemented deployment options.
 
 The [implementation plan](implementation-plan.md) owns milestone status.
 [Operations](operations.md#current-source-build-runtime) describes what can run
 from a source build today.
 
-Related contracts have one canonical home:
-
-| Contract | Owner |
-| --- | --- |
-| YAML, defaults, policy evaluation, and geo classification | [Configuration](configuration.md) |
-| RIPEstat/cache and CrowdSec protocol, admission, projection, and leases | [Data sources](data-sources.md) |
-| Kernel objects, packet paths, attachment, and backend transactions | [Firewall backends](firewall-backends.md) |
-| Operator procedures, service startup protocol, installed layout, and observability | [Operations](operations.md) |
-| Verification layers, build, CI, and releases | [Development](development.md) |
+Related contracts live in [configuration](configuration.md),
+[data sources](data-sources.md), [firewall backends](firewall-backends.md),
+[operations](operations.md), and [development](development.md). The
+[documentation map](../README.md#documentation) identifies each owner.
 
 ## System context and data flow
 
@@ -57,21 +52,21 @@ Version 1 manages the host network namespace only, using the shared host
 `/var/lib/perimeterd` state and `/run/perimeterd` runtime directories. Separate
 mount views of those directories or multiple instances in that namespace are
 unsupported; a different configuration path does not create a separate owner.
+The native test harness isolates the whole process and its state in disposable
+namespaces; the daemon does not manage multiple network namespaces.
 
 Before reading mutable ownership state or invoking a backend, `run` and
 `cleanup` acquire the same nonblocking exclusive `flock` on
 `/run/perimeterd/owner.lock`. They hold its open file descriptor for their
 entire lifetime, including recovery, child commands, and shutdown draining.
-A conflict fails immediately with an actionable error. `validate` and
-`version` do not need the lock. Direct invocations create the root-owned
-runtime directory and lock with modes `0700` and `0600` when absent.
+A conflict fails immediately. `validate` and `version` do not need the lock.
+Direct invocations create the root-owned runtime directory and lock with modes
+`0700` and `0600` when absent.
 
-The lock file is never unlinked or replaced: doing so would permit a second
-process to lock a different inode. Packaging and systemd preserve the runtime
-directory across service stops, as defined in [operations](operations.md).
-Children finish before the owner releases the lock. The lifecycle lock does
-not replace the shared host xtables lock or coordinate unrelated firewall
-managers.
+The lock file is never unlinked or replaced: a new inode would allow another
+owner. Children finish before the owner releases it. The planned service/package
+lifecycle must preserve this boundary across stops. This lock neither replaces
+the host xtables lock nor coordinates unrelated firewall managers.
 
 ## Conceptual contracts
 
@@ -102,35 +97,28 @@ retained across dispatches or failure retries; durable and source-cache
 validation remain trust boundaries.
 
 Kernel packet/byte accounting is implemented; periodic collection and Prometheus
-export of those counters are planned. The collector must be an observer, not a
-policy input: it reads through the writer outside the Prometheus request path,
-never mutates rules, and does not change readiness.
-[Operations](operations.md#prometheus-metrics) owns the required 15-second cadence,
-generation-delta accumulation, monotonic process-lifetime totals, and retention
-of the last successful sample on failure.
+export are planned. The collector must observe through the writer outside the
+HTTP request path, never mutate policy, and never change readiness.
+[Operations](operations.md#prometheus-metrics) owns collection cadence, failure
+handling, and process-lifetime counter semantics.
 
 ## Revision lifecycle
 
 ### Commands
 
-- `perimeterd validate --config /etc/perimeterd/perimeterd.yaml` performs
-  strict schema parsing, defaults, and local semantic validation. It makes no
-  network request and performs no firewall mutation.
-- `perimeterd run --config /etc/perimeterd/perimeterd.yaml` acquires lifecycle
-  ownership and recovers pending transactions before reading or validating the
-  current YAML. It then obtains every required fresh or committed cached
-  prefix, reconciles, durably commits, and completes required recovery before
-  reporting readiness. CrowdSec additionally requires
-  authoritative synchronization when enabled. The
-  [bounded startup protocol](operations.md#bounded-startup-deadline) applies
-  throughout recovery and initialization.
-- `perimeterd version` reports build metadata. Population from signed release
-  tags belongs to the planned release workflow.
-- `perimeterd cleanup` acquires lifecycle ownership and reads persisted active,
-  prepared, and retired target metadata plus ownership markers, not the
-  possibly invalid current configuration. It removes every recorded owned
-  artifact from both supported backends. It is reserved for explicit operator
-  action after stopping the service and for final package removal.
+| Command | Lifecycle effect |
+| --- | --- |
+| `validate` | Parse, normalize, and validate local configuration; no source requests or firewall mutation |
+| `version` | Report build metadata; no ownership or configuration requirement |
+| `run` | Acquire ownership, recover durable state before reading current YAML, initialize required sources, reconcile and commit, then report readiness |
+| `cleanup` | Acquire ownership and remove recorded owned targets using durable metadata, without consulting current YAML |
+
+`run` needs a complete static snapshot (fresh or acceptable committed cache) and
+authoritative CrowdSec synchronization when enabled. The
+[bounded startup protocol](operations.md#bounded-startup-deadline) covers
+recovery and initialization. Explicit cleanup is for operator action after
+stopping the daemon, or eventual final package removal. See
+[operations](operations.md#operator-sequence) for commands and prerequisites.
 
 ### Signals and shutdown
 
@@ -144,21 +132,21 @@ deadline. This is not indefinite fail-closed ban retention. Only explicit
 
 ### Staged reload
 
-A reload is a candidate revision until every stage succeeds. Static staging,
-CrowdSec synchronization, and dynamic-store capture share this lifecycle.
+Reload admission does not select a revision. Candidate resources remain separate
+until the durable commit:
 
 1. Admit a new request epoch, then parse and strictly validate the complete file.
 2. Resolve selectors using acceptable cache entries and required network
    fetches, then compile immutable policy state.
 3. Bind any replacement metrics listener and fully synchronize a replacement
    CrowdSec client into a separate staged store without retiring active resources.
-4. At the writer boundary, reject stale candidates, capture the selected dynamic
-   store, and durably prepare the transaction described below.
-5. Apply the complete desired firewall state under the selected backend's
-   transaction guarantees.
-6. Durably commit the active record, then publish the revision and promote its
-   staged resources. Retire old clients/listeners and collect retired firewall
-   objects only after that commit.
+4. At the writer boundary, reject stale candidates, select current dynamic
+   authority, and preflight the complete candidate without mutation.
+5. Durably prepare the transaction, then apply under the backend's transaction
+   guarantees.
+6. Durably commit the active record. Only then may the candidate's runtime
+   resources be published and previous clients, listeners, and firewall objects
+   be retired.
 
 Any failure before mutation closes candidate resources and leaves the active
 revision untouched. nftables packet-path switches are atomic; iptables commits
@@ -166,8 +154,8 @@ each address family separately and compensates on failure. Successful rollback
 restores the previous selection but cannot erase a transient mixed-generation
 window. Failed rollback or uncertain persistence enters degraded recovery:
 the last committed revision remains recorded, but it is not claimed to describe
-actual enforcement. No new candidate or source delta may mutate the firewall
-until recovery succeeds. Counter reads and explicit cleanup remain available.
+actual enforcement. Normal candidate and source-delta writes are fenced until
+recovery succeeds; recovery and explicit cleanup retain mutation authority.
 See [firewall backends](firewall-backends.md#failure-and-cleanup-behavior).
 
 Runtime resources follow the durable selection, not merely the last attempted
@@ -224,36 +212,35 @@ activation waits for the same durable commit as the static candidate.
 
 ### Prepared state
 
-All static reconciles, target migrations, and explicit cleanup use a versioned
-write-ahead journal under `/var/lib/perimeterd`. Before the first mutation,
-write and `fsync` the referenced immutable state, then publish the journal
-using the durable record recipe below. No unjournaled target may be created.
-The journal records:
+Static reconciles, target migrations, and explicit cleanup use versioned,
+checksummed durable records. Before mutation, sync the referenced immutable
+state and publish the journal using the durable-write recipe below. No
+unjournaled target may be created.
 
-- transaction identity, operation, and phase;
-- previous and candidate backend, table, attachment and generation identities;
-- previous and candidate nftables base-chain hook definitions, including
-  priority, type, policy, ownership and rule references, when hooks change;
-- exact ownership markers and the owned objects to create, retain, or remove;
-- previous and candidate validated configuration and compiled static state;
-- immutable prefix snapshot manifest identities; and
-- recovery progress, including switched iptables families.
+| Record | Responsibility |
+| --- | --- |
+| Owner record | Persistent identity used to validate owned native objects |
+| Immutable revision | Validated configuration and config path, compiled target/generation, snapshot manifest, and admission epoch |
+| Journal | Transaction identity, operation/phase, previous and candidate revision/manifest references, and observed iptables family selections |
+| Active record | The ID of the selected immutable revision |
 
-Persist configuration paths and source identity, never credential contents.
-CrowdSec decisions are not a durable cache:
-surviving kernel entries retain only their remaining leases, and authoritative
-LAPI synchronization rebuilds the store before readiness after restart. Static
-rollback restores prior dynamic-set references without resetting timeouts.
-Live renewal follows the [source lease contract](data-sources.md) and never
-extends a decision deadline. If kernel state was lost on reboot, source
-initialization must succeed before a complete initial reconcile.
+The journal's referenced revisions retain the full ownership and target metadata,
+including nftables hook definitions when priority changes. Family progress helps
+recovery inspect interrupted work; it is not the commit point.
+
+Persist credential locations and source identity, never credential contents or
+CrowdSec decisions. Recovery restores dynamic-container references without
+resetting surviving leases. Fresh LAPI synchronization rebuilds authority before
+readiness; after reboot, lost kernel entries are not reconstructed from a disk
+decision cache. [Data sources](data-sources.md#crowdsec-stream) owns live
+projection, renewal, and outage behavior.
 
 ### Durable record publication
 
-Keep the previous generations and snapshot manifest reachable until durable
-commit. After every required packet-path switch succeeds, prepare one active
-record containing the transaction ID, target/generation, configuration,
-compiled state, and snapshot manifest ID.
+Keep previous generations and snapshot manifests reachable until commit.
+After every required packet-path switch succeeds, publish `active.json` naming
+the candidate's immutable revision. The revision—not the small active record—
+contains the configuration, compiled target, and manifest identity.
 
 Publishing this active record, and every journal replacement, uses the same
 ordered durable-write recipe:
@@ -350,7 +337,7 @@ describes the overlapping enforcement.
 
 The last-known-good revision remains authoritative when a candidate is unsafe:
 
-- Unknown or invalid configuration never enters the writer.
+- Invalid configuration never authorizes kernel mutation.
 - An incomplete source snapshot is an error, never an empty selector result.
 - A missing parent chain required by the candidate fails preflight. A missing
   obsolete custom parent does not prevent removal of remaining owned artifacts.
@@ -360,8 +347,10 @@ The last-known-good revision remains authoritative when a candidate is unsafe:
   nor a successful RIPEstat response fails before any new policy mutation.
 - A rejected reload leaves the prior revision running; apply/recovery failures
   follow the backend-specific guarantees rather than claiming universal atomicity.
-- Refresh failure retains cached prefixes and the active rules. Logs and
-  metrics expose the error and snapshot age; the normal schedule retries.
+- Refresh failure retains cached prefixes and active rules. Current logs report
+  errors and the timestamp gauge reports the oldest retrieval time in the
+  committed snapshot. Richer source health metrics remain planned. The normal
+  schedule retries.
 
 The [CrowdSec contract](data-sources.md#crowdsec-stream) additionally
 retains failed deltas in the authoritative in-memory store and retries them
