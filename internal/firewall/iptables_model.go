@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/perimeterd/perimeterd/internal/config"
@@ -33,9 +34,12 @@ type iptChain struct {
 }
 
 type iptSet struct {
-	Name     string
-	Family   policy.Family
-	Prefixes []netip.Prefix
+	Name              string
+	Family            policy.Family
+	Prefixes          []netip.Prefix
+	Dynamic           bool
+	DynamicProjection bool
+	Timed             []policy.TimedPrefix
 }
 
 type iptAttachment struct {
@@ -63,6 +67,25 @@ func iptSetName(target *Target, family policy.Family, setID string) string {
 	identity := strings.Join([]string{"set", owner, generation, familyToken(family), setID}, "\x00")
 	digest := sha256.Sum256([]byte(identity))
 	return "pd" + familyToken(family) + "s" + hex.EncodeToString(digest[:iptSetDigestBytes])
+}
+
+// iptDynamicSetName derives a complete 31-byte identity from all ownership
+// inputs. Dynamic generations are independent from static generations so a
+// static refresh cannot silently replace a live lease container.
+func iptDynamicSetName(target *Target, family policy.Family) string {
+	owner, generation := "", ""
+	if target != nil {
+		owner, generation = target.Owner, target.DynamicGeneration
+	}
+	identity := strings.Join([]string{"dynamic", owner, generation, familyToken(family), "crowdsec"}, "\x00")
+	digest := sha256.Sum256([]byte(identity))
+	return "pd" + familyToken(family) + "d" + hex.EncodeToString(digest[:iptSetDigestBytes])
+}
+
+// The spare has the same complete owner/generation/family identity as the live
+// set, but a distinct role byte. It is never referenced by packet-path rules.
+func iptDynamicSpareName(live string) string {
+	return live[:4] + "r" + live[5:]
 }
 
 func iptChainName(identity string) string {
@@ -203,10 +226,21 @@ func validateIPTablesTarget(target *Target) error {
 			continue
 		}
 		for _, set := range family.Sets {
-			if set.Kind != policy.StaticSet {
+			var name, identity string
+			switch set.Kind {
+			case policy.StaticSet:
+				name = iptSetName(target, family.Family, set.ID)
+				identity = "set/" + familyToken(family.Family) + "/" + set.ID
+			case policy.DynamicCrowdSecSet:
+				name = iptDynamicSetName(target, family.Family)
+				identity = "dynamic/" + familyToken(family.Family) + "/" + set.ID
+				if err := addNative(iptDynamicSpareName(name), identity+"/resize", maxIPTSetNameBytes); err != nil {
+					return err
+				}
+			default:
 				continue
 			}
-			if err := addNative(iptSetName(target, family.Family, set.ID), "set/"+familyToken(family.Family)+"/"+set.ID, maxIPTSetNameBytes); err != nil {
+			if err := addNative(name, identity, maxIPTSetNameBytes); err != nil {
 				return err
 			}
 		}
@@ -225,6 +259,7 @@ func validateIPTablesTarget(target *Target) error {
 				}
 			}
 			staging := iptGenerationChainName(target, family.Family, attachmentDirection(attachment), attachment.OriginalDestination)
+
 			if err := addNative(staging, "staging/"+familyToken(family.Family)+"/"+string(attachment.Direction)+"/"+strconv.FormatBool(attachment.OriginalDestination), maxIPTChainNameBytes); err != nil {
 				return err
 			}
@@ -238,6 +273,41 @@ func attachmentDirection(attachment config.Attachment) policy.Direction {
 		return policy.Egress
 	}
 	return policy.Ingress
+}
+
+func loweredIPTTimedPrefixes(values []policy.TimedPrefix, family policy.Family) []policy.TimedPrefix {
+	seen := make(map[netip.Prefix]struct{}, len(values))
+	result := make([]policy.TimedPrefix, 0, len(values))
+	appendPrefix := func(prefix netip.Prefix, deadline time.Time) {
+		prefix = prefix.Masked()
+		if _, exists := seen[prefix]; exists {
+			return
+		}
+		seen[prefix] = struct{}{}
+		result = append(result, policy.TimedPrefix{Prefix: prefix, Deadline: deadline})
+	}
+	for _, value := range values {
+		if !value.Prefix.IsValid() || (family == policy.IPv4 && !value.Prefix.Addr().Is4()) ||
+			(family == policy.IPv6 && !value.Prefix.Addr().Is6()) {
+			continue
+		}
+		if value.Prefix.Bits() == 0 {
+			if family == policy.IPv4 {
+				appendPrefix(netip.MustParsePrefix("0.0.0.0/1"), value.Deadline)
+				appendPrefix(netip.MustParsePrefix("128.0.0.0/1"), value.Deadline)
+			} else {
+				appendPrefix(netip.MustParsePrefix("::/1"), value.Deadline)
+				appendPrefix(netip.MustParsePrefix("8000::/1"), value.Deadline)
+			}
+			continue
+		}
+		appendPrefix(value.Prefix, value.Deadline)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Prefix.Addr().Compare(result[j].Prefix.Addr()) < 0 ||
+			(result[i].Prefix.Addr() == result[j].Prefix.Addr() && result[i].Prefix.Bits() < result[j].Prefix.Bits())
+	})
+	return result
 }
 
 func loweredIPTPrefixes(values []netip.Prefix, family policy.Family) ([]netip.Prefix, error) {
@@ -323,10 +393,30 @@ func buildIPTFamily(target *Target, family policy.Family) (iptFamilyModel, error
 	sort.SliceStable(sets, func(i, j int) bool { return sets[i].ID < sets[j].ID })
 	setNames := make(map[string]string, len(sets))
 	for _, set := range sets {
-		if set.Kind != policy.StaticSet {
-			return model, fmt.Errorf("iptables model: set %q is not static", set.ID)
+		dynamic := set.Kind == policy.DynamicCrowdSecSet
+		if !dynamic && set.Kind != policy.StaticSet {
+			return model, fmt.Errorf("iptables model: set %q has unsupported kind %q", set.ID, set.Kind)
 		}
-		prefixes, err := loweredIPTPrefixes(set.Prefixes, family)
+		var prefixes []netip.Prefix
+		var timed []policy.TimedPrefix
+		if dynamic {
+			name := iptDynamicSetName(target, family)
+			if target.Dynamic != nil {
+				if err := ValidateDynamic(target.Dynamic.Prefixes); err != nil {
+					return model, err
+				}
+				timed = loweredIPTTimedPrefixes(target.Dynamic.Prefixes, family)
+				prefixes = make([]netip.Prefix, 0, len(timed))
+				for _, value := range timed {
+					prefixes = append(prefixes, value.Prefix)
+				}
+			}
+			model.Sets = append(model.Sets, iptSet{Name: name, Family: family, Prefixes: prefixes, Dynamic: true, DynamicProjection: target.Dynamic != nil, Timed: timed})
+			setNames[set.ID] = name
+			continue
+		}
+		var err error
+		prefixes, err = loweredIPTPrefixes(set.Prefixes, family)
 		if err != nil {
 			return model, fmt.Errorf("iptables model: set %q: %w", set.ID, err)
 		}

@@ -8,8 +8,8 @@ native kernel behavior. The [implementation plan](implementation-plan.md) is
 authoritative for delivery status.
 
 > **Status boundary.** The source-build instructions in this document describe
-> what runs today. The installed package, systemd, CrowdSec, Docker-specific
-> coexistence, and release sections are first-release contracts that remain
+> what runs today. The installed package, systemd, Docker-specific coexistence,
+> and release sections are first-release contracts that remain
 > planned. A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
@@ -23,12 +23,13 @@ The current binary implements:
 - direct global address lists and RIPEstat country/ASN snapshots, with local
   RIR and built-in/custom group expansion;
 - immutable source snapshots, refresh, cache fallback, durable revision/journal
-  recovery, backend and target migration, and custom iptables attachments; and
-- native processed and terminal-denial packet/byte accounting plus the
-  enforcement-health signal.
+  recovery, backend and target migration, and custom iptables attachments;
+- CrowdSec ingress bans with authoritative synchronization, expiry, renewable
+  kernel leases, and staged credential/endpoint replacement; and
+- native processed and terminal-denial packet/byte accounting plus enforcement
+  health and CrowdSec connection gauges.
 
-The current runtime rejects `crowdsec.enabled: true`. Docker-specific
-coexistence is not a verified runtime milestone; the `DOCKER-USER` material in
+Docker-specific coexistence is not a verified runtime milestone; the `DOCKER-USER` material in
 [firewall backends](firewall-backends.md#docker-docker-user-attachment) is
 planned guidance, not a support claim. Offline validation intentionally accepts
 the complete version-1 schema, including fields for these planned integrations.
@@ -74,8 +75,8 @@ sudo bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
 `validate` is local-only: it parses the YAML and performs schema and semantic
 checks without reading credentials, resolving selectors, contacting RIPEstat,
 or touching firewall state. A successful validation therefore does not prove
-that source data or native backend tools are available, and it does not enable
-CrowdSec.
+that source data, credentials, LAPI compatibility, or native backend tools are
+available. Only `run` can synchronize and enforce CrowdSec decisions.
 
 The minimum direct-rule configuration below is suitable for a disposable test
 (the address is only an example):
@@ -105,7 +106,8 @@ and immutable prefix snapshots, and `/run/perimeterd/owner.lock` for the
 lifecycle lock. The runtime creates missing directories when invoked as root.
 Do not delete either path, its records, or the lock inode to bypass recovery or
 ownership checks. A committed static policy remains in the kernel after a
-normal stop; dynamic integrations are not enabled by the current runtime.
+normal stop. CrowdSec entries retain only their remaining finite kernel lease;
+without the daemon, they can expire before the original decision deadline.
 
 Source-backed candidates carry immutable, content-addressed manifests under
 `/var/lib/perimeterd/prefixes/`; the committed revision selects its manifest.
@@ -125,12 +127,25 @@ the normal schedule.
 
 State and native-input limits are safety fences, not tuning knobs. Encoded
 state is limited to 16 MiB. nftables preflight requires each complete target to
-fit the 8 MiB installation limit and budgets inspection of both retained
+fit the 32 MiB installation limit and budgets inspection of both retained
 generations at 48 MiB per table. iptables/ipset command input is limited to
-16 MiB per batch; preflight reserves retained-generation and complete-rule
-inventory capacity within a 48 MiB budget. Each backend captures at most 64 MiB
-of native output per command, and selected ipset contents share that cap.
+16 MiB per invocation; ipset restore streams are split at command boundaries
+without reordering population and swaps. The aggregate ipset target may exceed
+one invocation's limit. Preflight reserves retained-generation and complete-rule
+inventory capacity within a 48 MiB budget. ipset accounting includes finite
+timeout fields and the live/spare peak during resizing; in-place replacements
+do not reserve a duplicate live set or an unused spare. Each backend captures
+at most 64 MiB of native output per command, and selected ipset contents share
+that cap.
 Oversized candidates are rejected before replacing the committed revision.
+CrowdSec nftables updates also budget the retained native contents together
+with the replacement dynamic contents before mutation. Replaced elements are
+not counted twice during renewal. An oversized update leaves the existing
+kernel enforcement unchanged rather than making the table uninspectable.
+Static refresh admission includes the current CrowdSec projection even when
+activation preserves the same dynamic generation. A refresh must not select
+static contents that prevent renewal of already-admitted authority. The
+capacity-only projection is neither applied nor persisted by that refresh.
 
 ## Operator sequence
 
@@ -171,9 +186,11 @@ before the first firewall commit; the default is loopback-only
 startup protocol. `GET /metrics` is unauthenticated, so expose a non-loopback
 address only behind suitable network access control.
 
-The current endpoint emits `perimeterd_enforcement_health` and, for an active
-source-backed revision,
-`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. Native
+The current endpoint emits `perimeterd_enforcement_health`,
+`perimeterd_crowdsec_connected`, and, for an active source-backed revision,
+`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The CrowdSec
+connection gauge is zero when disabled or awaiting a valid synchronization;
+LAPI unavailability does not extend retained decisions. Native
 processed and terminal-denial counters are available through the selected
 backend's owned counter objects; their semantics and inspection paths are in
 [Packet and byte accounting](firewall-backends.md#packet-and-byte-accounting).
@@ -200,27 +217,32 @@ ownership, and degraded-recovery behavior are defined in
 
 ## Supported CrowdSec LAPI prerequisite
 
-**Planned integration.** The current runtime rejects CrowdSec enablement. Before
-this integration can be released, the operator must install and verify the
-reviewed CrowdSec v1.7.6 LAPI deployment described by the [supported LAPI
-contract](data-sources.md#supported-lapi-contract). A future CrowdSec version
-requires compatibility review before use.
+**Implemented source-build integration.** CrowdSec LAPI v1.8.1 is the
+supported baseline, using its normal chunked decision stream. No
+`chunked_decisions_stream` feature-flag changes or older-server pin are
+required. See the [supported LAPI contract](data-sources.md#supported-lapi-contract).
 
-The planned prerequisite requires `chunked_decisions_stream` to be disabled in
-both locations on the CrowdSec host:
+Routine polls fetch incremental additions and deletions, not the full active
+blocklist. Full snapshots are reserved for initial synchronization, reconnect,
+and staged client replacement, including credential or endpoint reloads.
+This avoids repeatedly downloading external blocklists with around 100,000
+IPs/CIDRs.
 
-- set `CROWDSEC_FEATURE_CHUNKED_DECISIONS_STREAM=false` in the `crowdsec`
-  process environment; and
-- omit `- chunked_decisions_stream` from `ConfigDir/feature.yaml` (normally
-  `/etc/crowdsec/feature.yaml`).
+The known upstream database-query error behavior is accepted temporarily:
+a successful-looking empty or partial full snapshot may remove CrowdSec bans.
+Restoration may require a later full synchronization; static global and geo
+policy are unaffected. This is tracked in
+[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691),
+not worked around or tested as a compatibility blocker in perimeterd.
 
-An environment value of `false` does not override a YAML list entry that enables
-the feature. Inspect both locations, restart CrowdSec after changing either,
-and inspect the new process's effective environment and loaded feature
-configuration. This is an operator-checked prerequisite, not a capability that
-perimeterd can attest remotely. Local `validate`, successful authentication,
-HTTP status, or response-envelope validation cannot prove the remote version,
-feature state, or complete stream contract.
+Register a bouncer in that LAPI deployment and place its API key in a
+root-readable credential file. Configure `crowdsec.enabled: true`, `lapi_url`,
+and `api_key_file`, then run or reload the daemon. Initial synchronization
+must succeed before readiness. A same-path key rotation is reread on `SIGHUP`;
+a failed replacement retains the old authenticated client and its bans.
+The default incremental poll interval is `10s`; request deadlines are at most
+`30s`, and failures back off independently of local expiry and lease renewal.
+No decision snapshot or key contents are written into durable revisions.
 
 ## Lifecycle lock and recovery
 
@@ -332,7 +354,7 @@ The planned unit must not use `ExecStartPre=validate`: `run` must recover
 persisted state before reading current YAML. It must extend the activation
 window while bounded startup proceeds and send `READY=1` only after recovery,
 source resolution, backend validation, initial reconcile, durable commit, and
-any required planned CrowdSec synchronization. `READY=1` is not a revocable
+any required CrowdSec synchronization. `READY=1` is not a revocable
 health assertion; operators must also monitor the enforcement-health metric.
 
 ### Bounded startup deadline

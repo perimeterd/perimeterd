@@ -12,10 +12,11 @@ import (
 // metricsServer owns a staged metrics listener. Binding is performed before a
 // firewall commit; serving and promotion happen only after that commit.
 type metricsServer struct {
-	listen string
-	ln     net.Listener
-	server *http.Server
-	errCh  chan error
+	listen         string
+	ln             net.Listener
+	server         *http.Server
+	errCh          chan error
+	crowdConnected func() bool
 }
 
 func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int64) (*metricsServer, error) {
@@ -29,6 +30,7 @@ func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int
 	if err != nil {
 		return nil, fmt.Errorf("bind metrics %q: %w", listen, err)
 	}
+	var metrics *metricsServer
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -46,11 +48,18 @@ func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int
 				_, _ = fmt.Fprintf(writer, "# HELP perimeterd_prefix_snapshot_timestamp_seconds Oldest retrieval time in the committed prefix snapshot.\n# TYPE perimeterd_prefix_snapshot_timestamp_seconds gauge\nperimeterd_prefix_snapshot_timestamp_seconds{source=\"ripestat\"} %d\n", stamp)
 			}
 		}
+		if metrics != nil && metrics.crowdConnected != nil {
+			value := 0
+			if metrics.crowdConnected() {
+				value = 1
+			}
+			_, _ = fmt.Fprintf(writer, "# HELP perimeterd_crowdsec_connected Whether the CrowdSec client has a valid connection.\n# TYPE perimeterd_crowdsec_connected gauge\nperimeterd_crowdsec_connected %d\n", value)
+		}
 	})
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		http.NotFound(writer, request)
 	})
-	return &metricsServer{
+	metrics = &metricsServer{
 		listen: listen,
 		ln:     ln,
 		errCh:  make(chan error, 1),
@@ -61,7 +70,8 @@ func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int
 			WriteTimeout:      10 * time.Second,
 			IdleTimeout:       30 * time.Second,
 		},
-	}, nil
+	}
+	return metrics, nil
 }
 
 func (m *metricsServer) serve() {

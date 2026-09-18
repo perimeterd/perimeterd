@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/policy"
@@ -35,6 +36,8 @@ type Outcome struct {
 // The lifecycle owner must hold the state lock for the whole engine lifetime.
 type Engine struct {
 	mu         sync.Mutex
+	applyMu    sync.Mutex
+	crowd      *crowdRuntime
 	store      *state.Store
 	backend    firewall.Backend
 	checkpoint func(string) error
@@ -50,6 +53,7 @@ type Engine struct {
 // admissions; health is therefore initially false.
 func NewEngine(store *state.Store, backend firewall.Backend, checkpoint func(string) error) *Engine {
 	engine := &Engine{store: store, backend: backend, checkpoint: checkpoint}
+	engine.crowd = newCrowdRuntime(engine)
 	if backend == nil {
 		engine.backend = firewall.NewNative(func(family policy.Family, generation string) error {
 			if err := store.RecordFamilySelection(family, generation); err != nil {
@@ -63,6 +67,15 @@ func NewEngine(store *state.Store, backend firewall.Backend, checkpoint func(str
 		})
 	}
 	return engine
+}
+
+func (e *Engine) applyBackendLocked(ctx context.Context, previous, candidate *firewall.Target) error {
+	if (previous != nil && previous.DynamicGeneration != "") || (candidate != nil && candidate.DynamicGeneration != "") {
+		if _, err := e.crowd.nextOperationLocked(); err != nil {
+			return err
+		}
+	}
+	return e.backend.Apply(ctx, previous, candidate)
 }
 
 // Admit reserves a monotonically increasing request epoch. Admission itself is
@@ -126,16 +139,31 @@ func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+	selected, stageErr := e.crowd.stageForApply(ctx, candidate)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	outcome, err := e.applyLocked(ctx, candidate)
+	e.crowd.grantAt = time.Time{}
+	if stageErr != nil {
+		outcome := Outcome{Degraded: e.degraded()}
+		e.crowd.finishApplyLocked(outcome, selected)
+		return outcome, stageErr
+	}
+	if candidate.refresh != 0 {
+		// A reconnect may have replaced the source epoch between staging and
+		// acquisition of the writer fence. Refresh always uses live authority.
+		selected = e.crowd.active
+	}
+	outcome, err := e.applyLocked(ctx, candidate, selected)
+	e.crowd.finishApplyLocked(outcome, selected)
 	if outcome.Committed && outcome.Active != nil {
 		e.adoptActiveEpochLocked(outcome.Active)
 	}
 	return outcome, err
 }
 
-func (e *Engine) applyLocked(ctx context.Context, candidate Candidate) (Outcome, error) {
+func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected *crowdState) (Outcome, error) {
 	if err := e.startErrorLocked(ctx); err != nil {
 		return Outcome{Degraded: e.degraded()}, err
 	}
@@ -166,10 +194,33 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate) (Outcome,
 	if err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
-	if err := firewall.ValidateTarget(candidateTarget); err != nil {
+	var dynamic *firewall.DynamicState
+	if candidate.cfg.CrowdSec.Enabled {
+		if selected == nil || selected.store == nil {
+			return Outcome{Active: previous}, errors.New("CrowdSec activation was not synchronized")
+		}
+		if selected != e.crowd.active {
+			candidateTarget.DynamicGeneration = transaction
+			candidateTarget.Generation = transaction
+		}
+		dynamic = &firewall.DynamicState{Prefixes: selected.store.Projection(time.Now())}
+		if previousTarget == nil || candidateTarget.DynamicGeneration != previousTarget.DynamicGeneration {
+			candidateTarget.Dynamic = dynamic
+		}
+	}
+	// Admission must include the authority that a refresh preserves. Keep the
+	// activation target unchanged: a shared dynamic generation must not be
+	// rewritten or have its lease-renewal clock rebased by a static refresh.
+	preflightTarget := candidateTarget
+	if dynamic != nil && candidateTarget.Dynamic == nil {
+		capacityTarget := *candidateTarget
+		capacityTarget.Dynamic = dynamic
+		preflightTarget = &capacityTarget
+	}
+	if err := firewall.ValidateTarget(preflightTarget); err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
-	if err := e.backend.Preflight(ctx, previousTarget, candidateTarget); err != nil {
+	if err := e.backend.Preflight(ctx, previousTarget, preflightTarget); err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
 	candidateRevision := &state.Revision{
@@ -182,13 +233,18 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate) (Outcome,
 		Manifest:        candidate.snapshot.ManifestID(),
 		RefreshSequence: candidate.refresh,
 	}
+	e.crowd.transaction = transaction
+	e.crowd.staged = selected
 	if err := e.store.Prepare(previous, candidateRevision); err != nil {
 		return e.failLocked(err)
 	}
 	if err := e.check("after-prepare"); err != nil {
 		return e.rollbackLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
 	}
-	if err := e.backend.Apply(ctx, previousTarget, candidateTarget); err != nil {
+	if candidateTarget != nil && candidateTarget.Dynamic != nil {
+		e.crowd.grantAt = time.Now()
+	}
+	if err := e.applyBackendLocked(ctx, previousTarget, candidateTarget); err != nil {
 		return e.rollbackLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
 	}
 	if err := e.check("after-switch"); err != nil {
@@ -229,7 +285,7 @@ func (e *Engine) rollbackLocked(ctx context.Context, previous, candidate *state.
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, original
 	}
-	if err := e.backend.Apply(ctx, candidateTarget, previousTarget); err != nil {
+	if err := e.applyBackendLocked(ctx, candidateTarget, previousTarget); err != nil {
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, errors.Join(original, fmt.Errorf("restore previous firewall target: %w", err))
 	}
@@ -305,11 +361,24 @@ func (e *Engine) failLocked(err error) (Outcome, error) {
 // Recover resolves persisted transactions before configuration is read. It
 // uses only the observed active record, journal, and complete target metadata.
 func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	revision, err := e.recoverLocked(ctx)
+	if err == nil {
+		err = e.crowd.recoverLocked(ctx, revision)
+	}
+	if err != nil {
+		e.healthy.Store(false)
+	}
+	return revision, err
+}
+
+func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 	if e.closing.Load() {
 		return nil, errEngineClosed
 	}
@@ -339,7 +408,7 @@ func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
 		if err := e.store.Prepare(view.Active, view.Active); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		if err := e.backend.Apply(ctx, targetOf(view.Active), targetOf(view.Active)); err != nil {
+		if err := e.applyBackendLocked(ctx, targetOf(view.Active), targetOf(view.Active)); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		if err := e.store.MarkPhase("switched"); err != nil {
@@ -389,7 +458,7 @@ func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
 	}
 	prevTarget, candidateTarget := targetOf(previous), targetOf(candidate)
 	if view.Active != nil && view.Active.ID == journal.ID {
-		if err := e.backend.Apply(ctx, prevTarget, candidateTarget); err != nil {
+		if err := e.applyBackendLocked(ctx, prevTarget, candidateTarget); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		if err := e.store.Commit(candidate); err != nil {
@@ -408,7 +477,7 @@ func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
 		e.adoptActiveEpochLocked(candidate)
 		return candidate, nil
 	}
-	if err := e.backend.Apply(ctx, candidateTarget, prevTarget); err != nil {
+	if err := e.applyBackendLocked(ctx, candidateTarget, prevTarget); err != nil {
 		return nil, e.recoveryFailureLocked(err)
 	}
 	if err := e.backend.Retire(ctx, candidateTarget, prevTarget); err != nil {
@@ -480,16 +549,21 @@ func (e *Engine) Cleanup(ctx context.Context) error {
 // Healthy reports the current enforcement health without waiting for the
 // serialized writer.
 func (e *Engine) Healthy() bool {
-	return e.healthy.Load()
+	return e.healthy.Load() && e.crowd.enforced.Load()
 }
 
 // Close fences all future admissions and waits for any in-flight writer call
 // before the lifecycle lock can be released by the service.
 func (e *Engine) Close() {
 	e.closing.Store(true)
+	e.crowd.cancel()
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
 	e.mu.Lock()
+	e.crowd.closeLocked()
 	e.healthy.Store(false)
 	e.mu.Unlock()
+	e.crowd.workers.Wait()
 }
 
 func (e *Engine) startErrorLocked(ctx context.Context) error {
@@ -506,7 +580,7 @@ func (e *Engine) startErrorLocked(ctx context.Context) error {
 }
 
 func (e *Engine) degraded() bool {
-	return !e.healthy.Load()
+	return !e.Healthy()
 }
 
 func (e *Engine) recoveryFailureLocked(err error) error {

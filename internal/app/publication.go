@@ -55,6 +55,9 @@ func (p *runtimePublication) reserve(result stageResult) error {
 		if err != nil {
 			return err
 		}
+		if staged != nil {
+			staged.crowdConnected = p.engine.CrowdSecConnected
+		}
 	}
 	p.reservation = &runtimeReservation{
 		staged:     staged,

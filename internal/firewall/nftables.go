@@ -16,7 +16,7 @@ import (
 
 const (
 	maxNFTOutput          = 64 << 20
-	maxNFTInput           = 8 << 20
+	maxNFTInput           = 32 << 20
 	maxNFTInventoryBudget = 48 << 20
 )
 
@@ -69,7 +69,7 @@ func validateNFTCapacity(targets ...*Target) error {
 		if len(data) > maxNFTInput {
 			return errors.New("nft backend: complete target exceeds input limit")
 		}
-		budgets[target.Table] += 2*len(data) + 1024*len(batch.Nftables) + 4096
+		budgets[target.Table] += nftInspectionBudget(len(data), len(batch.Nftables))
 		if budgets[target.Table] > maxNFTInventoryBudget {
 			return errors.New("nft backend: retained generations exceed inspection capacity")
 		}
@@ -77,21 +77,27 @@ func validateNFTCapacity(targets ...*Target) error {
 	return nil
 }
 
+func nftInspectionBudget(encodedBytes, commands int) int {
+	return 2*encodedBytes + 1024*commands + 4096
+}
+
 type nftObject struct {
-	Kind    string
-	Family  string
-	Table   string
-	Name    string
-	Chain   string
-	Comment string
-	Type    string
-	Hook    string
-	Policy  string
-	Prio    int32
-	HasPrio bool
-	Expr    []json.RawMessage
-	Elem    json.RawMessage
-	Flags   []string
+	Kind       string
+	Family     string
+	Table      string
+	Name       string
+	Chain      string
+	Comment    string
+	Type       string
+	Hook       string
+	Policy     string
+	Prio       int32
+	HasPrio    bool
+	Expr       []json.RawMessage
+	Elem       json.RawMessage
+	Flags      []string
+	Timeout    json.RawMessage
+	HasTimeout bool
 }
 
 type baseDefinition struct {
@@ -102,12 +108,13 @@ type baseDefinition struct {
 }
 
 type nftInventory struct {
-	present  bool
-	table    nftObject
-	chains   map[string]nftObject
-	sets     map[string]nftObject
-	counters map[string]nftObject
-	rules    []nftObject
+	present   bool
+	sizeBytes int
+	table     nftObject
+	chains    map[string]nftObject
+	sets      map[string]nftObject
+	counters  map[string]nftObject
+	rules     []nftObject
 }
 
 func newNFTInventory() *nftInventory {
@@ -161,19 +168,20 @@ func (n *NFT) listTables(ctx context.Context) ([]nftObject, error) {
 	return decodeNFTObjects(data)
 }
 
-func (n *NFT) listTable(ctx context.Context, table string) ([]nftObject, error) {
+func (n *NFT) listTable(ctx context.Context, table string) ([]nftObject, int, error) {
 	request := map[string]any{"nftables": []any{
 		map[string]any{"list": map[string]any{"table": map[string]any{"family": "inet", "name": table}}},
 	}}
 	input, err := json.Marshal(request)
 	if err != nil {
-		return nil, fmt.Errorf("nft backend: encode list-table request: %w", err)
+		return nil, 0, fmt.Errorf("nft backend: encode list-table request: %w", err)
 	}
 	data, err := n.run(ctx, []string{"-j", "-f", "-"}, input)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return decodeNFTObjects(data)
+	objects, err := decodeNFTObjects(data)
+	return objects, len(data), err
 }
 
 func (n *NFT) inspect(ctx context.Context, table string, targets ...*Target) (*nftInventory, error) {
@@ -195,10 +203,11 @@ func (n *NFT) inspect(ctx context.Context, table string, targets ...*Target) (*n
 	if !inventory.present {
 		return inventory, nil
 	}
-	objects, err := n.listTable(ctx, table)
+	objects, sizeBytes, err := n.listTable(ctx, table)
 	if err != nil {
 		return nil, err
 	}
+	inventory.sizeBytes = sizeBytes
 	for _, object := range objects {
 		switch object.Kind {
 		case "table":
@@ -301,6 +310,7 @@ func decodeNFTObject(kind string, raw json.RawMessage) (nftObject, error) {
 		Expr    []json.RawMessage `json:"expr"`
 		Elem    json.RawMessage   `json:"elem"`
 		Flags   []string          `json:"flags"`
+		Timeout json.RawMessage   `json:"timeout"`
 	}
 	switch kind {
 	case "table", "chain", "set", "counter", "rule", "element":
@@ -315,7 +325,8 @@ func decodeNFTObject(kind string, raw json.RawMessage) (nftObject, error) {
 	}
 	object.Family, object.Table, object.Name, object.Chain = common.Family, common.Table, common.Name, common.Chain
 	object.Comment, object.Type, object.Hook, object.Policy, object.Expr, object.Elem = common.Comment, common.Type, common.Hook, common.Policy, common.Expr, common.Elem
-	object.Flags = common.Flags
+	object.Flags, object.Timeout = common.Flags, common.Timeout
+	object.HasTimeout = common.Timeout != nil
 	if common.Prio != "" {
 		value, err := strconv.ParseInt(string(common.Prio), 10, 32)
 		if err != nil {
@@ -326,6 +337,150 @@ func decodeNFTObject(kind string, raw json.RawMessage) (nftObject, error) {
 	return object, nil
 }
 
+type nftDynamicElement struct {
+	interval addressInterval
+	ttl      time.Duration
+}
+
+func dynamicSetDefinition(target *Target, family policy.Family, name string) map[string]any {
+	typeName := "ipv4_addr"
+	if family == policy.IPv6 {
+		typeName = "ipv6_addr"
+	}
+	return map[string]any{
+		"family": "inet", "table": target.Table, "name": name,
+		"type": typeName, "flags": []string{"interval", "timeout"},
+	}
+}
+
+func dynamicSetMetadataComplete(object nftObject, family policy.Family) bool {
+	typeName := "ipv4_addr"
+	if family == policy.IPv6 {
+		typeName = "ipv6_addr"
+	}
+	if object.Comment != "" || object.Type != typeName || len(object.Flags) != 2 ||
+		!slices.Contains(object.Flags, "interval") || !slices.Contains(object.Flags, "timeout") {
+		return false
+	}
+	if object.HasTimeout {
+		// Dynamic leases carry their authority on each element. A set-level
+		// timeout would silently expire or make elements permanent.
+		return false
+	}
+	return true
+}
+
+func parseDynamicElement(raw json.RawMessage, family policy.Family) (nftDynamicElement, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil || len(fields) != 1 {
+		return nftDynamicElement{}, errors.New("nft backend: dynamic element is not an object")
+	}
+	elemRaw, ok := fields["elem"]
+	if !ok {
+		return nftDynamicElement{}, errors.New("nft backend: dynamic element is missing elem")
+	}
+	var fieldsInner map[string]json.RawMessage
+	if err := json.Unmarshal(elemRaw, &fieldsInner); err != nil || fieldsInner == nil {
+		return nftDynamicElement{}, errors.New("nft backend: dynamic element payload is malformed")
+	}
+	for key := range fieldsInner {
+		if key != "val" && key != "timeout" && key != "expires" {
+			return nftDynamicElement{}, fmt.Errorf("nft backend: unknown dynamic element field %q", key)
+		}
+	}
+	valueRaw, hasValue := fieldsInner["val"]
+	timeoutRaw, hasTimeout := fieldsInner["timeout"]
+	expiresRaw, hasExpires := fieldsInner["expires"]
+	if !hasValue || !hasTimeout || !hasExpires {
+		return nftDynamicElement{}, errors.New("nft backend: dynamic element is missing timeout or expiry")
+	}
+	parseSeconds := func(raw json.RawMessage, label string, allowZero bool) (time.Duration, error) {
+		var number json.Number
+		if err := json.Unmarshal(raw, &number); err != nil {
+			return 0, fmt.Errorf("nft backend: dynamic element %s is not numeric", label)
+		}
+		seconds, err := strconv.ParseInt(string(number), 10, 64)
+		if err != nil || (!allowZero && seconds <= 0) || (allowZero && seconds < 0) || seconds > int64(24*time.Hour/time.Second) {
+			return 0, fmt.Errorf("nft backend: dynamic element %s is invalid", label)
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+	timeout, err := parseSeconds(timeoutRaw, "timeout", false)
+	if err != nil {
+		return nftDynamicElement{}, err
+	}
+	ttl, err := parseSeconds(expiresRaw, "expiry", true)
+	if err != nil {
+		return nftDynamicElement{}, err
+	}
+	if ttl > timeout {
+		return nftDynamicElement{}, errors.New("nft backend: dynamic element expiry exceeds timeout")
+	}
+	interval, err := parseObservedInterval(valueRaw, family)
+	if err != nil {
+		return nftDynamicElement{}, fmt.Errorf("nft backend: malformed dynamic element: %w", err)
+	}
+	return nftDynamicElement{interval: interval, ttl: ttl}, nil
+}
+
+func dynamicSetCommands(target *Target, family policy.Family, observed nftObject, desired []policy.TimedPrefix, now time.Time) ([]nftCommand, error) {
+	if err := ValidateDynamic(desired); err != nil {
+		return nil, err
+	}
+	observedByInterval := make(map[addressInterval]time.Duration)
+	if len(observed.Elem) != 0 {
+		var rawElements []json.RawMessage
+		if err := json.Unmarshal(observed.Elem, &rawElements); err != nil || rawElements == nil {
+			return nil, errors.New("nft backend: dynamic set elements are malformed")
+		}
+		for _, raw := range rawElements {
+			element, err := parseDynamicElement(raw, family)
+			if err != nil {
+				return nil, err
+			}
+			if _, exists := observedByInterval[element.interval]; exists {
+				return nil, errors.New("nft backend: dynamic set contains duplicate elements")
+			}
+			observedByInterval[element.interval] = element.ttl
+		}
+	}
+	var additions []any
+	changed := false
+	for _, desiredValue := range desired {
+		if (family == policy.IPv4 && !desiredValue.Prefix.Addr().Is4()) || (family == policy.IPv6 && !desiredValue.Prefix.Addr().Is6()) {
+			continue
+		}
+		grant, _ := LeaseGrant(desiredValue.Deadline, now, time.Second)
+		if grant <= 0 {
+			continue
+		}
+		if ttl, exists := observedByInterval[prefixInterval(desiredValue.Prefix)]; !exists || ttl != grant {
+			changed = true
+		}
+		var value any = desiredValue.Prefix.Addr().String()
+		if desiredValue.Prefix.Bits() != desiredValue.Prefix.Addr().BitLen() {
+			value = prefixExpression(desiredValue.Prefix)
+		}
+		additions = append(additions, map[string]any{"elem": map[string]any{"val": value, "timeout": int64(grant / time.Second)}})
+	}
+	if !changed && len(additions) == len(observedByInterval) {
+		return nil, nil
+	}
+	// A flush plus one grouped add commits atomically with no empty-set window.
+	// Per-element deletion makes large interval-set renewals prohibitively slow,
+	// and races kernel expiry. Flush only contents, retaining identity and rules.
+	commands := make([]nftCommand, 0, 2)
+	if len(observedByInterval) != 0 {
+		commands = append(commands, nftCommand{Flush: map[string]any{"set": objectRef(target.Table, dynamicSetName(target, family))}})
+	}
+	if len(additions) != 0 {
+		commands = append(commands, nftCommand{Add: map[string]any{"element": map[string]any{
+			"family": "inet", "table": target.Table, "name": dynamicSetName(target, family), "elem": additions,
+		}}})
+	}
+	return commands, nil
+}
+
 func validateInventory(inventory *nftInventory, targets ...*Target) error {
 	if inventory == nil || !inventory.present {
 		return nil
@@ -334,6 +489,7 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 	chainComments := make(map[string]string)
 	baseDefs := make(map[string][]baseDefinition)
 	setTypes := make(map[string]string)
+	dynamicSets := make(map[string]policy.Family)
 	counterComments := make(map[string]string)
 	ruleChains := make(map[string]string)
 	var owner string
@@ -382,11 +538,15 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 			for _, set := range family.Sets {
 				name := setName(target, family.Family, set.ID)
 				valid["set/"+name] = struct{}{}
-				// nft JSON does not round-trip set comments. Ownership is the
-				// recorded owner/generation-qualified name inside the marked
-				// table, with immutable contents and shape checked exactly.
-				if observed, exists := inventory.sets[name]; exists && !setElementsComplete(observed, family.Family, set.Prefixes) {
-					return fmt.Errorf("nft backend: set %q has missing or unexpected elements", name)
+				if set.Kind == policy.DynamicCrowdSecSet {
+					dynamicSets[name] = family.Family
+				} else {
+					// nft JSON does not round-trip set comments. Ownership is the
+					// recorded owner/generation-qualified name inside the marked
+					// table, with immutable contents and shape checked exactly.
+					if observed, exists := inventory.sets[name]; exists && !setElementsComplete(observed, family.Family, set.Prefixes) {
+						return fmt.Errorf("nft backend: set %q has missing or unexpected elements", name)
+					}
 				}
 				if family.Family == policy.IPv4 {
 					setTypes[name] = "ipv4_addr"
@@ -411,6 +571,34 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 	if owner != "" && inventory.table.Comment != tableComment(owner) {
 		return errors.New("nft backend: table ownership collision")
 	}
+	for name, set := range inventory.sets {
+		if _, ok := valid["set/"+name]; !ok {
+			return fmt.Errorf("nft backend: unknown or foreign set %q", name)
+		}
+		if family, dynamic := dynamicSets[name]; dynamic {
+			if !dynamicSetMetadataComplete(set, family) {
+				return fmt.Errorf("nft backend: dynamic set %q has unexpected metadata", name)
+			}
+			if len(set.Elem) != 0 {
+				var elements []json.RawMessage
+				if err := json.Unmarshal(set.Elem, &elements); err != nil || elements == nil {
+					return fmt.Errorf("nft backend: dynamic set %q has malformed elements", name)
+				}
+				for _, raw := range elements {
+					if _, err := parseDynamicElement(raw, family); err != nil {
+						return fmt.Errorf("nft backend: dynamic set %q: %w", name, err)
+					}
+				}
+			}
+			continue
+		}
+		if set.Comment != "" || len(set.Flags) != 2 || !slices.Contains(set.Flags, "constant") || !slices.Contains(set.Flags, "interval") {
+			return fmt.Errorf("nft backend: set %q has unexpected metadata or flags", name)
+		}
+		if expected, ok := setTypes[name]; !ok || set.Type != expected {
+			return fmt.Errorf("nft backend: set %q has unexpected datatype", name)
+		}
+	}
 	for name, chain := range inventory.chains {
 		if _, ok := valid["chain/"+name]; !ok {
 			return fmt.Errorf("nft backend: unknown or foreign chain %q", name)
@@ -431,17 +619,6 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 			}
 		} else if chain.Type != "" || chain.Hook != "" || chain.Policy != "" || chain.HasPrio {
 			return fmt.Errorf("nft backend: regular chain %q is unexpectedly hooked", name)
-		}
-	}
-	for name, set := range inventory.sets {
-		if _, ok := valid["set/"+name]; !ok {
-			return fmt.Errorf("nft backend: unknown or foreign set %q", name)
-		}
-		if set.Comment != "" || len(set.Flags) != 2 || !slices.Contains(set.Flags, "constant") || !slices.Contains(set.Flags, "interval") {
-			return fmt.Errorf("nft backend: set %q has unexpected metadata or flags", name)
-		}
-		if expected, ok := setTypes[name]; !ok || set.Type != expected {
-			return fmt.Errorf("nft backend: set %q has unexpected datatype", name)
 		}
 	}
 	for name, counter := range inventory.counters {
@@ -546,16 +723,86 @@ func (n *NFT) Apply(ctx context.Context, previous, candidate *Target) error {
 	return n.applyBatch(ctx, batch)
 }
 
+func encodeNFTBatch(batch nftBatch) ([]byte, error) {
+	data, err := json.Marshal(batch)
+	if err != nil {
+		return nil, fmt.Errorf("nft backend: encode batch: %w", err)
+	}
+	if len(data) > maxNFTInput {
+		return nil, errors.New("nft backend: batch exceeds input limit")
+	}
+	return data, nil
+}
+
 func (n *NFT) applyBatch(ctx context.Context, batch nftBatch) error {
 	if len(batch.Nftables) == 0 {
 		return nil
 	}
-	data, err := json.Marshal(batch)
+	data, err := encodeNFTBatch(batch)
 	if err != nil {
-		return fmt.Errorf("nft backend: encode batch: %w", err)
+		return err
 	}
-	if len(data) > maxNFTInput {
-		return errors.New("nft backend: batch exceeds input limit")
+	_, err = n.run(ctx, []string{"-j", "-f", "-"}, data)
+	return err
+}
+
+// UpdateDynamic reconciles only the exact dynamic containers recorded by
+// target. Static sets, generations, chains, and dispatch hooks are not part of
+// this transaction.
+func (n *NFT) UpdateDynamic(ctx context.Context, target *Target, desired []policy.TimedPrefix) error {
+	if target == nil {
+		return errors.New("nft backend: dynamic update requires a target")
+	}
+	if err := validateNFTTarget(target); err != nil {
+		return err
+	}
+	if target.DynamicGeneration == "" {
+		return errors.New("nft backend: dynamic update requires a dynamic generation")
+	}
+	if err := ValidateDynamic(desired); err != nil {
+		return err
+	}
+	inventory, err := n.inspect(ctx, target.Table, target)
+	if err != nil {
+		return err
+	}
+	if !inventory.present {
+		return errors.New("nft backend: dynamic table is absent")
+	}
+	now := time.Now()
+	var batch nftBatch
+	retainedBytes := inventory.sizeBytes
+	for _, familyPlan := range target.Families {
+		for _, set := range familyPlan.Sets {
+			if set.Kind != policy.DynamicCrowdSecSet {
+				continue
+			}
+			name := setName(target, familyPlan.Family, set.ID)
+			observed, exists := inventory.sets[name]
+			if !exists {
+				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"set": dynamicSetDefinition(target, familyPlan.Family, name)}})
+			}
+			commands, err := dynamicSetCommands(target, familyPlan.Family, observed, desired, now)
+			if err != nil {
+				return err
+			}
+			if len(commands) != 0 {
+				// A changed set is atomically replaced. Retain all other native
+				// contents, but do not count its old and new elements together.
+				retainedBytes -= len(observed.Elem)
+			}
+			batch.Nftables = append(batch.Nftables, commands...)
+		}
+	}
+	if len(batch.Nftables) == 0 {
+		return nil
+	}
+	data, err := encodeNFTBatch(batch)
+	if err != nil {
+		return err
+	}
+	if retainedBytes+nftInspectionBudget(len(data), len(batch.Nftables)) > maxNFTInventoryBudget {
+		return errors.New("nft backend: combined static and dynamic contents exceed inspection capacity")
 	}
 	_, err = n.run(ctx, []string{"-j", "-f", "-"}, data)
 	return err

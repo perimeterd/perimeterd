@@ -16,15 +16,17 @@ internal/app/                 lifecycle, candidates, serialized writer, HTTP and
 internal/cli/                 command dispatch, validation and version reporting
 internal/config/              YAML schema, defaults and strict validation
 internal/config/catalog/      checked-in selector catalogs
+internal/crowdsec/            bounded LAPI adapter, authoritative store and timed projection
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
 internal/source/              RIPEstat resolution, immutable cache and local HTTP fixtures
 internal/state/               revision store, record codec/validation and durable filesystem IO
 configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
-.github/workflows/ci.yml      quality, build, unit/race and native firewall gates
+.github/workflows/ci.yml      quality, build, unit/race, native firewall and real-LAPI gates
 .github/workflows/codeql.yml  Go security analysis
 tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
+tests/crowdsec/              pinned real-LAPI streaming compatibility gate
 docs/                         design contracts, current operations and implementation plan
 .golangci.yml                 lint/format policy
 Makefile                      local and CI entry points
@@ -41,6 +43,10 @@ The most useful file boundaries when changing an existing path are:
 
 - `internal/app/publication.go`: staged metrics/listener reservations and
   transaction-gated runtime publication.
+- `internal/app/crowdsec.go`: staged client epochs, serialized dynamic
+  reconciliation, independent expiry/renewal workers, and reconnect handover.
+- `internal/crowdsec/`: response validation, decision identity, absolute
+  deadlines, and maximum-expiry overlap projection.
 - `internal/config/catalog/`: checked-in country, RIR, and ASN vocabulary.
 - `internal/firewall/exec.go`: bounded native subprocess I/O shared by
   backends.
@@ -59,9 +65,9 @@ The most useful file boundaries when changing an existing path are:
 
 ### Planned additions
 
-CrowdSec runtime support, Docker-specific coexistence, installed
-systemd/tmpfiles payloads, package lifecycle scripts, and GoReleaser/release
-workflows belong to later milestones. Their eventual package layout should
+Docker-specific coexistence, installed systemd/tmpfiles payloads, package
+lifecycle scripts, and GoReleaser/release workflows belong to later milestones.
+Their eventual package layout should
 follow the real integration boundaries; these directories and files are not
 present scaffolding.
 
@@ -116,7 +122,7 @@ touch the firewall. Run the opt-in native gate separately:
 
 ```sh
 make test-e2e
-# If unprivileged user namespaces are unavailable:
+# If user namespaces are unavailable or legacy /proc inventory is inaccessible:
 make test-e2e E2E_SUDO=sudo
 ```
 
@@ -149,22 +155,43 @@ unique temporary directories, and table-deletion assertions require successful
 ruleset inspection plus explicit absence; command failures, timeouts, and
 malformed inspection output fail the assertion.
 
+The real-LAPI gate needs Docker (or a compatible Podman CLI):
+
+```sh
+make test-crowdsec
+# Optional explicit runtime:
+CROWDSEC_CONTAINER_RUNTIME=podman make test-crowdsec
+```
+
+It runs a digest-pinned CrowdSec v1.8.1 container on an isolated network with
+an ephemeral loopback port, private SQLite data, and the normal chunked stream.
+It verifies duplicate-prefix IDs, incremental updates without retransmitting
+the active snapshot, deletion of the longer overlap, reconnect, and
+authoritative emptiness. The fixture is destroyed afterward.
+
+The known query-error behavior in
+[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691)
+is an accepted temporary upstream risk, not a compatibility-test condition.
+Do not inject database faults or introduce full-list polling to work around
+it. See the [supported LAPI contract](data-sources.md#supported-lapi-contract).
+
 The executable target inventory is:
 
 | Target | Contract |
 | --- | --- |
-| `fmt` | Rewrite all Go sources selected with the `e2e` build tag using pinned `gofumpt` followed by `goimports` |
+| `fmt` | Rewrite Go sources selected with `e2e,crowdsec` build tags using pinned `gofumpt` followed by `goimports` |
 | `fmt-check` | Check pinned `gofumpt` and `goimports` formatting without modifying files |
-| `lint` | Run golangci-lint's pinned `gci` diff check and lint policy with the `e2e` build tag |
+| `lint` | Run golangci-lint's pinned `gci` diff check and lint policy with `e2e,crowdsec` build tags |
 | `vuln` | Run pinned `govulncheck ./...` |
 | `test` | Run shuffled unit tests and write `coverage.out` |
 | `test-race` | Run all package tests with the race detector and shuffled order |
 | `test-e2e` | Build and run the explicitly privileged Linux namespace/backend scenarios |
+| `test-crowdsec` | Run the digest-pinned real LAPI streaming compatibility scenarios |
 | `build` | Build the current CLI with version metadata |
 | `verify` | Run `go mod verify`, `fmt-check`, `lint`, `vuln`, `build`, and `test` |
 
-`verify` intentionally does not run `test-race` or `test-e2e`; those are
-separate gates. `package` is a planned GoReleaser/nFPM snapshot-packaging
+`verify` intentionally does not run `test-race`, `test-e2e`, or `test-crowdsec`;
+those are separate gates. `package` is a planned GoReleaser/nFPM snapshot-packaging
 command, not an implemented target or a successful no-op.
 
 Tool dependencies and exact versions are pinned in the `tool` and module
@@ -207,9 +234,9 @@ commit SHAs and refresh their human-readable release comments.
 
 The remaining sections are the complete first-release contract, not a list of
 currently passing tests. The local commands above describe what can run now.
-Static source-backed policy and both native backend paths are implemented;
-CrowdSec runtime support, Docker-specific coexistence, package/systemd
-integration, and release workflows remain planned. The
+Static source-backed policy, CrowdSec, and both native backend paths are
+implemented; Docker-specific coexistence, package/systemd integration, and
+release workflows remain planned. The
 [implementation plan](implementation-plan.md) tracks milestone status.
 
 ## Verification matrix
@@ -254,10 +281,9 @@ than one layer when the real boundary matters.
 | Raw CrowdSec envelope | Before dependency decoding, HTTP 200 with empty/truncated bodies, missing or duplicate list keys, wrong list types, trailing JSON, or decompressed-size overflow rejects the snapshot and retains existing bans. | Unit fixture; privileged netns E2E |
 | Valid empty CrowdSec lists | Complete empty/null lists from a supported server legitimately clear an authoritative snapshot. | Unit fixture; privileged netns E2E |
 | Non-deduplicated decisions | Initial/reconnect/incremental streams with two decision IDs for one prefix, deletion of the longer ban, and expiration of the remaining ID remove coverage at the correct deadline rather than retaining a hidden ID. | Unit fixture; real-LAPI compatibility; privileged netns E2E |
-| Request adaptation | Startup/scopes and other supported options survive request adaptation while all decision IDs are obtained. A server-shaped valid partial-success envelope demonstrates that JSON validation cannot attest completeness. | Unit fixture; real-LAPI compatibility |
-| Real LAPI compatibility | A pinned real supported LAPI verifies all IDs with `dedup=false`, manual deletion of the longer overlapping ban, reconnect, and server-query failures as observable failures rather than valid partial snapshots. | Real supported LAPI compatibility job |
-| LAPI deployment mode | The compatibility deployment checks both environment and feature configuration for the disabled defective chunked path. Changing supported LAPI releases or modes requires this gate and reviewed server source evidence; support is not inferred from a version string or HTTP transfer encoding alone. | Real supported LAPI compatibility job; reviewed source evidence |
-| Partial-response regression | A regression fixture preserves the known valid-JSON partial response to document why a client-only gate cannot certify server behavior. | Unit fixture; real-LAPI compatibility |
+| Request adaptation | Startup/scopes and other supported options survive request adaptation while all decision IDs are obtained. | Unit fixture; real-LAPI compatibility |
+| Real LAPI compatibility | The pinned v1.8.1 LAPI verifies all IDs with `dedup=false`, incremental updates without replaying unchanged active decisions, deletion of the longer overlapping ban, reconnect, and valid empty snapshots. | Real supported LAPI compatibility job |
+| LAPI deployment mode | Use the current server's normal chunked stream. The accepted upstream query-error issue is documented, not fault-injected, worked around, or used to block compatibility. | Real supported LAPI compatibility job; accepted-risk documentation |
 | Refresh safety | Malformed refreshes retain last-known-good rules. | Privileged netns E2E |
 | CrowdSec startup/reconnect | Initial CrowdSec synchronization enforces existing bans before readiness; reconnect replaces stale decisions; endpoint replacement fences old events. | Privileged netns E2E |
 | Outage behavior | CrowdSec precedence and local expiry work during a fixture outage. | Privileged netns E2E |
@@ -338,13 +364,26 @@ Prerequisites are described under [local commands](#local-commands).
 Unit/integration source tests use local HTTP servers and checked-in official
 RIPEstat responses with provenance metadata.
 
-The version-1 suite must expand that coverage with CrowdSec and Docker scenarios.
-The matrix above defines those acceptance requirements.
+CrowdSec scenarios additionally verify startup synchronization, reload and
+restart handover, finite leases, overlap, native expiry, and ingress precedence
+on both backends. Native scale cases install, renew, and replace 100,000-entry
+IPv4 and IPv6 projections, including mapped-IPv6 residuals. ipset recovery
+cases interrupt static population and both sides of the resize swap, retry
+with newer authority, and reject foreign references and spare-name collisions.
+An nftables capacity case rejects an oversized combined static/dynamic inventory
+before mutation, preserves the existing packet-path decision, and verifies
+subsequent admissible replacement, renewal, removal, and owned cleanup.
+A runtime refresh case expands 100,000 source decisions into 200,000 timed
+prefixes and rejects geo growth that would prevent their renewal. It verifies
+the retained revision, packet denial, and renewal of the same absolute authority.
+Docker scenarios remain required by the matrix above.
 
 The planned separate Docker job must execute the [Docker coexistence row](#kernel-backend-and-coexistence).
-The planned CrowdSec compatibility job must use a pinned real supported LAPI
+The CrowdSec compatibility job uses the pinned real supported LAPI
 rather than fixtures, with deployment and server-source review as specified in
 the [sources and compatibility matrix](#sources-and-compatibility).
+That gate also verifies admission of server-accepted mapped IPv4 addresses and
+CIDRs as IPv4 authority without rejecting unrelated decisions in the same batch.
 
 Shared namespace, mount, fixture, cleanup, host-isolation, availability, and
 iptables-family prerequisites are the [test-isolation contract in the service

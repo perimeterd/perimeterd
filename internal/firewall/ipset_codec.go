@@ -127,6 +127,34 @@ func parseIPSetSave(data []byte) (map[string]iptObservedSet, error) {
 			}
 			set.Entries = append(set.Entries, entry)
 			set.Extended = set.Extended || len(fields) != 3
+			for n := 3; n < len(fields); n++ {
+				switch fields[n] {
+				case "timeout":
+					if n+1 >= len(fields) {
+						return nil, errors.New("ipset entry timeout is missing")
+					}
+					if set.Timeouts == nil {
+						set.Timeouts = make(map[string]uint64)
+					}
+					if _, duplicate := set.Timeouts[entry]; duplicate {
+						return nil, errors.New("duplicate ipset entry timeout")
+					}
+					timeout, err := strconv.ParseUint(fields[n+1], 10, 64)
+					if err != nil {
+						return nil, fmt.Errorf("ipset entry timeout: %w", err)
+					}
+					set.Timeouts[entry] = timeout
+					n++
+				case "comment":
+					if n+1 >= len(fields) {
+						return nil, errors.New("ipset entry comment is missing")
+					}
+					set.UnknownOptions = true
+					n++
+				default:
+					set.UnknownOptions = true
+				}
+			}
 			result[set.Name] = set
 		default:
 			return nil, errors.New("unsupported ipset save directive")

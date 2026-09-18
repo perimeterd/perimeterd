@@ -116,6 +116,7 @@ func Run(ctx context.Context, options Options) error {
 		return errors.Join(err, stopNotifier())
 	}
 	engine := NewEngine(store, opts.Backend, opts.Checkpoint)
+	engine.ConfigureCrowdSecTransport(opts.SourceClient)
 	defer engine.Close()
 
 	recovered, err := recoverUntilReady(startupCtx, engine, nil)

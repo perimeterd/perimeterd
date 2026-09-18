@@ -98,3 +98,19 @@ jobs:
           sudo modprobe ip6table_filter
       - name: Run isolated kernel E2E
         run: E2E_SUDO=sudo make test-e2e
+
+  crowdsec:
+    name: real CrowdSec LAPI compatibility
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+      - name: Run pinned real-LAPI gate
+        run: make test-crowdsec

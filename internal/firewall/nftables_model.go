@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
@@ -39,9 +40,21 @@ func BuildTarget(owner, id string, cfg config.Config, model policy.State, previo
 		return nil, nil
 	}
 	families := model.Families()
+	dynamicGeneration := ""
+	if cfg.CrowdSec.Enabled {
+		dynamicGeneration = id
+		table := cfg.Firewall.Nftables.Table
+		if cfg.Firewall.Backend == "iptables" {
+			table = "filter"
+		}
+		if previous != nil && previous.Owner == owner && previous.Backend() == cfg.Firewall.Backend &&
+			previous.Table == table && previous.DynamicGeneration != "" {
+			dynamicGeneration = previous.DynamicGeneration
+		}
+	}
 	candidate := &Target{
 		Owner: owner, Table: cfg.Firewall.Nftables.Table, Priority: cfg.Firewall.Nftables.Priority,
-		Generation: id, Families: families,
+		Generation: id, DynamicGeneration: dynamicGeneration, Families: families,
 	}
 	if cfg.Firewall.Backend == "iptables" {
 		candidate.Table = "filter"
@@ -49,7 +62,7 @@ func BuildTarget(owner, id string, cfg config.Config, model policy.State, previo
 		candidate.IPTables = &IPTablesTarget{Attachments: cloneIPTablesAttachments(cfg.Firewall.IPTables.Attachments)}
 	}
 	if previous != nil && previous.Owner == candidate.Owner && previous.Backend() == candidate.Backend() &&
-		previous.Table == candidate.Table && sameFamilies(previous.Families, candidate.Families) &&
+		previous.Table == candidate.Table && previous.DynamicGeneration == candidate.DynamicGeneration && sameFamilies(previous.Families, candidate.Families) &&
 		reflect.DeepEqual(previous.IPTables, candidate.IPTables) {
 		candidate.Generation = previous.Generation
 	}
@@ -192,7 +205,14 @@ func generationChainName(target *Target, family policy.Family, direction policy.
 	return artifactName(target.Owner, target.Generation, "path_"+familyToken(family)+"_"+string(direction))
 }
 
+func dynamicSetName(target *Target, family policy.Family) string {
+	return artifactName(target.Owner, target.DynamicGeneration, "dynamic_"+familyToken(family))
+}
+
 func setName(target *Target, family policy.Family, setID string) string {
+	if setID == "crowdsec" && target.DynamicGeneration != "" {
+		return dynamicSetName(target, family)
+	}
 	prefix := artifactName(target.Owner, target.Generation, "set_"+familyToken(family)+"_")
 	readable := sanitizeRole(setID)
 	// geo/eligible and the fixed geo_eligible set are distinct logical sets;
@@ -502,9 +522,32 @@ func commandBatch(target *Target, inventory *nftInventory, old *Target) (nftBatc
 			"comment": ownershipComment(target.Owner, stableToken, "counter/"+counter.Name, true),
 		}}})
 	}
+	now := time.Now()
 	for _, family := range target.Families {
 		for _, set := range family.Sets {
 			name := setName(target, family.Family, set.ID)
+			if set.Kind == policy.DynamicCrowdSecSet {
+				if inventory != nil && inventory.hasSet(name) {
+					if target.Dynamic != nil {
+						commands, err := dynamicSetCommands(target, family.Family, inventory.sets[name], target.Dynamic.Prefixes, now)
+						if err != nil {
+							return nftBatch{}, err
+						}
+						batch.Nftables = append(batch.Nftables, commands...)
+					}
+					continue
+				}
+				definition := dynamicSetDefinition(target, family.Family, name)
+				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"set": definition}})
+				if target.Dynamic != nil {
+					commands, err := dynamicSetCommands(target, family.Family, nftObject{}, target.Dynamic.Prefixes, now)
+					if err != nil {
+						return nftBatch{}, err
+					}
+					batch.Nftables = append(batch.Nftables, commands...)
+				}
+				continue
+			}
 			elems := make([]any, 0, len(set.Prefixes))
 			for _, prefix := range set.Prefixes {
 				elems = append(elems, prefixExpression(prefix))

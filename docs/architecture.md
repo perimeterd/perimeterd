@@ -1,9 +1,9 @@
 # Architecture
 
 This document owns component boundaries, static revision admission, writer
-ownership, and durable recovery. The static lifecycle is implemented for both
-native backends; CrowdSec and deployment extensions below remain first-release
-or future requirements.
+ownership, and durable recovery. Static policy and CrowdSec integration are
+implemented for both native backends; deployment extensions below remain
+first-release or future requirements.
 
 The [implementation plan](implementation-plan.md) owns milestone status.
 [Operations](operations.md#current-source-build-runtime) describes what can run
@@ -26,7 +26,7 @@ flowchart LR
     CS[Local config source] --> V[Strict validation]
     V --> R[Selector resolver and RIPEstat cache]
     R --> C[Policy compiler]
-    L[CrowdSec LAPI stream - planned] --> D[Dynamic decision store - planned]
+    L[CrowdSec LAPI stream] --> D[Dynamic decision store]
     C --> W[Serialized firewall writer]
     D --> W
     W --> B[Selected firewall backend]
@@ -43,8 +43,8 @@ flowchart LR
 `perimeterd` is one foreground process with one serialized firewall writer.
 Configuration parsing, network requests, prefix normalization, policy compilation,
 and replacement-resource setup happen outside the apply critical section.
-Completed static candidates enter the writer; the planned CrowdSec integration
-will submit coalesced decision deltas through the same owner.
+Completed static candidates and coalesced CrowdSec decision projections enter
+the same writer.
 
 Only the writer invokes backend mutations and native inspection. Backends
 perform these operations under that ownership; source adapters never mutate
@@ -94,7 +94,7 @@ current static provider is RIPEstat. Future configuration or prefix providers
 must preserve these boundaries and produce complete candidates rather than
 bypass admission or call a backend directly.
 
-Static reconciliation remains separate from the planned incremental CrowdSec
+Static reconciliation remains separate from the incremental CrowdSec
 path: individual decisions must not rebuild global or geo sets. Both paths use
 the same writer.
 
@@ -117,7 +117,7 @@ of the last successful sample on failure.
   ownership and recovers pending transactions before reading or validating the
   current YAML. It then obtains every required fresh or committed cached
   prefix, reconciles, durably commits, and completes required recovery before
-  reporting readiness. The planned CrowdSec integration additionally requires
+  reporting readiness. CrowdSec additionally requires
   authoritative synchronization when enabled. The
   [bounded startup protocol](operations.md#bounded-startup-deadline) applies
   throughout recovery and initialization.
@@ -134,16 +134,15 @@ of the last successful sample on failure.
 `SIGHUP` stages a complete reload. `SIGTERM` stops watchers, refresh workers,
 and the HTTP listener, drains or safely cancels in-flight work, and exits. It
 deliberately leaves the last applied static rules active across restart.
-The planned CrowdSec integration retains only the remaining kernel lease on
+CrowdSec retains only the remaining kernel lease on
 shutdown: without a running owner, bans may expire before the source decision's
 deadline. This is not indefinite fail-closed ban retention. Only explicit
 `cleanup` removes all recorded owned artifacts.
 
 ### Staged reload
 
-A reload is a candidate revision until every stage succeeds. Static staging is
-implemented; CrowdSec client synchronization and dynamic-store capture in the
-steps below are requirements for its planned integration.
+A reload is a candidate revision until every stage succeeds. Static staging,
+CrowdSec synchronization, and dynamic-store capture share this lifecycle.
 
 1. Admit a new request epoch, then parse and strictly validate the complete file.
 2. Resolve selectors using acceptable cache entries and required network
@@ -206,7 +205,7 @@ Superseded work is cancelled opportunistically and discarded at the writer
 even if cancellation loses a race. Discard closes candidate resources without
 changing active state, cache pointers, or failure health.
 
-The planned CrowdSec integration shares the writer but has its own
+CrowdSec shares the writer but has its own
 [dynamic admission and activation contract](data-sources.md#authoritative-stream-and-decision-identity).
 It distinguishes client identity, desired revision, and enforcement operation
 sequence so unchanged bans can renew without admitting stale work. That
@@ -238,7 +237,7 @@ The journal records:
 - recovery progress, including switched iptables families.
 
 Persist configuration paths and source identity, never credential contents.
-For the planned CrowdSec integration, decisions are not a durable cache:
+CrowdSec decisions are not a durable cache:
 surviving kernel entries retain only their remaining leases, and authoritative
 LAPI synchronization rebuilds the store before readiness after restart. Static
 rollback restores prior dynamic-set references without resetting timeouts.
@@ -361,7 +360,7 @@ The last-known-good revision remains authoritative when a candidate is unsafe:
 - Refresh failure retains cached prefixes and the active rules. Logs and
   metrics expose the error and snapshot age; the normal schedule retries.
 
-The planned [CrowdSec contract](data-sources.md#crowdsec-stream) additionally
+The [CrowdSec contract](data-sources.md#crowdsec-stream) additionally
 retains failed deltas in the authoritative in-memory store and retries them
 idempotently.
 

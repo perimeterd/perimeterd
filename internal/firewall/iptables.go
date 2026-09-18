@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -156,36 +158,181 @@ func (i *IPTables) Preflight(ctx context.Context, previous, candidate *Target) e
 	return nil
 }
 
+func observedSetEntries(set iptObservedSet) map[string]struct{} {
+	result := make(map[string]struct{}, len(set.Entries))
+	for _, entry := range set.Entries {
+		result[entry] = struct{}{}
+	}
+	return result
+}
+
+func ipsetCapacity(set iptObservedSet) (int, error) {
+	capacity := 0
+	for n := 0; n+1 < len(set.Options); n += 2 {
+		if set.Options[n] != "maxelem" {
+			continue
+		}
+		if capacity != 0 {
+			return 0, errors.New("duplicate ipset capacity")
+		}
+		value, err := strconv.Atoi(set.Options[n+1])
+		if err != nil || value <= 0 {
+			return 0, errors.New("invalid ipset capacity")
+		}
+		capacity = value
+	}
+	if capacity == 0 {
+		return 0, errors.New("missing ipset capacity")
+	}
+	return capacity, nil
+}
+
+func dynamicIPSetCapacity(needed int) int {
+	capacity := 65536
+	for capacity < needed && capacity <= math.MaxInt/2 {
+		capacity *= 2
+	}
+	return max(capacity, needed)
+}
+
+// A bounded restore may stop at any line. The spare name is authorized by the
+// same recorded dynamic generation, so retries and cleanup recognize it both
+// before and after swap. Live references always keep pointing at the live name.
+func appendDynamicIPSet(input *strings.Builder, set iptSet, inventory *iptInventory, desired map[string]uint64) error {
+	observed, exists := inventory.Sets[set.Name]
+	capacity := 0
+	if exists {
+		var err error
+		capacity, err = ipsetCapacity(observed)
+		if err != nil {
+			return err
+		}
+	}
+	spare := iptDynamicSpareName(set.Name)
+	if _, exists := inventory.Sets[spare]; exists {
+		fmt.Fprintf(input, "destroy %s\n", spare)
+	}
+	resize := exists && len(desired) > capacity
+	destination := set.Name
+	if resize {
+		destination = spare
+	}
+	if !exists || resize {
+		fmt.Fprintf(input, "create %s hash:net family %s maxelem %d timeout %d\n",
+			destination, familySetName(set.Family), dynamicIPSetCapacity(len(desired)), int(maximumLease/time.Second))
+	}
+	if !resize {
+		for _, entry := range observed.Entries {
+			if _, keep := desired[entry]; !keep {
+				fmt.Fprintf(input, "del %s %s -exist\n", set.Name, entry)
+			}
+		}
+	}
+	entries := make([]string, 0, len(desired))
+	for entry := range desired {
+		entries = append(entries, entry)
+	}
+	slices.Sort(entries)
+	for _, entry := range entries {
+		grant := desired[entry]
+		if !resize && observed.Timeouts[entry] == grant {
+			continue
+		}
+		fmt.Fprintf(input, "add %s %s timeout %d -exist\n", destination, entry, grant)
+	}
+	if resize {
+		fmt.Fprintf(input, "swap %s %s\ndestroy %s\n", spare, set.Name, spare)
+	}
+	return nil
+}
+
+// ipset restore is already non-transactional. Bound each invocation while
+// preserving command order, including population before a resize swap.
+func (i *IPTables) restoreSets(ctx context.Context, input string) error {
+	for input != "" {
+		size := min(len(input), maxIPTablesInput)
+		if size < len(input) {
+			size = strings.LastIndexByte(input[:size], '\n') + 1
+			if size == 0 {
+				return errors.New("ipset command exceeds input limit")
+			}
+		}
+		if _, err := i.run(ctx, "ipset", []string{"restore"}, []byte(input[:size])); err != nil {
+			return err
+		}
+		input = input[size:]
+	}
+	return nil
+}
+
 func (i *IPTables) stage(ctx context.Context, models map[policy.Family]iptFamilyModel, inventory *iptInventory) error {
 	var setInput strings.Builder
+	now := time.Now()
 	for _, family := range []policy.Family{policy.IPv4, policy.IPv6} {
 		model := models[family]
 		for _, set := range model.Sets {
 			observed, exists := inventory.Sets[set.Name]
-			if exists && len(observed.Entries) == len(set.Prefixes) {
+			// A nil projection means recovery/refresh: never alter live leases.
+			if set.Dynamic && !set.DynamicProjection {
+				if !exists {
+					fmt.Fprintf(&setInput, "create %s hash:net family %s maxelem %d timeout %d\n", set.Name, familySetName(family), 65536, int(maximumLease/time.Second))
+				}
 				continue
+			}
+			desired := make(map[string]uint64, len(set.Prefixes))
+			for n, prefix := range set.Prefixes {
+				if !set.Dynamic {
+					desired[prefix.String()] = 0
+					continue
+				}
+				grant, _ := LeaseGrant(set.Timed[n].Deadline, now, time.Second)
+				if grant > 0 {
+					desired[prefix.String()] = uint64(grant / time.Second)
+				}
+			}
+			if set.Dynamic {
+				if exists && referencedSet(inventory, set.Name) {
+					continue // A reused live generation is reconciled by UpdateDynamic.
+				}
+				if err := appendDynamicIPSet(&setInput, set, inventory, desired); err != nil {
+					return err
+				}
+				continue
+			}
+			if exists && len(observed.Entries) == len(desired) {
+				same := true
+				for _, entry := range observed.Entries {
+					if _, wanted := desired[entry]; !wanted {
+						same = false
+						break
+					}
+				}
+				if same {
+					continue
+				}
 			}
 			if exists && referencedSet(inventory, set.Name) {
 				return fmt.Errorf("refusing to mutate referenced generation set %s", set.Name)
 			}
 			if !exists {
-				fmt.Fprintf(&setInput, "create %s hash:net family %s maxelem %d\n", set.Name, familySetName(family), max(65536, len(set.Prefixes)))
+				fmt.Fprintf(&setInput, "create %s hash:net family %s maxelem %d\n", set.Name, familySetName(family), max(65536, len(desired)))
 			}
-			seen := make(map[string]bool, len(observed.Entries))
+			observedEntries := observedSetEntries(observed)
 			for _, entry := range observed.Entries {
-				seen[entry] = true
+				if _, keep := desired[entry]; !keep {
+					fmt.Fprintf(&setInput, "del %s %s\n", set.Name, entry)
+				}
 			}
 			for _, prefix := range set.Prefixes {
-				if !seen[prefix.String()] {
-					fmt.Fprintf(&setInput, "add %s %s\n", set.Name, prefix)
+				entry := prefix.String()
+				if _, exists := observedEntries[entry]; !exists {
+					fmt.Fprintf(&setInput, "add %s %s\n", set.Name, entry)
 				}
 			}
 		}
 	}
-	if setInput.Len() != 0 {
-		if _, err := i.run(ctx, "ipset", []string{"restore"}, []byte(setInput.String())); err != nil {
-			return err
-		}
+	if err := i.restoreSets(ctx, setInput.String()); err != nil {
+		return err
 	}
 	for _, family := range []policy.Family{policy.IPv4, policy.IPv6} {
 		var lines []string
@@ -288,6 +435,64 @@ func (i *IPTables) selectFamily(ctx context.Context, family policy.Family, previ
 		}
 	}
 	return nil
+}
+
+// UpdateDynamic reconciles only the recorded CrowdSec hash:net containers.
+// Static sets and packet paths are intentionally absent from the mutation
+// plan, so a partially applied restore converges on the next invocation.
+func (i *IPTables) UpdateDynamic(ctx context.Context, target *Target, prefixes []policy.TimedPrefix) error {
+	if err := ValidateTarget(target); err != nil {
+		return err
+	}
+	if target == nil || target.IPTables == nil {
+		return errors.New("iptables dynamic update requires an iptables target")
+	}
+	if target.DynamicGeneration == "" {
+		return errors.New("iptables dynamic update requires a dynamic generation")
+	}
+	if err := ValidateDynamic(prefixes); err != nil {
+		return err
+	}
+	expected, err := expectedIPT(target)
+	if err != nil {
+		return err
+	}
+	inventory, err := i.inspectTargets(ctx, expected)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	var input strings.Builder
+	for _, family := range []policy.Family{policy.IPv4, policy.IPv6} {
+		model := expected.models[target][family]
+		for _, set := range model.Sets {
+			if !set.Dynamic {
+				continue
+			}
+			desiredTimed := loweredIPTTimedPrefixes(prefixes, family)
+			set.DynamicProjection = true
+			set.Prefixes = make([]netip.Prefix, 0, len(desiredTimed))
+			desired := make(map[string]uint64, len(desiredTimed))
+			for _, value := range desiredTimed {
+				grant, _ := LeaseGrant(value.Deadline, now, time.Second)
+				if grant > 0 {
+					set.Prefixes = append(set.Prefixes, value.Prefix)
+					desired[value.Prefix.String()] = uint64(grant / time.Second)
+				}
+			}
+			expected.sets[set.Name] = set
+			spare := set
+			spare.Name = iptDynamicSpareName(set.Name)
+			expected.sets[spare.Name] = spare
+			if err := appendDynamicIPSet(&input, set, inventory, desired); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateIPTCapacity(inventory, expected); err != nil {
+		return err
+	}
+	return i.restoreSets(ctx, input.String())
 }
 
 // Apply stages both families before switching either one. Failed or uncertain
@@ -460,6 +665,26 @@ func (i *IPTables) remove(ctx context.Context, remove, keep []*Target) error {
 	}
 	slices.Sort(names)
 	for _, name := range names {
+		observed := inventory.Sets[name]
+		var accounted uint64
+		for _, rule := range inventory.Rules {
+			count := uint64(0)
+			for reference := range rule.references(iptSetReference) {
+				if reference == name {
+					count++
+				}
+			}
+			if count == 0 {
+				continue
+			}
+			if !obsolete.rules[rule.iptChainKey][iptRuleKey(rule.Args)] {
+				return fmt.Errorf("refusing to destroy referenced ipset %s", name)
+			}
+			accounted += count
+		}
+		if observed.References != accounted {
+			return fmt.Errorf("ipset %s has unaccounted native references", name)
+		}
 		if _, err := i.run(ctx, "ipset", []string{"destroy", name}, nil); err != nil {
 			return err
 		}

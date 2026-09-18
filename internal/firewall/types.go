@@ -24,13 +24,22 @@ type CounterSpec struct {
 // Target is an immutable, serializable desired firewall state. It contains the
 // complete model required to recover after a process or host restart.
 type Target struct {
-	Owner      string              `json:"owner"`
-	Table      string              `json:"table"`
-	Priority   int32               `json:"priority"`
-	Generation string              `json:"generation"`
-	Families   []policy.FamilyPlan `json:"families"`
-	Counters   []CounterSpec       `json:"counters"`
-	IPTables   *IPTablesTarget     `json:"iptables,omitempty"`
+	Owner             string              `json:"owner"`
+	Table             string              `json:"table"`
+	Priority          int32               `json:"priority"`
+	Generation        string              `json:"generation"`
+	Families          []policy.FamilyPlan `json:"families"`
+	Counters          []CounterSpec       `json:"counters"`
+	IPTables          *IPTablesTarget     `json:"iptables,omitempty"`
+	DynamicGeneration string              `json:"dynamic_generation,omitempty"`
+	Dynamic           *DynamicState       `json:"-"`
+}
+
+// DynamicState supplies an in-memory projection for activation. Its absence
+// preserves existing kernel leases during static recovery or refresh. Decisions
+// are never serialized as durable authority.
+type DynamicState struct {
+	Prefixes []policy.TimedPrefix
 }
 
 // IPTablesTarget records the owned integration boundary. Its presence selects
@@ -61,6 +70,7 @@ type Backend interface {
 	Apply(context.Context, *Target, *Target) error
 	Retire(context.Context, *Target, *Target) error
 	Cleanup(context.Context, []*Target) error
+	UpdateDynamic(context.Context, *Target, []policy.TimedPrefix) error
 }
 
 var targetIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -78,7 +88,7 @@ func validRole(role policy.CounterRole) bool {
 		return role.Reason == "" && role.Action == ""
 	}
 	return role.Kind == policy.Denied &&
-		(role.Reason == policy.GlobalBlocklist || role.Reason == policy.GeoPolicy) &&
+		(role.Reason == policy.GlobalBlocklist || role.Reason == policy.GeoPolicy || role.Reason == policy.CrowdSec) &&
 		(role.Action == policy.Drop || role.Action == policy.Reject)
 }
 
@@ -124,17 +134,13 @@ func validTrafficScope(scope policy.Scope) bool {
 	return true
 }
 
-// ValidateConfig validates the implemented static runtime. Offline validation
-// also accepts integrations that are not yet available here.
+// ValidateConfig validates the supported runtime configuration.
 func ValidateConfig(value config.Config) error {
 	if value.Version != 1 {
 		return fmt.Errorf("firewall runtime: unsupported config version %d", value.Version)
 	}
 	if value.Firewall.Backend != "nftables" && value.Firewall.Backend != "iptables" {
 		return fmt.Errorf("firewall runtime: unsupported backend %q", value.Firewall.Backend)
-	}
-	if value.CrowdSec.Enabled {
-		return fmt.Errorf("firewall runtime: crowdsec is not supported")
 	}
 	if value.Firewall.DenyAction != "drop" && value.Firewall.DenyAction != "reject" {
 		return fmt.Errorf("firewall runtime: unsupported deny action %q", value.Firewall.DenyAction)
@@ -161,8 +167,8 @@ func ValidateConfig(value config.Config) error {
 }
 
 // ValidateTarget checks the complete typed target before it can become
-// mutation authority. Dynamic models remain intentionally unrepresentable in
-// a Target; static global and geo sets are the only accepted sets.
+// mutation authority. Dynamic set identities are durable, but their decisions
+// exist only in the live authoritative store and expiring kernel leases.
 func ValidateTarget(value *Target) error {
 	if value == nil {
 		return nil
@@ -190,6 +196,17 @@ func ValidateTarget(value *Target) error {
 	if len(value.Families) == 0 {
 		return fmt.Errorf("firewall target: non-empty target requires at least one family")
 	}
+	if value.DynamicGeneration != "" && !validTargetID(value.DynamicGeneration) {
+		return fmt.Errorf("firewall target: invalid dynamic generation")
+	}
+	if value.Dynamic != nil {
+		if value.DynamicGeneration == "" {
+			return fmt.Errorf("firewall target: dynamic projection requires a dynamic generation")
+		}
+		if err := ValidateDynamic(value.Dynamic.Prefixes); err != nil {
+			return err
+		}
+	}
 	seenFamilies := make(map[policy.Family]struct{}, len(value.Families))
 	expectedCounters := make(map[string]CounterSpec)
 	nativeSets := make(map[string]string)
@@ -202,9 +219,20 @@ func ValidateTarget(value *Target) error {
 		}
 		seenFamilies[family.Family] = struct{}{}
 		setIDs := make(map[string]struct{}, len(family.Sets))
+		hasDynamic := false
 		for _, set := range family.Sets {
-			if set.Kind != policy.StaticSet || !validStaticSetID(set.ID) {
-				return fmt.Errorf("firewall target: unsupported set %q", set.ID)
+			switch set.Kind {
+			case policy.StaticSet:
+				if !validStaticSetID(set.ID) {
+					return fmt.Errorf("firewall target: unsupported static set %q", set.ID)
+				}
+			case policy.DynamicCrowdSecSet:
+				if set.ID != "crowdsec" || len(set.Prefixes) != 0 || value.DynamicGeneration == "" {
+					return fmt.Errorf("firewall target: invalid dynamic set")
+				}
+				hasDynamic = true
+			default:
+				return fmt.Errorf("firewall target: unsupported set kind")
 			}
 			if _, ok := setIDs[set.ID]; ok {
 				return fmt.Errorf("firewall target: duplicate set %q", set.ID)
@@ -225,6 +253,9 @@ func ValidateTarget(value *Target) error {
 					return fmt.Errorf("firewall target: set %s: %w", set.ID, err)
 				}
 			}
+		}
+		if hasDynamic != (value.DynamicGeneration != "") {
+			return fmt.Errorf("firewall target: dynamic generation and family model disagree")
 		}
 		pathDirections := make(map[policy.Direction]struct{}, 2)
 		for _, path := range family.Paths {
@@ -250,6 +281,11 @@ func ValidateTarget(value *Target) error {
 			for _, rule := range path.Rules {
 				if err := validateRuntimeRule(rule, setIDs); err != nil {
 					return fmt.Errorf("firewall target: %s path rule: %w", path.Direction, err)
+				}
+				if rule.Match.SetID == "crowdsec" && (path.Direction != policy.Ingress ||
+					rule.Counter.Reason != policy.CrowdSec || !rule.Match.Traffic.Any ||
+					rule.Match.NegateSet || rule.Policy != "") {
+					return fmt.Errorf("firewall target: invalid CrowdSec rule")
 				}
 				if rule.Counter.Kind == policy.Denied {
 					if !validRole(rule.Counter) {
@@ -343,6 +379,9 @@ func validateRuntimeRule(rule policy.Rule, setIDs map[string]struct{}) error {
 		}
 		if rule.Counter.Reason == policy.GeoPolicy && rule.Policy == "" {
 			return fmt.Errorf("geo denial counter is missing policy metadata")
+		}
+		if rule.Counter.Reason == policy.CrowdSec && (rule.Match.SetID != "crowdsec" || rule.Policy != "") {
+			return fmt.Errorf("CrowdSec denial counter has invalid match")
 		}
 		if rule.Counter.Reason == policy.GlobalBlocklist && rule.Policy != "" {
 			return fmt.Errorf("global denial counter has policy metadata")

@@ -6,11 +6,10 @@ and policy evaluation; [architecture](architecture.md) owns admission, durable
 publication, recovery, and the cross-target migration algorithm;
 [operations](operations.md) owns procedures and observability.
 
-> **Status boundary.** Static source-backed policy, both native backends, target
-> migration, custom attachments, and native packet accounting are implemented.
-> CrowdSec dynamic updates and Docker-specific coexistence remain first-release
-> work. Where this document describes those integrations, it labels the
-> contract rather than claiming current runtime support.
+> **Status boundary.** Static source-backed policy, CrowdSec dynamic bans, both
+> native backends, target migration, custom attachments, and native packet
+> accounting are implemented. Docker-specific coexistence remains first-release
+> work rather than a current support claim.
 
 ## Common invariants
 
@@ -34,18 +33,18 @@ Both implemented backends obey these rules:
 - Keep IPv4 and IPv6 sets distinct. nftables switches both families together
   in one netlink transaction; iptables commits each family independently.
 
-**Planned dynamic integration.** When CrowdSec is delivered, stable dynamic
-sets will use the source-owned [timed projection and renewable lease
+**Dynamic integration.** Stable CrowdSec containers use the source-owned
+[timed projection and renewable lease
 contract](data-sources.md#renewable-kernel-leases). Credential or endpoint
-replacement and disable will stage separate dynamic-set references, retaining
+replacement and disable stage separate dynamic-set references, retaining
 old references and live lease state through durable commit. Ordinary static
-refreshes will reuse active dynamic sets. A backend must not invent another
+refreshes reuse active dynamic sets. A backend must not invent another
 ban cap, renewal schedule, or expiry policy; daemon downtime can let leases
 expire before the retained source deadline.
 
 The packet path is limited to new flows. `ESTABLISHED,RELATED` returns before
 any denial check, and non-`NEW` traffic returns. For a new flow, the effective
-order is global allowlist, global blocklist, planned ingress CrowdSec set, then
+order is global allowlist, global blocklist, ingress CrowdSec set, then
 geo policies by ascending priority. A non-match and an allowlist match return
 or continue to the surrounding firewall; neither emits a global `ACCEPT`.
 `drop` maps to DROP. `reject` maps to a TCP reset for TCP and the native
@@ -66,7 +65,7 @@ owned direction entry
   -> not a NEW flow? return
   -> global allowlist? return/continue
   -> global blocklist? deny
-  -> planned ingress CrowdSec set? deny
+  -> ingress CrowdSec set? deny
   -> remote address not globally routable unicast? return
   -> geo policies in ascending priority: first matching traffic scope decides
   -> no matching scope: return
@@ -93,7 +92,7 @@ packets. Perimeterd does not use packet marks or topology-based de-duplication.
 
 A denied counter increments only for the terminal denial decision actually
 executed on that traversal. It is classified by `global_blocklist`,
-`crowdsec` (planned), or `geo_policy`, and by `drop` or `reject`. Intermediate
+`crowdsec`, or `geo_policy`, and by `drop` or `reject`. Intermediate
 match/jump counters and terminal rules that were not executed are not included;
 a generated rejection response is not another denied packet.
 
@@ -117,7 +116,7 @@ The nftables backend owns one `inet` table whose configured name defaults to
   guards, and dispatch to the selected generated path;
 - stable named counters for processed traffic and bounded denial reasons;
 - generation-suffixed IPv4 and IPv6 sets for global and geo prefixes; and
-- **planned** stable dynamic IPv4/IPv6 CrowdSec sets with renewable leases.
+- stable dynamic IPv4/IPv6 CrowdSec sets with renewable leases.
 
 The priority must be a signed 32-bit value strictly greater than conntrack's
 `-200`: the accepted range is `-199` through `2147483647`. Local validation
@@ -159,11 +158,14 @@ Only after durable active-record commit may a later cleanup remove it. Delayed
 or failed cleanup retains owned sets/chains for retry and never reverts a
 successful enforcement switch.
 
-**Planned dynamic updates.** CrowdSec additions and removals will use smaller
-netlink transactions against stable dynamic sets and the source lease rules;
-they must not rebuild static generations. Until that integration lands, the
-runtime rejects `crowdsec.enabled: true` and creates no dynamic CrowdSec
-objects.
+**Dynamic updates.** CrowdSec projections replace the contents of stable
+dynamic sets without rebuilding static generations. Each changed set uses a
+flush and grouped element addition in the same atomic netlink transaction:
+there is no empty-set enforcement window. Grouping avoids repeated ownership
+metadata, and flushing avoids expensive individual interval deletions during
+large-list renewal. Timed elements use integer-second native timeouts and
+remain bounded after daemon shutdown. This native replacement does not change
+the incremental LAPI stream protocol.
 
 Changing the table name is a target migration, not an in-place update: build
 and apply the new table, commit it, then retire recorded old ownership. The
@@ -231,13 +233,29 @@ allow-before-block precedence:
 | `0.0.0.0/0` | `0.0.0.0/1` and `128.0.0.0/1` |
 | `::/0` | `::/1` and `8000::/1` |
 
-Static global and geo sets use this lowering today. **Planned dynamic
-integration** must lower dynamic `/0` in the same way: the pair is one
+Static global, geo, and dynamic sets use this lowering. Dynamic `/0` is lowered
+with the same source lifetime: the pair is one
 projected prefix with one absolute deadline and equal remaining lease timeout,
 not two fresh full-duration bans. Reconcile both members from the current
 projection on partial updates; do not delete a member still required by that
 projection. Non-`/0` prefixes retain their shape. nftables represents `/0`
 natively with the same logical semantics.
+
+Dynamic ipsets are created with at least 65,536 entries of capacity and grow geometrically.
+Growth populates a deterministic, generation-owned spare, atomically swaps it
+with the attached live set, and removes the old contents. Interrupted growth
+retains recorded ownership of both names; reconciliation uses the latest
+projection rather than replaying stale decisions. A spare with unrecorded
+native references is never modified or removed.
+
+An interrupted static restore may leave an unreferenced, recorded staging set
+with only a subset of its expected entries. Recovery may complete that set and
+cleanup may remove it. Missing entries in a referenced static set, or
+unrecorded entries in either case, still fail ownership validation.
+
+IPv6 overlap projection may produce mapped IPv6 residual prefixes even when
+the source inputs are non-mapped. Both backends preserve those residuals as
+128-bit IPv6 ranges; they do not grant authority over IPv4 addresses.
 
 ## iptables attachment contract
 

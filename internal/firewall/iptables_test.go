@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
@@ -82,6 +84,28 @@ func TestIPSetSaveAcceptsForeignTypesAndNormalizesHostPrefixes(t *testing.T) {
 		t.Fatalf("incorrect native inventory: %+v", sets)
 	}
 }
+
+func TestIPSetSaveRetainsFiniteDynamicTimeouts(t *testing.T) {
+	sets, err := parseIPSetSave([]byte("create owned hash:net family inet maxelem 65536 timeout 86400\nadd owned 198.51.100.1 timeout 37\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := sets["owned"]
+	if !owned.Extended || owned.UnknownOptions || owned.Timeouts["198.51.100.1/32"] != 37 {
+		t.Fatalf("dynamic timeout metadata was not retained safely: %+v", owned)
+	}
+}
+
+func TestIPTDynamicZeroPrefixRetainsOneDeadline(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	values := loweredIPTTimedPrefixes([]policy.TimedPrefix{{Prefix: policyPrefix("0.0.0.0/0"), Deadline: deadline}}, policy.IPv4)
+	if len(values) != 2 || values[0].Deadline != deadline || values[1].Deadline != deadline ||
+		values[0].Prefix.String() != "0.0.0.0/1" || values[1].Prefix.String() != "128.0.0.0/1" {
+		t.Fatalf("zero prefix did not lower with retained deadline: %#v", values)
+	}
+}
+
+func policyPrefix(value string) netip.Prefix { return netip.MustParsePrefix(value) }
 
 func TestIPTablesInventorySeparatesTableAndParentNames(t *testing.T) {
 	backend := &IPTables{exec: func(_ context.Context, command string, _ []string, _ []byte) ([]byte, error) {

@@ -89,6 +89,31 @@ printf '%%s %%s\n' "$name" "$*" >> "$log"
 if [ "${1:-}" = "--version" ]; then exec "$real" "$@"; fi
 mode=$(/bin/cat "$modefile")
 case "$name" in
+  ipset)
+    case "$mode:${1:-}" in
+      set-partial:restore|set-before-swap:restore|set-after-swap:restore)
+        if [ ! -e "$marker.$mode" ]; then
+          tmp=$(/usr/bin/mktemp)
+          trap '/bin/rm -f "$tmp"' EXIT
+          while IFS= read -r line; do
+            case "$mode:$line" in
+              set-partial:add\ *|set-after-swap:swap\ *)
+                printf '%%s\n' "$line" >> "$tmp"
+                /usr/bin/touch "$marker.$mode"
+                "$real" restore < "$tmp"
+                exit 42 ;;
+              set-before-swap:swap\ *)
+                /usr/bin/touch "$marker.$mode"
+                "$real" restore < "$tmp"
+                exit 42 ;;
+            esac
+            printf '%%s\n' "$line" >> "$tmp"
+          done
+          "$real" restore < "$tmp"
+          exit 0
+        fi ;;
+    esac
+    exec "$real" "$@" ;;
   iptables-restore|ip6tables-restore)
     tmp=$(/usr/bin/mktemp)
     trap '/bin/rm -f "$tmp"' EXIT
@@ -147,7 +172,7 @@ func writeFailureMode(t *testing.T, tools iptablesTools, mode string) {
 	if err := os.WriteFile(tools.mode, []byte(mode), 0o600); err != nil {
 		t.Fatalf("write iptables failure mode %q: %v", mode, err)
 	}
-	for _, suffix := range []string{"all", "precommit", "retire", "v6-second", "v6-second-comp-1", "v6-second-comp-2"} {
+	for _, suffix := range []string{"all", "precommit", "retire", "v6-second", "v6-second-comp-1", "v6-second-comp-2", "set-partial", "set-before-swap", "set-after-swap"} {
 		_ = os.Remove(tools.marker + "." + suffix)
 	}
 }

@@ -111,6 +111,20 @@ func TestIPTActiveAttachmentNamesStableAcrossGeneration(t *testing.T) {
 	}
 }
 
+func TestIPTDynamicSetNameUsesIndependentFullIdentity(t *testing.T) {
+	target := iptModelTestTarget("abcdefabcdefabcdefabcdefabcdefab", nil)
+	target.DynamicGeneration = "11111111111111111111111111111111"
+	first := iptDynamicSetName(target, policy.IPv4)
+	target.Generation = "fedcbafedcbafedcbafedcbafedcbafe"
+	if second := iptDynamicSetName(target, policy.IPv4); first != second || len([]byte(first)) != maxIPTSetNameBytes {
+		t.Fatalf("dynamic set identity changed with static generation or exceeded native limit: %q -> %q", first, second)
+	}
+	target.DynamicGeneration = "22222222222222222222222222222222"
+	if third := iptDynamicSetName(target, policy.IPv4); third == first {
+		t.Fatal("dynamic generation did not change the native set identity")
+	}
+}
+
 func TestValidateIPTablesTargetRejectsMalformedAndDuplicateAttachments(t *testing.T) {
 	bad := iptModelTestTarget("abcdefabcdefabcdefabcdefabcdefab", []config.Attachment{{Chain: "bad chain", Direction: "ingress"}})
 	if err := validateIPTablesTarget(bad); err == nil {

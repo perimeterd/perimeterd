@@ -7,13 +7,12 @@
 > durable-recovery behavior are implemented; backend realization is specified
 > in [firewall backends](firewall-backends.md).
 >
-> **Planned status.** CrowdSec dynamic-ban runtime integration remains planned.
-> The protocol, authoritative-stream, expiry, projection, lease, and reload
-> requirements below are the first-release contract for that integration, not a
-> claim that the current runtime can enable it. The
-> [implementation plan](implementation-plan.md) is authoritative for delivery
-> status, and [operations](operations.md#current-source-build-runtime) lists
-> currently usable runtime capabilities.
+> CrowdSec dynamic bans are also implemented on both backends, with
+> authoritative synchronization, timed overlap projection, staged reloads, and
+> renewable finite kernel leases. The supported LAPI deployment prerequisite
+> below remains mandatory. The [implementation plan](implementation-plan.md)
+> owns delivery status; [operations](operations.md#current-source-build-runtime)
+> describes source-build use and its production-security limitations.
 
 ## Contents
 
@@ -28,7 +27,7 @@
   - [Snapshot manifests](#snapshot-manifests)
   - [Cache publication and durable-commit coupling](#cache-publication-and-durable-commit-coupling)
   - [Fresh reuse and stale fallback](#fresh-reuse-and-stale-fallback)
-- [CrowdSec stream (planned)](#crowdsec-stream)
+- [CrowdSec stream](#crowdsec-stream)
   - [Supported LAPI contract](#supported-lapi-contract)
   - [Compatibility rationale and primary-source evidence](#compatibility-rationale-and-primary-source-evidence)
   - [Response-envelope validation](#response-envelope-validation)
@@ -37,12 +36,11 @@
   - [Stream synchronization and activation](#stream-synchronization-and-activation)
   - [Overlap, expiry, and backend projection](#overlap-expiry-and-backend-projection)
   - [Renewable kernel leases](#renewable-kernel-leases)
-- [CrowdSec availability, endpoint changes, and secrets (planned)](#crowdsec-availability-endpoint-changes-and-secrets)
+- [CrowdSec availability, endpoint changes, and secrets](#crowdsec-availability-endpoint-changes-and-secrets)
 - [Source failure matrix](#source-failure-matrix)
 
-Version 1 uses RIPEstat for static country/ASN prefixes. The first-release
-design also includes a planned CrowdSec LAPI integration for dynamic ingress
-bans. [Configuration](configuration.md) defines selectors and defaults;
+Version 1 uses RIPEstat for static country/ASN prefixes and CrowdSec LAPI for
+dynamic ingress bans. [Configuration](configuration.md) defines selectors and defaults;
 [architecture](architecture.md) defines revision admission, commit behavior,
 and process lifecycle. Sources produce typed data and never emit firewall
 syntax. This document owns source wire compatibility, source-side validation,
@@ -301,13 +299,7 @@ normal schedule.
 
 ## CrowdSec stream
 
-> **Planned first-release integration.** CrowdSec runtime code is not
-> implemented in the current build; `crowdsec.enabled` is schema-valid for
-> offline validation but must remain disabled for runtime use. The requirements
-> in this section are normative for the planned integration and do not imply
-> that a current daemon can authenticate, poll, or enforce CrowdSec decisions.
-
-The planned adapter uses the MIT-licensed
+The implemented adapter uses the MIT-licensed
 [`github.com/crowdsecurity/go-cs-bouncer`](https://github.com/crowdsecurity/go-cs-bouncer)
 for authenticated API client setup and its stream-mode data types, not its
 point-query protocol. The adapter owns the polling loop and calls the exposed
@@ -315,40 +307,27 @@ point-query protocol. The adapter owns the polling loop and calls the exposed
 It must not delegate recovery to `StreamBouncer.Run`: the current
 [implementation](https://raw.githubusercontent.com/crowdsecurity/go-cs-bouncer/main/stream_bouncer.go)
 keeps `Startup=false` after post-start errors and does not implement this
-design's reconnect contract. Pin and review the dependency used for these APIs.
+design's reconnect contract. The implementation pins `go-cs-bouncer v0.0.21`
+and the patched `crowdsec v1.8.1` SDK in `go.mod`; it does not run the SDK poller.
 CrowdSec describes bouncers as
 [remediation components](https://docs.crowdsec.net/u/bouncers/intro/) that act
 on Security Engine decisions.
 
 ### Supported LAPI contract
 
-The planned version-1 integration targets the reviewed CrowdSec LAPI baseline
-at [v1.7.6](https://github.com/crowdsecurity/crowdsec/tree/v1.7.6), including
-the stream decoder behavior reviewed in
-[`pkg/apiclient/client_http.go`](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/apiclient/client_http.go)
-and the feature registration in
-[`pkg/fflag/crowdsec.go`](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/fflag/crowdsec.go).
-The LAPI deployment is an explicit prerequisite, not a capability that the
-adapter discovers from a response:
+The supported and tested CrowdSec LAPI server baseline is
+[v1.8.1](https://github.com/crowdsecurity/crowdsec/tree/v1.8.1), using its normal
+chunked decision stream. No legacy feature-flag override is required.
 
-- `chunked_decisions_stream` must be disabled in both
-  `CROWDSEC_FEATURE_CHUNKED_DECISIONS_STREAM` (set it to `false`) and
-  `<ConfigDir>/feature.yaml` (the file must not list
-  `- chunked_decisions_stream`; the usual path is
-  `/etc/crowdsec/feature.yaml`). The two settings are required together so
-  that an environment or file setting cannot silently enable the mode.
-- The endpoint's JSON, headers, transfer encoding, or a successful envelope
-  cannot attest that the server is running with that feature disabled. In the
-  defective chunked-LAPI mode, a response can be a syntactically valid,
-  apparently complete `new`/`deleted` envelope even though the backing
-  database read produced only a partial result. Envelope validity therefore
-  proves wire-format validity, not database query success or completeness; it
-  must never authorize replacing the authoritative store on its own.
-- A different CrowdSec release, a changed stream implementation, or enabled
-  chunked mode is unsupported until a reviewed compatibility update establishes
-  its response and cursor semantics with primary-source evidence and actual
-  response fixtures. Support is added explicitly, not inferred from version
-  ordering or HTTP framing.
+The adapter uses `/v1/decisions/stream`, not repeated downloads from
+`/v1/decisions`. Initial synchronization, reconnects, and staged client
+replacement request a full `startup=true` snapshot; ordinary polls use
+`startup=false` and consume incremental additions and deletions. This avoids
+repeatedly downloading large external blocklists, which may contain around
+100,000 IPs/CIDRs. There is no periodic full-snapshot polling workaround.
+
+The upstream query-error issue is an explicitly accepted temporary risk,
+documented below; it does not block support for this server release.
 
 Every request to `/v1/decisions/stream` uses `dedup=false`, including the
 initial `startup=true` request, every reconnect `startup=true` request, and each
@@ -369,16 +348,31 @@ authoritative store.
 
 ### Compatibility rationale and primary-source evidence
 
-The reviewed behavior is defined by the
-[database stream queries](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/database/decisions.go),
-[SDK request options](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/apiclient/decisions_service.go),
-and the defective
-[chunked query-error path](https://github.com/crowdsecurity/crowdsec/blob/v1.7.6/pkg/apiserver/controllers/v1/decisions.go#L267-L284).
-These sources explain the explicit version pin, the disabled chunked feature,
-and the transport-level `dedup=false` requirement; they are compatibility
-rationale, not an alternative runtime contract. See
-[operations](operations.md#supported-crowdsec-lapi-prerequisite) for operator
-checks and the required server restart after feature changes.
+The reviewed behavior is defined by the v1.8.1
+[database stream queries](https://github.com/crowdsecurity/crowdsec/blob/v1.8.1/pkg/database/decisions.go),
+[SDK request options](https://github.com/crowdsecurity/crowdsec/blob/v1.8.1/pkg/apiclient/decisions_service.go),
+and [stream controller](https://github.com/crowdsecurity/crowdsec/blob/v1.8.1/pkg/apiserver/controllers/v1/decisions.go).
+The pinned real-LAPI gate verifies all decision IDs with `dedup=false`,
+incremental updates without replaying the active snapshot, overlapping-ID
+deletion, reconnect, and valid authoritative emptiness.
+
+**Accepted upstream risk.**
+[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691)
+tracks a database query failure that can produce HTTP 200 with a valid-looking
+empty or incomplete stream envelope. Envelope validation cannot distinguish
+that response from successful data. A startup or reconnect snapshot may
+therefore replace CrowdSec authority with an incomplete or empty set; restoring
+all omitted decisions may require a later full synchronization. Static global
+and geo policy are not replaced by CrowdSec snapshots.
+
+As of 2026-09-17, this risk is deliberately accepted because CrowdSec is an
+additional protection layer. Perimeterd proceeds under the normal stream
+contract while the issue is addressed upstream. Do not add a database-fault
+regression for this condition, block current-server support on it, downgrade
+the server, or substitute repeated full-list downloads. The compatibility
+gate deliberately excludes this condition; it does not claim it is fixed.
+Malformed-response validation, explicit HTTP-error handling, local expiry,
+and renewable lease protections remain unchanged.
 
 ### Response-envelope validation
 
@@ -400,9 +394,12 @@ The gate must validate one complete JSON envelope before returning bytes to
 - the body is non-empty and its top-level value is exactly one object;
 - after that object's closing `}`, only JSON whitespace is allowed; a second
   value, any other trailing byte, or an incomplete document is an error;
-- `new` and `deleted` each occur exactly once and each value is either an array
-  or JSON `null` (null is normalized to an empty array); missing, duplicate,
-  malformed, or other-typed required fields are errors; and
+- lowercase `new` and `deleted` each occur exactly once and each value is either
+  an array or JSON `null` (null is normalized to an empty array); missing,
+  duplicate, malformed, or other-typed required fields are errors. Case variants
+  such as `New` and `Deleted` are also errors, not ignored extensions, because
+  the SDK's case-insensitive decoder could use them to overwrite validated
+  fields; and
 - unknown members may be ignored only after their complete JSON values have
   been parsed, so malformed data cannot be hidden in an unexamined suffix.
 
@@ -425,9 +422,11 @@ exists; it never installs an empty candidate.
 
 The adapter accepts only decisions whose type is `ban` and whose scope/value
 is a valid IP address or CIDR. It canonicalizes addresses and masks CIDRs with
-`net/netip`, rejects malformed decisions, requires an LAPI decision ID, and
-stores an absolute expiry. An LAPI-provided absolute expiry is authoritative
-and retained exactly; pair it with a local monotonic deadline for scheduling.
+`net/netip`, rejects malformed decisions and zone-qualified (scoped) addresses,
+requires an LAPI decision ID, and stores an absolute expiry. Scope rejection
+precedes canonicalization so converting to a prefix cannot silently broaden
+authority. An LAPI-provided absolute expiry is authoritative and retained
+exactly; pair it with a local monotonic deadline for scheduling.
 If the API supplies only a valid duration `d`, capture wall-clock and monotonic
 instants at request start, `(wall_start, mono_start)`, and derive the
 conservative deadline as `wall_start + d - 1s`, paired with
@@ -435,6 +434,12 @@ conservative deadline as `wall_start + d - 1s`, paired with
 the one-second cushion covers the API's duration rounding. Consequently a
 duration-only decision can expire locally up to the request age plus that
 cushion early, in addition to native timeout quantization.
+
+Mapped IPv4 source addresses, such as `::ffff:198.51.100.77`, are canonicalized
+to IPv4 `/32` authority. A source CIDR wholly within the mapped `/96` becomes
+the equivalent IPv4 network (`::ffff:198.51.101.129/120` becomes
+`198.51.101.0/24`). Broader IPv6 ranges and the 128-bit IPv6 residual ranges
+produced by overlap projection retain their IPv6 family.
 
 An already elapsed deadline causes that decision to be omitted as expired, not
 a malformed-response error or evidence that the entire snapshot is empty.
@@ -587,6 +592,10 @@ rounded = floor(remaining / u) * u
 grant = min(rounded, 86400s)
 ```
 
+Both current backends use `u = 1s`: ipset accepts integer-second timeouts, and
+the nftables JSON API requires integer seconds for timed elements. Sub-second
+positive lifetimes are omitted rather than encoded as a zero/permanent lease.
+
 If `remaining <= 0`, expire the contribution. If it is still future but
 `grant <= 0`, omit its native element until the ordinary deadline event; do not
 enqueue an immediate self-retrying update. Never pass zero, because zero means
@@ -607,6 +616,10 @@ validation gate, reconnect is pending, or dynamic enforcement is in degraded
 recovery. Renewal and reconciliation still pass through the serialized writer;
 they cannot bypass a static transaction's mutation fence. If static recovery
 blocks writes, queued renewals wait and kernel leases may expire early.
+Failed dynamic writes explicitly wake this scheduler when scheduling a retry,
+including when the active decision store is empty and has no expiry or renewal
+timer. A reconnect whose new-snapshot write and compensation both fail must not
+leave recovery dependent on another decision or expiry event.
 
 A stale callback or queued attempt is benign: recompute any outstanding lease
 obligation from current state without changing health merely for losing an
@@ -663,11 +676,7 @@ degraded recovery blocks dynamic mutations.
 
 ## CrowdSec availability, endpoint changes, and secrets
 
-> **Planned integration.** The requirements in this section apply only after
-> the CrowdSec runtime milestone is implemented. Current runtime use keeps
-> CrowdSec disabled; see [operations](operations.md#current-source-build-runtime).
-
-For the planned integration, CrowdSec is optional. When enabled:
+CrowdSec is optional. When enabled:
 
 - the key file must exist, be readable, and contain a usable credential;
 - initial LAPI authentication, authoritative full synchronization, exact
@@ -717,8 +726,7 @@ file modes and observability.
 
 ## Source failure matrix
 
-The RIPEstat/cache rows describe implemented source-backed policy. The CrowdSec
-rows are requirements for the planned integration.
+The rows below describe implemented source-backed and dynamic policy behavior.
 
 ### RIPEstat and cache (implemented)
 
@@ -730,7 +738,7 @@ rows are requirements for the planned integration.
 | Corrupt objects referenced by recovery state | Do not silently substitute a newly fetched generation. Recovery validates the journal and committed references before admitting work; missing recovery evidence requires repair as specified in [architecture](architecture.md#durable-apply-and-crash-recovery). |
 | Initial backend application failure | Withhold readiness and perform backend-specific compensation; preserve recovery evidence if it fails. |
 
-### CrowdSec integration (planned)
+### CrowdSec integration
 
 | Failure | Required behavior |
 | --- | --- |

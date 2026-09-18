@@ -131,7 +131,7 @@ func command(t *testing.T, timeout time.Duration, args ...string) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	// #nosec G204 -- command and arguments are fixed by this privileged test harness.
+	// #nosec G204 G702 -- privileged fixtures choose the executable; native identifiers are argv values, never shell input.
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {

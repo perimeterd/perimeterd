@@ -81,8 +81,8 @@ crowdsec:
 `geo` uses RIPEstat as the only version 1 provider and has no configurable
 provider field; [data sources](data-sources.md) owns its endpoints, snapshots,
 and compatibility contract. `crowdsec.lapi_url` is an independent absolute
-HTTP or HTTPS URL; HTTP is permitted for a local LAPI. CrowdSec runtime
-support is planned, as described below.
+HTTP or HTTPS URL; HTTP is permitted for a local LAPI. CrowdSec requires the
+supported remote deployment described below.
 
 ## Canonical field and default table
 
@@ -114,7 +114,7 @@ and are always validated; only the selected backend is applied.
 | `geo.refresh_jitter` | duration | `10m` | Positive upper delay |
 | `groups` | map | `{}` | Lowercase name to countries |
 | `policies` | list | `[]` | Explicit priority order |
-| `crowdsec.enabled` | bool | `false` | Enable LAPI stream (planned runtime) |
+| `crowdsec.enabled` | bool | `false` | Enable the supported LAPI stream integration |
 | `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
 | `crowdsec.api_key_file` | path | none | Required by schema when enabled |
 | `crowdsec.update_frequency` | duration | `10s` | Positive |
@@ -135,10 +135,9 @@ allowlist still adds immutable local ranges).
 While CrowdSec is disabled, `api_key_file: ""` is equivalent to omission; when
 enabled, the schema requires a non-empty path.
 
-The `crowdsec` block is accepted by offline schema validation. Current
-`run` rejects `crowdsec.enabled: true`; the dynamic LAPI integration is planned.
-When that integration is delivered, enabling it will also require the operator-
-verified [supported LAPI contract](data-sources.md#supported-lapi-contract).
+The `crowdsec` block is accepted by offline schema validation and runtime
+enforcement. Enabling it also requires the operator-verified
+[supported LAPI contract](data-sources.md#supported-lapi-contract).
 Neither local validation nor a successful API call can attest that remote
 deployment prerequisite.
 
@@ -313,15 +312,13 @@ direction, traffic, and selector syntax remain locally validated, but selectors
 are not fetched or resolved and the policy emits no rules or sets. A disabled
 policy therefore continues to reserve its priority within its direction, so
 enabling it cannot silently reorder another policy. Removing the policy has the
-same firewall result for that policy. Other policies remain; when the planned
-CrowdSec integration is available, its artifacts remain as well.
+same firewall result for that policy. Other policies and enabled CrowdSec
+artifacts remain.
 
 ## Evaluation semantics
 
-The ordering below is the normative contract for static policy evaluation and
-for the planned CrowdSec stage. The current runtime rejects
-`crowdsec.enabled: true`; documenting this stage does not imply that it can be
-enabled today.
+The ordering below is the contract for static policy and the enabled CrowdSec
+stage on both native backends.
 
 1. `ESTABLISHED,RELATED` traffic returns before all perimeterd denial rules.
 2. Traffic that is not a new conntrack flow returns.
@@ -345,8 +342,8 @@ an administrator continue after perimeterd returns.
 Geo policy applies only to new conntrack flows and geo-eligible unicast remote
 addresses, defined exactly below. References to globally routable or global
 addresses in geo examples mean this classification, not a live routing lookup.
-When the planned CrowdSec stage is available, it may deny any explicitly
-banned valid IP or CIDR not present in the effective global allowlist.
+CrowdSec may deny any explicitly banned valid IP or CIDR not present in the
+effective global allowlist.
 Established traffic returns first, preserving
 replies to host-originated connections in ingress and replies to accepted
 inbound connections in egress.
@@ -397,8 +394,8 @@ relying on a library's evolving classification. The restored exceptions are
 more specific than their excluded parent; backend prefix compaction must not
 erase those holes.
 
-This classifier is consulted only after global allow, global block, and, when
-available, the planned ingress CrowdSec checks. Exclusion from geo policy is not
+This classifier is consulted only after global allow, global block, and enabled
+ingress CrowdSec checks. Exclusion from geo policy is not
 an unconditional allow: a configured global block or CrowdSec ban can still
 deny non-eligible space unless the effective global allowlist protects it.
 
@@ -417,9 +414,9 @@ artifacts, including allow-only rules and accounting objects, through the
 normal journaled apply/cleanup path. Configured and built-in allows alone do
 not require a firewall path.
 
-An empty policy list does not suppress a remaining global block. When the
-planned CrowdSec integration is available and enabled, keep its dynamic path
-even when its current decision store is empty. Do not infer the no-artifacts
+An empty policy list does not suppress a remaining global block. When CrowdSec
+is enabled, keep its dynamic path even when its current decision store is empty.
+Do not infer the no-artifacts
 state from a temporarily empty source response or from allows shadowing
 configured denies.
 
@@ -595,8 +592,7 @@ policies:
 the four configured partner countries; other global destinations are denied.
 
 ### Disable only SSH while retaining web and CrowdSec
-This fragment illustrates the planned CrowdSec integration; the current runtime
-rejects `crowdsec.enabled: true`.
+This requires the [supported LAPI deployment](data-sources.md#supported-lapi-contract).
 
 Before:
 
@@ -703,8 +699,8 @@ These cases are normative checks of the preceding ordering:
 7. **SSH-only reset:** changing only `ssh-admin` to `disabled`, or removing it,
    removes its static rule/set artifacts. Web policy and CrowdSec dynamic sets
    are unchanged.
-8. **Planned CrowdSec precedence:** when the planned integration is available, a
-   new ingress flow not globally listed but from a CrowdSec-banned address is
+8. **CrowdSec precedence:** a new ingress flow not globally listed but from a
+   CrowdSec-banned address is
    denied before geo evaluation even when a geo allowlist contains it.
 
 ## Validation phases
@@ -727,10 +723,9 @@ non-empty target, and stages then applies a backend reconcile. Reload repeats
 this full staging path; initial readiness additionally requires the decision
 projection to be applied and its durable active revision committed.
 
-The current static runtime supports the RIPEstat-backed country/ASN policy
-model on both nftables and iptables/ipset. `crowdsec.enabled: true` is accepted
-by `validate` only as a schema value and is rejected by `run`; the dynamic LAPI
-integration and its remote prerequisite remain planned. A configuration with
+The runtime supports RIPEstat-backed country/ASN policy and CrowdSec ingress
+bans on both nftables and iptables/ipset. CrowdSec enablement additionally
+requires the operator-verified remote deployment prerequisite. A configuration with
 both `firewall.ipv4: false` and `firewall.ipv6: false` is locally valid when
 it requests no artifacts, but runtime compilation rejects it when enforcement
 is requested. See [architecture](architecture.md) for freshness, commit,

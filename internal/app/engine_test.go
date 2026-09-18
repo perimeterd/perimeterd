@@ -9,6 +9,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
@@ -61,6 +62,10 @@ func (b *recordingBackend) selectTarget(candidate *firewall.Target) {
 	} else {
 		b.selected = candidate.Generation
 	}
+}
+
+func (b *recordingBackend) UpdateDynamic(context.Context, *firewall.Target, []policy.TimedPrefix) error {
+	return nil
 }
 
 func (b *recordingBackend) Retire(context.Context, *firewall.Target, *firewall.Target) error {

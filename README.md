@@ -6,12 +6,13 @@
 existing Linux firewall. It filters unwanted ingress and egress traffic; the
 parent firewall remains responsible for permitting services and ports.
 
-> **Status: static source-backed nftables and iptables/ipset runtime.** Offline
-> validation, the pure policy compiler, direct IP/CIDR rules, and RIPEstat
-> country/RIR/group/ASN policies are implemented, with immutable source caching,
-> scheduled refresh, durable recovery, backend migration, and isolated packet-path
-> tests. CrowdSec, Docker integration, packages, and production releases remain
-> planned. This is not yet a production-ready security control.
+> **Status: source-backed nftables and iptables/ipset runtime with CrowdSec.**
+> Offline validation, the pure policy compiler, direct IP/CIDR rules, RIPEstat
+> country/RIR/group/ASN policies, and CrowdSec ingress bans are implemented.
+> The runtime includes immutable static caching, durable recovery, renewable
+> dynamic leases, backend migration, and isolated packet-path tests. Docker
+> integration, packages, and production releases remain planned. This is not
+> yet a production-ready security control.
 
 The [implementation plan](docs/implementation-plan.md) is the authoritative
 record of completed milestones and remaining work.

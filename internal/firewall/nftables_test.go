@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
@@ -308,7 +309,7 @@ func TestSetElementsCompareCanonicalNftIntervals(t *testing.T) {
 	}
 }
 
-func TestValidateConfigSupportsStaticGeoAndRejectsDynamic(t *testing.T) {
+func TestValidateConfigSupportsSourcesAndRejectsUnknownPolicyMode(t *testing.T) {
 	cfg := config.Config{
 		Version:  1,
 		Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", Nftables: config.NftablesConfig{Table: "perimeterd", Priority: -10}},
@@ -323,8 +324,8 @@ func TestValidateConfigSupportsStaticGeoAndRejectsDynamic(t *testing.T) {
 	}
 	cfg.Policies = nil
 	cfg.CrowdSec.Enabled = true
-	if err := ValidateConfig(cfg); err == nil {
-		t.Fatal("crowdsec was accepted by initial runtime")
+	if err := ValidateConfig(cfg); err != nil {
+		t.Fatalf("CrowdSec configuration was rejected: %v", err)
 	}
 }
 
@@ -580,7 +581,7 @@ func TestOversizedTargetRejectedBeforeNativeCommands(t *testing.T) {
 		},
 	}
 	base := netip.MustParseAddr("2600:1234:5678:9abc:def0:1234:1234:1000").As16()
-	for index := uint32(0); index < 150000; index++ {
+	for index := uint32(0); index < 600000; index++ {
 		address := base
 		binary.BigEndian.PutUint32(address[12:], 0x12341000+index*2)
 		cfg.Global.Blocklist = append(cfg.Global.Blocklist, netip.PrefixFrom(netip.AddrFrom16(address), 128))
@@ -634,4 +635,111 @@ func TestGenerationReconciliationRequiresRuleOrder(t *testing.T) {
 	if generationRulesComplete(inventory, target) {
 		t.Fatal("reordered policy bypassing denials was accepted as complete")
 	}
+}
+
+func TestBuildTargetKeepsDynamicIdentityAcrossStaticReplacement(t *testing.T) {
+	base := config.Config{
+		Version:  1,
+		Global:   config.GlobalConfig{Blocklist: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}},
+		CrowdSec: config.CrowdSecConfig{Enabled: true},
+		Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", IPv4: true, IPv6: true, Nftables: config.NftablesConfig{Table: "crowd-test", Priority: -10}},
+	}
+	firstModel, err := policy.Compile(base, policy.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := BuildTarget(testOwner, testGenA, base, firstModel, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := base
+	replacement.Global.Blocklist = []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}
+	secondModel, err := policy.Compile(replacement, policy.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := BuildTarget(testOwner, testGenB, replacement, secondModel, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.DynamicGeneration != first.DynamicGeneration {
+		t.Fatalf("static replacement changed dynamic identity: old=%q new=%q", first.DynamicGeneration, second.DynamicGeneration)
+	}
+	if second.Generation == first.Generation {
+		t.Fatal("static replacement unexpectedly reused packet-path generation")
+	}
+	var dynamicName string
+	for _, family := range second.Families {
+		for _, set := range family.Sets {
+			if set.Kind == policy.DynamicCrowdSecSet {
+				dynamicName = setName(second, family.Family, set.ID)
+			}
+		}
+	}
+	if dynamicName == "" || !strings.Contains(dynamicName, second.DynamicGeneration) {
+		t.Fatalf("dynamic set name omitted independent identity: %q", dynamicName)
+	}
+}
+
+func TestDynamicSetCommandsUseTimedBothFamilyIntervals(t *testing.T) {
+	target := testTarget(t, testGenA)
+	target.DynamicGeneration = testGenA
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	desired := []policy.TimedPrefix{
+		{Prefix: netip.MustParsePrefix("::/0"), Deadline: now.Add(2 * time.Hour)},
+		{Prefix: netip.MustParsePrefix("0.0.0.0/0"), Deadline: now.Add(2 * time.Hour)},
+	}
+	commands, err := dynamicSetCommands(target, policy.IPv4, nftObject{}, desired, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("IPv4 projection emitted %d commands, want 1", len(commands))
+	}
+	data, err := json.Marshal(commands[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"len":0`) || !strings.Contains(text, `"timeout":7200`) ||
+		!strings.Contains(text, `"elem":[{"elem":{"timeout":7200,"val":{"prefix"`) {
+		t.Fatalf("IPv4 /0 timed element was not lowered exactly: %s", text)
+	}
+	commands, err = dynamicSetCommands(target, policy.IPv6, nftObject{}, desired, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 1 || !strings.Contains(string(marshalNFTJSONForTest(t, commands[0])), `"name":"`+dynamicSetName(target, policy.IPv6)+`"`) {
+		t.Fatalf("IPv6 projection was not isolated to its family: %#v", commands)
+	}
+}
+
+func TestDynamicInventoryRejectsPermanentOrMalformedElements(t *testing.T) {
+	target := testTarget(t, testGenA)
+	target.DynamicGeneration = testGenA
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	expired := nftObject{Elem: json.RawMessage(`[{"elem":{"val":"203.0.113.7","timeout":5,"expires":0}}]`)}
+	commands, err := dynamicSetCommands(target, policy.IPv4, expired, []policy.TimedPrefix{{Prefix: netip.MustParsePrefix("203.0.113.7/32"), Deadline: now.Add(time.Minute)}}, now)
+	if err != nil || len(commands) != 2 {
+		t.Fatalf("finite expired element was not replaced safely: commands=%#v err=%v", commands, err)
+	}
+	malformed := []nftObject{
+		{Elem: json.RawMessage(`[{"elem":{"val":"203.0.113.7","timeout":0,"expires":0}}]`)},
+		{Elem: json.RawMessage(`[{"elem":{"val":"203.0.113.7","timeout":5}}]`)},
+		{Elem: json.RawMessage(`[{"elem":{"val":"203.0.113.7","timeout":5,"expires":5,"foreign":true}}]`)},
+	}
+	for index, observed := range malformed {
+		if _, err := dynamicSetCommands(target, policy.IPv4, observed, []policy.TimedPrefix{{Prefix: netip.MustParsePrefix("203.0.113.7/32"), Deadline: now.Add(time.Minute)}}, now); err == nil {
+			t.Fatalf("malformed dynamic element %d was accepted", index)
+		}
+	}
+}
+
+func marshalNFTJSONForTest(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

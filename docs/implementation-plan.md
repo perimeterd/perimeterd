@@ -15,9 +15,9 @@ gates remain part of the first-release scope.
 | Static nftables runtime | Implemented | Maintain durable recovery and owned-only mutation |
 | RIPEstat resolution, cache, and refresh | Implemented for both backends | Maintain complete-snapshot selection and fallback |
 | iptables/ipset runtime and backend migration | Implemented | Maintain per-family recovery and ownership fencing |
-| CrowdSec | Planned | Authoritative startup synchronization and decision lifecycle |
+| CrowdSec | Implemented for both backends | Maintain authoritative synchronization, bounded leases, and pinned LAPI compatibility |
 | Coexistence | Custom-chain attachments implemented; Docker milestone pending | Verify Docker-specific integration and ordering |
-| Operations and delivery | Source-build CLI, logging, readiness, two HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
+| Operations and delivery | Source-build CLI, logging, readiness, three HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
 
 ## 1. Foundation and offline configuration validation
 
@@ -123,7 +123,7 @@ These remain separate milestones under one writer and revision lifecycle:
 
 | Milestone | Status | Required proof |
 | --- | --- | --- |
-| CrowdSec | Planned | Authoritative startup synchronization, decision updates/removals, expiry and renewable kernel leases, reload handover, and pinned real-LAPI compatibility |
+| CrowdSec | Implemented | Authoritative startup synchronization, decision updates/removals, expiry and renewable kernel leases, reload handover, and pinned real-LAPI compatibility |
 | iptables/ipset | Implemented | Equivalent packet-policy behavior, family-by-family commit and compensation, failure recovery, and backend migration |
 | Coexistence | Custom attachments implemented; Docker milestone pending | Documented Docker/custom-chain attachments and preservation of foreign firewall state |
 
@@ -136,15 +136,34 @@ second-family failure, successful and failed compensation, unhealthy enforcement
 crashes between family switches and after commit, and bidirectional migration
 with precommit and retirement failures.
 
-CrowdSec and the Docker-specific coexistence milestone remain pending. Keep
-both under the same writer and revision lifecycle; dynamic bans must not gain
-separate mutation shortcuts.
+**CrowdSec status:** implemented under the same serialized writer. The adapter
+validates bounded response envelopes before SDK decoding, preserves decision
+identity and absolute expiry, and projects overlapping bans into disjoint timed
+prefixes. Both backends use finite, renewable leases capped at 24 hours.
+Reloads stage a separate authority epoch and native references; reconnects
+replace authority only after successful reconciliation. Decisions and credentials
+are never persisted as recovery authority.
+
+Regression coverage exercises stale epochs, failed dynamic writes, same-path
+credential rotation, uncertain durable commit, and renewal without a desired-state
+change. Isolated native tests cover IPv4/IPv6 bans, removals, overlap, `/0`,
+allow precedence, ingress-only behavior, retained leases, expiry without the
+daemon, reload/restart, and owned cleanup on nftables and both iptables variants.
+`make test-crowdsec` and its CI job run the digest-pinned v1.8.1 LAPI streaming
+compatibility gate, including incremental updates without replaying the active
+snapshot.
+
+The Docker-specific coexistence milestone remains pending. The known LAPI
+query-error behavior is an accepted temporary upstream risk tracked in
+[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691).
+It is not fault-tested or worked around with full-list polling; see
+[data sources](data-sources.md#supported-lapi-contract).
 
 ## 6. Operational and release gates
 
 **Status:** partially implemented. Source builds provide stdout logging,
-enforcement health, the committed-prefix timestamp gauge, native packet/byte
-accounting, and bounded systemd readiness notifications. The complete Prometheus
+enforcement health, committed-prefix timestamp and CrowdSec connection gauges,
+native packet/byte accounting, and bounded systemd readiness notifications. The complete Prometheus
 exporter, installed systemd/tmpfiles payloads, RPM/DEB lifecycle, remaining
 architecture verification, and signed releases are still required.
 

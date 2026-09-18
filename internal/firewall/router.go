@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
 // Native routes persisted targets without auto-detection or fallback. A backend
@@ -117,4 +119,19 @@ func (n *Native) Cleanup(ctx context.Context, targets []*Target) error {
 		}
 	}
 	return result
+}
+
+// UpdateDynamic reconciles the selected backend's owned dynamic projection
+// without changing the static packet path or creating unrecorded targets.
+func (n *Native) UpdateDynamic(ctx context.Context, target *Target, prefixes []policy.TimedPrefix) error {
+	if err := ValidateTarget(target); err != nil {
+		return err
+	}
+	if target == nil || target.DynamicGeneration == "" {
+		return errors.New("firewall dynamic update requires an active dynamic target")
+	}
+	if err := ValidateDynamic(prefixes); err != nil {
+		return err
+	}
+	return n.implementation(target.Backend()).UpdateDynamic(ctx, target, prefixes)
 }

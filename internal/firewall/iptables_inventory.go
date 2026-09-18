@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
@@ -68,8 +71,11 @@ type (
 		Name, Type, Family string
 		Options            []string
 		Entries            []string
+		Timeouts           map[string]uint64
 		Extended           bool
+		UnknownOptions     bool
 		References         uint64
+		InspectionBytes    int
 	}
 )
 
@@ -183,7 +189,8 @@ func (i *IPTables) inspectSets(ctx context.Context, expected map[string]iptSet, 
 		if err != nil {
 			return err
 		}
-		inventory.SetBytes += len(output) + len(header)
+		observed.InspectionBytes = len(output) + len(header)
+		inventory.SetBytes += observed.InspectionBytes
 		inventory.Sets[name] = observed
 	}
 	return nil
@@ -245,10 +252,15 @@ func expectedIPT(targets ...*Target) (*iptExpected, error) {
 				}
 			}
 			for _, set := range model.Sets {
-				if old, exists := result.sets[set.Name]; exists && (old.Family != set.Family || !slices.Equal(old.Prefixes, set.Prefixes)) {
+				if old, exists := result.sets[set.Name]; exists && (old.Family != set.Family || old.Dynamic != set.Dynamic || (!set.Dynamic && !slices.Equal(old.Prefixes, set.Prefixes))) {
 					return nil, errors.New("conflicting recorded ipset definitions")
 				}
 				result.sets[set.Name] = set
+				if set.Dynamic {
+					spare := set
+					spare.Name = iptDynamicSpareName(set.Name)
+					result.sets[spare.Name] = spare
+				}
 			}
 			for _, attachment := range model.Attachments {
 				key := chainKey(family, attachment.Parent)
@@ -308,13 +320,53 @@ func validateIPTInventory(inventory *iptInventory, expected *iptExpected) error 
 		if observed.References != references[name] {
 			return fmt.Errorf("owned set %s has inconsistent native references: kernel=%d recorded=%d", name, observed.References, references[name])
 		}
-		if observed.Type != "hash:net" || observed.Family != familySetName(want.Family) || observed.Extended {
+		if observed.Type != "hash:net" || observed.Family != familySetName(want.Family) {
 			return fmt.Errorf("unexpected owned set shape: %s", name)
 		}
-		for n := 0; n < len(observed.Options); n += 2 {
-			if n+1 == len(observed.Options) || !slices.Contains([]string{"family", "hashsize", "maxelem", "bucketsize", "initval"}, observed.Options[n]) {
-				return fmt.Errorf("unexpected owned set option: %s", name)
+		if !want.Dynamic {
+			if observed.Extended {
+				return fmt.Errorf("unexpected owned set shape: %s", name)
 			}
+			for n := 0; n < len(observed.Options); n += 2 {
+				if n+1 == len(observed.Options) || !slices.Contains([]string{"family", "hashsize", "maxelem", "bucketsize", "initval"}, observed.Options[n]) {
+					return fmt.Errorf("unexpected owned set option: %s", name)
+				}
+			}
+		} else {
+			hasDefaultTimeout := false
+			for n := 0; n < len(observed.Options); n += 2 {
+				if n+1 == len(observed.Options) || !slices.Contains([]string{"family", "hashsize", "maxelem", "bucketsize", "initval", "timeout"}, observed.Options[n]) {
+					return fmt.Errorf("unexpected owned set option: %s", name)
+				}
+				if observed.Options[n] == "timeout" {
+					timeout, err := strconv.ParseUint(observed.Options[n+1], 10, 64)
+					if err != nil || timeout != uint64(maximumLease/time.Second) {
+						return fmt.Errorf("dynamic set has an unsafe default timeout: %s", name)
+					}
+					hasDefaultTimeout = true
+				}
+			}
+			if !hasDefaultTimeout {
+				return fmt.Errorf("dynamic set has no finite default timeout: %s", name)
+			}
+			if _, err := ipsetCapacity(observed); err != nil {
+				return fmt.Errorf("dynamic set %s: %w", name, err)
+			}
+			if observed.UnknownOptions {
+				return fmt.Errorf("unexpected dynamic set entry metadata: %s", name)
+			}
+			for _, entry := range observed.Entries {
+				if timeout, exists := observed.Timeouts[entry]; !exists || timeout == 0 ||
+					timeout > uint64(maximumLease/time.Second) {
+					return fmt.Errorf("dynamic set entry has no finite timeout: %s", name)
+				}
+				prefix, err := netip.ParsePrefix(entry)
+				if err != nil || (want.Family == policy.IPv4 && !prefix.Addr().Is4()) ||
+					(want.Family == policy.IPv6 && !prefix.Addr().Is6()) {
+					return fmt.Errorf("unexpected dynamic set element: %s", name)
+				}
+			}
+			continue
 		}
 		prefixes := make(map[string]bool, len(want.Prefixes))
 		for _, prefix := range want.Prefixes {
@@ -325,6 +377,11 @@ func validateIPTInventory(inventory *iptInventory, expected *iptExpected) error 
 				return fmt.Errorf("unexpected owned set element: %s", name)
 			}
 			delete(prefixes, entry)
+		}
+		// An interrupted restore can leave an authorized, unreferenced staging
+		// set incomplete. Stage can finish it and cleanup can discard it.
+		if len(prefixes) != 0 && observed.References != 0 {
+			return fmt.Errorf("owned set is missing expected elements: %s", name)
 		}
 	}
 	return nil
@@ -421,20 +478,25 @@ func (i *IPTables) preflightTargets(ctx context.Context, expected *iptExpected, 
 	return inventory, nil
 }
 
+func ipsetInspectionSize(set iptSet) int {
+	size := 1024 // Save definition plus the terse XML header.
+	entryOverhead := len(set.Name) + 6
+	var buffer [64]byte
+	if set.Dynamic {
+		entryOverhead += len(" timeout ") + len(strconv.AppendUint(buffer[:0], uint64(maximumLease/time.Second), 10))
+	}
+	for _, prefix := range set.Prefixes {
+		size += entryOverhead + len(prefix.AppendTo(buffer[:0]))
+	}
+	return size
+}
+
 // Leave capture headroom for counters and native formatting. Budget the full
 // rule inventories and recorded sets so staging cannot prevent later inspection.
 func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
 	const budget = 48 << 20
 	setBytes := inventory.SetBytes
 	tableBytes := map[policy.Family]int{policy.IPv4: inventory.TableBytes[policy.IPv4], policy.IPv6: inventory.TableBytes[policy.IPv6]}
-	setSize := func(set iptSet) int {
-		size := 1024 // Save definition plus the terse XML header.
-		var buffer [64]byte
-		for _, prefix := range set.Prefixes {
-			size += len(set.Name) + len(prefix.AppendTo(buffer[:0])) + 6
-		}
-		return size
-	}
 	chainSize := func(chain iptChain) int {
 		size := len(chain.Name) + 64
 		for _, rule := range chain.Rules {
@@ -447,9 +509,35 @@ func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
 	}
 	for name, set := range expected.sets {
 		observed, exists := inventory.Sets[name]
-		if !exists || len(observed.Entries) != len(set.Prefixes) {
-			setBytes += setSize(set)
+		current := observed.InspectionBytes
+		if set.Dynamic {
+			spare := iptDynamicSpareName(name)
+			if name == spare {
+				continue // Accounted together with the live set.
+			}
+			current += inventory.Sets[spare].InspectionBytes
+			if !set.DynamicProjection {
+				if !exists {
+					setBytes += ipsetInspectionSize(set)
+				}
+				continue
+			}
 		}
+		planned := ipsetInspectionSize(set)
+		if set.Dynamic && exists {
+			capacity, err := ipsetCapacity(observed)
+			if err != nil {
+				return err
+			}
+			if len(set.Prefixes) > capacity {
+				// Only resizing holds old live contents alongside a populated
+				// spare. An existing spare is destroyed before either operation.
+				planned += observed.InspectionBytes
+			}
+		}
+		// In-place updates delete obsolete entries before adding replacements.
+		// Static partial staging likewise fills one set, not a second copy.
+		setBytes += max(0, planned-current)
 	}
 	for key, chains := range expected.chains {
 		size := 0
@@ -459,11 +547,7 @@ func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
 		tableBytes[key.Family] += size
 	}
 	for _, models := range expected.models {
-		inputSets := 0
 		for _, model := range models {
-			for _, set := range model.Sets {
-				inputSets += setSize(set)
-			}
 			rules := 4096
 			for _, chains := range [][]iptChain{model.Staging, model.Active} {
 				for _, chain := range chains {
@@ -476,9 +560,6 @@ func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
 			if rules > maxIPTablesInput {
 				return errors.New("iptables complete family exceeds input budget")
 			}
-		}
-		if inputSets > maxIPTablesInput {
-			return errors.New("ipset complete target exceeds input budget")
 		}
 	}
 	if setBytes > budget || tableBytes[policy.IPv4] > budget || tableBytes[policy.IPv6] > budget {
