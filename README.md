@@ -1,6 +1,6 @@
-# perimeterd
+![Block unwanted traffic at your Linux perimeter](docs/img/social-banner.png)
 
-**Block unwanted traffic at your Linux perimeter.**
+# perimeterd
 
 `perimeterd` adds geographic/ASN policy and IP/CIDR allow/block overrides to an
 existing Linux firewall. It filters unwanted ingress and egress traffic; the
