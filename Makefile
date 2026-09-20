@@ -21,8 +21,9 @@ GO_SOURCES := $(GO) list -tags=e2e,crowdsec -f '{{range .GoFiles}}{{$$.Dir}}/{{.
 E2E_TEST_BINARY := bin/perimeterd-e2e
 E2E_SUDO ?=
 CROWDSEC_CONTAINER_RUNTIME ?= docker
+DOCKER_TEST_BINDIR ?=
 
-.PHONY: fmt fmt-check lint test test-race vuln build build-e2e test-e2e test-crowdsec verify bench-scale-small bench-scale-large bench-native-scale-small bench-native-scale-large
+.PHONY: fmt fmt-check lint test test-race vuln build build-e2e test-e2e test-crowdsec test-docker verify bench-scale-small bench-scale-large bench-native-scale-small bench-native-scale-large
 
 fmt:
 	@files="$$($(GO_SOURCES))" || exit $$?; \
@@ -76,6 +77,11 @@ test-crowdsec:
 			printf 'test-crowdsec requires %s in PATH\n' "$(CROWDSEC_CONTAINER_RUNTIME)" >&2; exit 1; \
 		}
 	CROWDSEC_CONTAINER_RUNTIME="$(CROWDSEC_CONTAINER_RUNTIME)" $(GO) test -tags crowdsec -count=1 -run '^TestRealLAPICompatibility$$' ./tests/crowdsec
+
+# Requires a real Docker Engine toolset, not a Podman-compatible CLI. The test
+# starts a private daemon inside the same isolated namespaces as native E2E.
+test-docker: build-e2e
+	$(E2E_SUDO) env PERIMETERD_E2E=1 PERIMETERD_DOCKER_E2E=1 DOCKER_TEST_BINDIR="$(DOCKER_TEST_BINDIR)" E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.run '^TestE2EDocker(Coexistence|SecurityIsolation)$$' -test.count=1
 
 SCALE_BENCHTIME ?= 1x
 

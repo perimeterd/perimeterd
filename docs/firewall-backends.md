@@ -7,10 +7,10 @@ publication, recovery, and the cross-target migration algorithm;
 [operations](operations.md) owns procedures and observability.
 
 > **Status boundary.** Static source-backed policy, CrowdSec dynamic bans, both
-> native backends, target migration, custom attachments, and native accounting
-> objects are implemented. Aggregated counter collection/export remains planned.
-> Docker-specific coexistence remains first-release work rather than a current
-> support claim.
+> native backends, target migration, custom attachments, Docker iptables bridge
+> coexistence, and native accounting objects are implemented. Aggregated counter
+> collection/export remains planned. The Docker support boundary is defined
+> [below](#docker-docker-user-attachment).
 
 ## Contents
 
@@ -338,11 +338,18 @@ container ports.
 
 ## Docker `DOCKER-USER` attachment
 
-**Planned Docker-specific coexistence guidance.** Docker integration and its
-verification milestone are not implemented support in the current release.
-The example below records the intended explicit interface-constrained shape;
-it must not be read as proof that perimeterd manages Docker coexistence today.
-Perimeterd must never create or flush the Docker-owned chain.
+**Verified with Docker Engine 29.8.1:** bridge networking through Docker's
+**iptables firewall backend**, using either iptables-nft or iptables-legacy,
+with IPv4 and IPv6. This is not Docker's native nftables backend, which does
+not provide `DOCKER-USER`. Rootless networking and Swarm are outside this
+verified scope.
+
+Select `firewall.backend: iptables` explicitly and use the same tool family as
+Docker. Start Docker and create its bridge network before perimeterd; the
+`DOCKER-USER` parent must exist in every enabled address family. Perimeterd
+inserts its tagged jump before existing rules but never creates or flushes the
+Docker-owned chain. Replace the example interfaces with actual external ingress
+interfaces; do not include container bridges.
 
 ```yaml
 firewall:
@@ -359,19 +366,27 @@ firewall:
         original_destination: true
 ```
 
-Docker documents that `DOCKER-USER` receives packets after DNAT. With
-`original_destination`, the intended generated rule matches the original
-published host port; without it, policy ports see the translated container
-port. The input-interface constraint prevents container-originated forwarding
-from entering an ingress policy. Overlapping `FORWARD` and `DOCKER-USER`
-attachments are expected to count separate owned-path traversals; no packet-mark
-or topology de-duplication is intended.
+[Docker documents](https://docs.docker.com/engine/network/firewall-iptables/)
+that `DOCKER-USER` receives packets after DNAT. With
+`original_destination: true`, policy ports match the original published host
+port; without it, they match the translated container port. The input-interface
+constraint keeps container-originated forwarding out of this ingress attachment.
+Allow/no-match returns to Docker and any foreign rules; it does not bypass a
+later denial or change Docker's default policies. Overlapping `FORWARD` and
+`DOCKER-USER` attachments count separate owned-path traversals; perimeterd does
+not de-duplicate them.
 
-For the planned integration, an absent `DOCKER-USER` chain must fail
-reconciliation and preserve last-known-good enforcement. Operators must start
-Docker first or omit this planned attachment. The current generic custom-chain
-contract still requires every configured parent to exist, but Docker-specific
-coexistence, documentation, and tests remain release work.
+A missing candidate parent rejects reconciliation before mutation and retains
+the previous active revision and enforcement through its existing parents.
+That guarantee cannot preserve a chain another manager has itself deleted.
+Keep Docker's chains and perimeterd's tagged jumps intact; there is no Docker
+lifecycle watcher or automatic backend selection.
+
+The [isolated Docker gate](development.md#real-docker-coexistence-gate) verifies
+remapped host ports, translated-port contrast, container egress, downstream
+foreign denial, failed reload preservation, retained enforcement on stop, and
+owned cleanup. Snapshots cover Docker/foreign rules and default policies in
+all IPv4/IPv6 iptables tables.
 
 ## Coexistence
 

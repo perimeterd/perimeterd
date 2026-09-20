@@ -114,3 +114,38 @@ jobs:
           check-latest: false
       - name: Run pinned real-LAPI gate
         run: make test-crowdsec
+
+  docker:
+    name: isolated Docker coexistence
+    runs-on: ubuntu-26.04
+    env:
+      DOCKER_VERSION: "29.8.1"
+      DOCKER_SHA256: d8db66739d2e28d4933786d73e918d9be643a67fbd835db1bf740d650a259e70
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+      - name: Install native test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nftables iproute2 iptables ipset
+          sudo modprobe ip_set_hash_net
+          sudo modprobe xt_set
+          sudo modprobe iptable_filter
+          sudo modprobe ip6table_filter
+      - name: Prepare pinned Docker Engine toolset
+        run: |
+          mkdir -p "$RUNNER_TEMP/docker-engine"
+          curl --fail --location --retry 3 \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
+            --output "$RUNNER_TEMP/docker-engine.tgz"
+          printf '%s  %s\n' "$DOCKER_SHA256" "$RUNNER_TEMP/docker-engine.tgz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/docker-engine.tgz" -C "$RUNNER_TEMP/docker-engine"
+      - name: Run real isolated Docker packet-path gate
+        run: E2E_SUDO=sudo DOCKER_TEST_BINDIR="$RUNNER_TEMP/docker-engine/docker" make test-docker

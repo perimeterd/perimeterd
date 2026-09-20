@@ -23,7 +23,7 @@ internal/firewall/            typed targets, native backend routing and reconcil
 internal/source/              RIPEstat resolution, immutable cache and local HTTP fixtures
 internal/state/               revision store, record codec/validation and durable filesystem IO
 configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
-.github/workflows/ci.yml      quality, build, unit/race, native firewall and real-LAPI gates
+.github/workflows/ci.yml      quality, build, unit/race, native firewall, Docker and real-LAPI gates
 .github/workflows/codeql.yml  Go security analysis
 tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
 tests/crowdsec/              pinned real-LAPI streaming compatibility gate
@@ -60,15 +60,15 @@ The most useful file boundaries when changing an existing path are:
 - `tests/e2e/`: namespace admission and isolation (`harness_test.go`), traffic
   probes (`network_test.go`), daemon lifecycle (`daemon_test.go`), geo
   scenarios (`geo_test.go`), native backend scenarios (`nftables_test.go` and
-  `iptables_test.go`), runtime/recovery boundaries (`runtime_test.go`,
+  `iptables_test.go`), real Docker coexistence (`docker_harness_test.go`,
+  `docker_test.go`), runtime/recovery boundaries (`runtime_test.go`,
   `recovery_test.go`), and failure injection (`crash_test.go`).
 
 ### Planned additions
 
-Docker-specific coexistence, installed systemd/tmpfiles payloads, package
-lifecycle scripts, and GoReleaser/release workflows belong to later milestones.
-Their eventual package layout should
-follow the real integration boundaries; these directories and files are not
+Installed systemd/tmpfiles payloads, package lifecycle scripts, and
+GoReleaser/release workflows belong to later milestones. Their eventual package
+layout should follow the real integration boundaries; these directories and files are not
 present scaffolding.
 
 No `pkg/` tree exists until a real supported public Go API exists. Future
@@ -97,7 +97,7 @@ isolated packet interpreter is test-only.
 
 The `Makefile` is the source of truth for executable local gates and scale
 profiles. It provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`,
-`build`, `build-e2e`, `test-e2e`, `test-crowdsec`, `verify`, and the four opt-in
+`build`, `build-e2e`, `test-e2e`, `test-docker`, `test-crowdsec`, `verify`, and the four opt-in
 scale targets. Use Go 1.27.1, or enable automatic toolchain selection when the
 installed Go is older. The race target requires a native C compiler and
 enables CGO for that command.
@@ -132,8 +132,8 @@ defaults to `dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and
 
 `perimeterd validate` is an offline local check. It does not fetch sources or
 touch the firewall. `make verify` runs `go mod verify`, `fmt-check`, `lint`,
-`vuln`, `build`, and `test`; it intentionally excludes the race, native, and
-real-LAPI gates below.
+`vuln`, `build`, and `test`; it intentionally excludes the race, native, Docker,
+and real-LAPI gates below.
 
 ### Native namespace gate
 
@@ -163,8 +163,8 @@ process is PID-namespace init, so its exit or timeout terminates descendants.
 It exercises real CLI lifecycle, IPv4/IPv6 TCP/UDP packets, reloads, kernel
 counters, ownership collisions, and interrupted transactions, and never
 applies test rules to the development host's firewall. Tagged E2E sources are
-formatted and linted by the ordinary gates but execute only through this
-target. CI runs this native gate in a separate Linux job.
+formatted and linted by the ordinary gates but execute only through opt-in
+native/Docker targets. CI runs the native gate in a separate Linux job.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent
@@ -173,6 +173,55 @@ explicit deadlines. Configuration files and readiness sockets use private,
 unique temporary directories, and table-deletion assertions require successful
 ruleset inspection plus explicit absence; command failures, timeouts, and
 malformed inspection output fail the assertion.
+
+### Real Docker coexistence gate
+
+This gate needs a **real Docker Engine toolset**, not a Podman-compatible CLI:
+
+```sh
+make test-docker E2E_SUDO=sudo
+# Use a separately provisioned Docker toolset instead of PATH:
+make test-docker E2E_SUDO=sudo DOCKER_TEST_BINDIR=/absolute/path/to/docker
+```
+
+`DOCKER_TEST_BINDIR` points to the directory containing `docker`, `dockerd`,
+`containerd`, its shims, `runc`, and the other Engine runtime binaries. CI
+downloads the official Docker 29.8.1 static toolset and verifies its pinned
+SHA-256 before running this target; refresh the version and checksum together.
+The gate rejects Podman and records actual client, daemon, and runtime versions.
+
+Run as privileged root with the native namespace prerequisites above, a writable
+cgroup hierarchy, bridge/NAT support, and space in `/tmp`. The fixture creates
+a private daemon socket, configuration, data/exec roots, runtime directory, and
+cgroup parent after entering isolated mount/network/PID namespaces. It never
+connects to the host Docker socket or changes the host firewall. Before starting
+the daemon, it masks `/sys/kernel/security` with empty read-only tmpfs inside
+the private mount namespace. Docker 29.8 loads `docker-default` at startup;
+this mask makes AppArmor unavailable to the private Engine and runtime without
+changing host profiles. A failed mask aborts the gate rather than starting an
+unprotected daemon. Docker uses the iptables firewall backend and vfs storage
+with the userland proxy disabled.
+The fixture imports the statically linked E2E executable into a scratch image;
+no container image pull or live RIPEstat request is needed.
+
+Both iptables-nft and iptables-legacy run the same IPv4/IPv6 bridge scenarios.
+Published host ports `18080` and `18081` map to container port `8080`, proving
+original-destination selection and its translated-port contrast. A global
+block on globally classified container addresses makes the external-interface
+egress check meaningful; private/ULA addresses would bypass denial through the
+built-in allowlist. The gate also verifies downstream foreign denial, missing-parent
+reload rejection, retained enforcement on stop, owned cleanup, and preservation
+of Docker/foreign rules and default policies across all iptables tables.
+
+Both targets run a security-isolation regression against a private stand-in
+for securityfs, including on hosts without AppArmor. It verifies that policy
+interfaces are hidden, the mask is read-only, and underlying policy files are
+unchanged; it never loads or replaces real host profiles.
+
+`test-e2e` skips the real-engine scenario unless `PERIMETERD_DOCKER_E2E=1`;
+use `test-docker` to supply the complete contract. Docker's native nftables
+backend, rootless networking, and Swarm are outside the verified scope. See
+the [Docker attachment contract](firewall-backends.md#docker-docker-user-attachment).
 
 ### Real-LAPI compatibility gate
 
@@ -212,13 +261,14 @@ The executable target inventory is:
 | `build-e2e` | Build the E2E binary and check native tool prerequisites |
 | `test-e2e` | Build and run the isolated Linux namespace/backend scenarios |
 | `test-crowdsec` | Run the digest-pinned real LAPI streaming compatibility scenarios |
+| `test-docker` | Run real isolated Docker bridge coexistence with both iptables tool families |
 | `verify` | Run `go mod verify`, `fmt-check`, `lint`, `vuln`, `build`, and `test` |
 | `bench-scale-small` | Run baseline control-plane/serialization benchmarks with `-benchmem` |
 | `bench-scale-large` | Run large-100k/large-250k control-plane/serialization benchmarks with `-benchmem` |
 | `bench-native-scale-small` | Run the isolated small native scale profile |
 | `bench-native-scale-large` | Run the isolated large native scale profile |
 
-`verify` intentionally does not run `test-race`, `test-e2e`, or
+`verify` intentionally does not run `test-race`, `test-e2e`, `test-docker`, or
 `test-crowdsec`; those are separate gates. `package` is a planned
 GoReleaser/nFPM snapshot-packaging command, not an implemented target or a
 successful no-op.
@@ -331,8 +381,8 @@ implicit timing or throughput targets.
 
 The remaining sections are the complete first-release contract, not a list of
 currently passing tests. The local commands above describe what can run now.
-Static source-backed policy, CrowdSec, and both native backend paths are
-implemented; Docker-specific coexistence, package/systemd integration, and
+Static source-backed policy, CrowdSec, both native backend paths, and Docker's
+iptables bridge integration are implemented; package/systemd integration and
 release workflows remain planned. The
 [implementation plan](implementation-plan.md) tracks milestone status.
 
@@ -474,8 +524,9 @@ fixtures, with deployment and server-source review as specified in the
 [sources and compatibility matrix](#sources-and-compatibility). It verifies
 normal chunked streaming, duplicate-prefix IDs, mapped IPv4 authority,
 incremental updates, overlap deletion, reconnect, and authoritative
-emptiness. Docker coexistence remains a planned separate job; it must execute
-the [Docker coexistence row](#kernel-backend-and-coexistence).
+emptiness. The separate real Docker job executes the
+[Docker coexistence row](#kernel-backend-and-coexistence) through
+[`make test-docker`](#real-docker-coexistence-gate).
 
 Shared namespace, mount, fixture, cleanup, host-isolation, availability, and
 iptables-family prerequisites are the [test-isolation contract in the service
@@ -484,7 +535,7 @@ and packaging matrix](#service-and-packaging).
 ## Pull-request and branch CI
 
 The existing `.github/workflows/ci.yml` triggers for pull requests targeting
-`main` and pushes to `main`. It has four current jobs:
+`main` and pushes to `main`. It has five current jobs:
 
 - `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
   `coverage.out`.
@@ -494,6 +545,9 @@ The existing `.github/workflows/ci.yml` triggers for pull requests targeting
   families selected by the suite.
 - `real CrowdSec LAPI compatibility` runs `make test-crowdsec` against the
   digest-pinned v1.8.1 container.
+- `isolated Docker coexistence` provisions the checksum-pinned Docker 29.8.1
+  Engine toolset and runs `E2E_SUDO=sudo make test-docker`, covering IPv4/IPv6
+  bridge packet paths on both iptables tool families.
 
 The separate `.github/workflows/codeql.yml` scans Go for the same pull-request
 and `main` push events plus its weekly schedule. Renovate tracks Go modules
@@ -504,10 +558,10 @@ current executable CI gates; the [verification matrix](#verification-matrix)
 remains the full first-release contract. Scale targets are opt-in, not CI gates.
 
 Before version 1, CI and release orchestration must additionally implement the
-matrix's Docker coexistence, package installation/upgrade, and systemd-VM
-gates. The pinned CrowdSec compatibility gate already exists in branch CI but
-must also be included in the release workflow. Listing planned jobs as
-requirements does not mean those jobs exist.
+matrix's package installation/upgrade and systemd-VM gates. The pinned Docker
+and CrowdSec compatibility gates already exist in branch CI but must also be
+included in the release workflow. Listing planned jobs as requirements does not
+mean those jobs exist.
 
 Workflow permissions are read-only by default and elevated only for a job's
 required security or artifact operation. Superseded CI runs for the same

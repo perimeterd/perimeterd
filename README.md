@@ -7,11 +7,12 @@ existing Linux firewall. It filters unwanted ingress and egress traffic; the
 parent firewall remains responsible for permitting services and ports.
 
 > **Implemented:** offline validation, source-backed nftables and iptables/ipset
-> enforcement, and CrowdSec ingress bans. The runtime includes durable recovery,
-> static caching, renewable leases, and isolated packet-path tests.
+> enforcement, CrowdSec ingress bans, and Docker bridge coexistence through
+> `DOCKER-USER` with Docker's iptables backend. The runtime includes durable
+> recovery, static caching, renewable leases, and isolated packet-path tests.
 >
-> Docker integration, installed service/package artifacts, and production
-> releases remain planned. **This is not yet a production-ready security control.**
+> Installed service/package artifacts and production releases remain planned.
+> **This is not yet a production-ready security control.**
 
 The [implementation plan](docs/implementation-plan.md) tracks completed
 milestones and remaining release gates.

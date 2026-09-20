@@ -8,9 +8,9 @@ native kernel behavior. The [implementation plan](implementation-plan.md) is
 authoritative for delivery status.
 
 > **Status boundary.** The source-build instructions in this document describe
-> what runs today. The installed package, systemd, Docker-specific coexistence,
-> and release sections are first-release contracts that remain
-> planned. A full-schema configuration is not a capability list.
+> what runs today, including Docker's iptables bridge integration. Installed
+> packages, systemd payloads, and release artifacts remain first-release work.
+> A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
 
@@ -26,13 +26,15 @@ The current binary implements:
   recovery, backend and target migration, and custom iptables attachments;
 - CrowdSec ingress bans with authoritative synchronization, expiry, renewable
   kernel leases, and staged credential/endpoint replacement;
+- explicit Docker `DOCKER-USER` bridge attachments with pre-DNAT port matching;
 - backend-owned native processed and terminal-denial counter objects; and
 - enforcement-health, CrowdSec connection, and committed-prefix timestamp gauges.
 
-Docker-specific coexistence is not a verified runtime milestone; the `DOCKER-USER` material in
-[firewall backends](firewall-backends.md#docker-docker-user-attachment) is
-planned guidance, not a support claim. Offline validation intentionally accepts
-the complete version-1 schema, including fields for these planned integrations.
+Docker coexistence is verified for Docker Engine 29.8.1's iptables bridge
+backend with both iptables tool families and IPv4/IPv6. Docker's native nftables
+backend, rootless networking, and Swarm are outside that verified scope.
+See the [Docker attachment contract](firewall-backends.md#docker-docker-user-attachment).
+Offline validation intentionally accepts the complete version-1 schema.
 `configs/perimeterd.yaml` is a full-schema example and must not be treated as a
 runnable capability list.
 
@@ -59,6 +61,15 @@ Keep the selected command alternatives unchanged while perimeterd-owned
 iptables artifacts remain. To switch between legacy and nf_tables, first stop
 the daemon and run cleanup with the original tools, then change the alternatives
 and reconcile again; never change `PATH` underneath recorded ownership.
+
+For Docker bridge filtering, start Docker and its bridge network first. Select
+perimeterd's iptables backend and the same iptables tool family Docker uses.
+`DOCKER-USER` must already exist for every enabled family. Constrain the ingress
+attachment to external input interfaces and enable `original_destination` when
+policy ports refer to published host ports rather than translated container
+ports. Perimeterd does not create Docker chains, permit services on behalf of
+Docker, or watch Docker lifecycle events. Preserve its tagged jumps when another
+manager edits the parent chain.
 
 A source-backed policy needs network access to the fixed RIPEstat endpoints on
 its first resolution unless an acceptable committed snapshot covers every
