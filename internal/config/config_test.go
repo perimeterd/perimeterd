@@ -205,3 +205,88 @@ func TestParseAttachmentDefaultsVersusExplicitEmpty(t *testing.T) {
 		})
 	}
 }
+
+func TestParseIPListsNormalizeAndReferenceValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`version: 1
+firewall:
+  backend: nftables
+ip_lists:
+  zoom:
+    url: HTTPS://EXAMPLE.COM/feed?region=US
+    refresh_interval: 6h
+    request_timeout: 45s
+policies:
+  - name: disabled
+    priority: 1
+    direction: ingress
+    mode: disabled
+    traffic: ["any"]
+    include:
+      ip_lists: [zoom, zoom]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := cfg.IPLists["zoom"]
+	if list.URL != "https://example.com/feed?region=US" || list.RefreshInterval != 6*time.Hour || list.RequestTimeout != 45*time.Second {
+		t.Fatalf("custom list was not normalized: %#v", list)
+	}
+	if len(cfg.Policies[0].Include.IPLists) != 1 || cfg.Policies[0].Include.IPLists[0] != "zoom" {
+		t.Fatalf("list selector was not deduplicated: %#v", cfg.Policies[0].Include.IPLists)
+	}
+
+	invalid := []string{
+		`version: 1
+firewall: {backend: nftables}
+ip_lists:
+  Zoom:
+    url: https://example.com/feed
+`,
+		`version: 1
+firewall: {backend: nftables}
+ip_lists:
+  zoom:
+    url: https://user@example.com/feed
+`,
+		`version: 1
+firewall: {backend: nftables}
+ip_lists:
+  zoom:
+    url: https://example.com/feed#fragment
+`,
+		`version: 1
+firewall: {backend: nftables}
+ip_lists:
+  zoom:
+    url: https://example.com/feed
+policies:
+  - name: disabled
+    priority: 1
+    direction: ingress
+    mode: disabled
+    traffic: ["any"]
+    include:
+      ip_lists: [missing]
+`,
+		`version: 1
+firewall: {backend: nftables}
+ip_lists:
+  zoom:
+    url: https://example.com/feed
+    refresh_interval: 0s
+`,
+	}
+	for _, input := range invalid {
+		if _, err := Parse([]byte(input)); err == nil {
+			t.Errorf("invalid custom-list configuration was accepted:\n%s", input)
+		}
+	}
+}
+
+func TestIPListURLPreservesIPv6InterfaceZone(t *testing.T) {
+	want := "http://[fe80::1%25FeedNIC]/list"
+	got, err := NormalizeIPListURL("HTTP://[fe80::1%25FeedNIC]/list")
+	if err != nil || got != want {
+		t.Fatalf("IPv6 interface identity changed: URL=%q error=%v", got, err)
+	}
+}

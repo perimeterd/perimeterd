@@ -26,15 +26,23 @@ import (
 // Prefixes and selector values are normalized deterministically for consumers
 // such as the policy compiler.
 type Config struct {
-	Version  int                 `yaml:"version"`
-	Logging  LoggingConfig       `yaml:"logging"`
-	Metrics  MetricsConfig       `yaml:"metrics"`
-	Global   GlobalConfig        `yaml:"global"`
-	Firewall FirewallConfig      `yaml:"firewall"`
-	Geo      GeoConfig           `yaml:"geo"`
-	Groups   map[string][]string `yaml:"groups"`
-	Policies []Policy            `yaml:"policies"`
-	CrowdSec CrowdSecConfig      `yaml:"crowdsec"`
+	Version  int                     `yaml:"version"`
+	Logging  LoggingConfig           `yaml:"logging"`
+	Metrics  MetricsConfig           `yaml:"metrics"`
+	Global   GlobalConfig            `yaml:"global"`
+	Firewall FirewallConfig          `yaml:"firewall"`
+	Geo      GeoConfig               `yaml:"geo"`
+	IPLists  map[string]IPListConfig `yaml:"ip_lists"`
+	Groups   map[string][]string     `yaml:"groups"`
+	Policies []Policy                `yaml:"policies"`
+	CrowdSec CrowdSecConfig          `yaml:"crowdsec"`
+}
+
+// IPListConfig describes one named HTTP(S) text source.
+type IPListConfig struct {
+	URL             string        `yaml:"url"`
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
+	RequestTimeout  time.Duration `yaml:"request_timeout"`
 }
 
 // LoggingConfig controls structured log verbosity and encoding.
@@ -136,6 +144,7 @@ type Selector struct {
 	RIRs              []string `yaml:"rirs"`
 	Groups            []string `yaml:"groups"`
 	ASNs              []string `yaml:"asns"`
+	IPLists           []string `yaml:"ip_lists"`
 	ExpandedCountries []string `yaml:"expanded_countries"`
 }
 
@@ -190,15 +199,22 @@ func Load(path string) (Config, error) {
 }
 
 type rawConfig struct {
-	Version  *int                `yaml:"version"`
-	Logging  *rawLogging         `yaml:"logging"`
-	Metrics  *rawMetrics         `yaml:"metrics"`
-	Global   *rawGlobal          `yaml:"global"`
-	Firewall *rawFirewall        `yaml:"firewall"`
-	Geo      *rawGeo             `yaml:"geo"`
-	Groups   map[string][]string `yaml:"groups"`
-	Policies []rawPolicy         `yaml:"policies"`
-	CrowdSec *rawCrowdSec        `yaml:"crowdsec"`
+	Version  *int                  `yaml:"version"`
+	Logging  *rawLogging           `yaml:"logging"`
+	Metrics  *rawMetrics           `yaml:"metrics"`
+	Global   *rawGlobal            `yaml:"global"`
+	Firewall *rawFirewall          `yaml:"firewall"`
+	Geo      *rawGeo               `yaml:"geo"`
+	IPLists  map[string]*rawIPList `yaml:"ip_lists"`
+	Groups   map[string][]string   `yaml:"groups"`
+	Policies []rawPolicy           `yaml:"policies"`
+	CrowdSec *rawCrowdSec          `yaml:"crowdsec"`
+}
+
+type rawIPList struct {
+	URL             *string `yaml:"url"`
+	RefreshInterval *string `yaml:"refresh_interval"`
+	RequestTimeout  *string `yaml:"request_timeout"`
 }
 
 type rawLogging struct {
@@ -269,6 +285,7 @@ type rawSelector struct {
 	RIRs      *[]string `yaml:"rirs"`
 	Groups    *[]string `yaml:"groups"`
 	ASNs      *[]string `yaml:"asns"`
+	IPLists   *[]string `yaml:"ip_lists"`
 }
 
 func normalize(raw rawConfig) (Config, error) {
@@ -298,6 +315,7 @@ func normalize(raw rawConfig) (Config, error) {
 			IPTables: IPTablesConfig{Attachments: defaultAttachments()},
 		},
 		Geo:      GeoConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second, RefreshJitter: 10 * time.Minute},
+		IPLists:  make(map[string]IPListConfig),
 		Groups:   make(map[string][]string),
 		Policies: []Policy{},
 		CrowdSec: CrowdSecConfig{Enabled: false, LAPIURL: "http://127.0.0.1:8080", UpdateFrequency: 10 * time.Second},
@@ -443,13 +461,19 @@ func normalize(raw rawConfig) (Config, error) {
 		return Config{}, errors.New("crowdsec.update_frequency: must be positive")
 	}
 
+	ipLists, err := normalizeIPLists(raw.IPLists)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.IPLists = ipLists
+
 	groups, err := normalizeGroups(raw.Groups)
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.Groups = groups
 	for _, rp := range raw.Policies {
-		p, e := normalizePolicy(rp, groups)
+		p, e := normalizePolicy(rp, groups, ipLists)
 		if e != nil {
 			return Config{}, e
 		}
@@ -581,6 +605,72 @@ func sliceKey(values []string) string {
 	return b.String()
 }
 
+func normalizeIPLists(raw map[string]*rawIPList) (map[string]IPListConfig, error) {
+	out := make(map[string]IPListConfig, len(raw))
+	for name, value := range raw {
+		field := "ip_lists." + name
+		if err := validateName(name, field); err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, fmt.Errorf("%s: required mapping", field)
+		}
+		if value.URL == nil || *value.URL == "" {
+			return nil, fmt.Errorf("%s.url: required non-empty value", field)
+		}
+		urlValue, err := NormalizeIPListURL(*value.URL)
+		if err != nil {
+			return nil, fmt.Errorf("%s.url: %w", field, err)
+		}
+		entry := IPListConfig{
+			URL:             urlValue,
+			RefreshInterval: 24 * time.Hour,
+			RequestTimeout:  30 * time.Second,
+		}
+		if value.RefreshInterval != nil {
+			entry.RefreshInterval, err = positiveDuration(*value.RefreshInterval, field+".refresh_interval")
+			if err != nil {
+				return nil, err
+			}
+		}
+		if value.RequestTimeout != nil {
+			entry.RequestTimeout, err = positiveDuration(*value.RequestTimeout, field+".request_timeout")
+			if err != nil {
+				return nil, err
+			}
+		}
+		out[name] = entry
+	}
+	return out, nil
+}
+
+// NormalizeIPListURL canonicalizes and validates one configured HTTP(S) list
+// URL. Scheme and DNS host are lowercased; IPv6 zones, path and query are preserved.
+func NormalizeIPListURL(value string) (string, error) {
+	if strings.ContainsAny(value, "\r\n") {
+		return "", errors.New("invalid URL")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.Hostname() == "" {
+		return "", errors.New("must be an absolute http or https URL")
+	}
+	if parsed.User != nil {
+		return "", errors.New("user information is not allowed")
+	}
+	if strings.Contains(value, "#") {
+		return "", errors.New("fragment is not allowed")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", errors.New("must be an absolute http or https URL")
+	}
+	parsed.Scheme = scheme
+	if !strings.HasPrefix(parsed.Host, "[") {
+		parsed.Host = strings.ToLower(parsed.Host)
+	}
+	return parsed.String(), nil
+}
+
 func normalizeGroups(raw map[string][]string) (map[string][]string, error) {
 	out := make(map[string][]string, len(raw))
 	for name, countries := range raw {
@@ -611,7 +701,7 @@ func normalizeGroups(raw map[string][]string) (map[string][]string, error) {
 	return out, nil
 }
 
-func normalizePolicy(raw rawPolicy, groups map[string][]string) (Policy, error) {
+func normalizePolicy(raw rawPolicy, groups map[string][]string, ipLists map[string]IPListConfig) (Policy, error) {
 	if raw.Name == nil || *raw.Name == "" {
 		return Policy{}, errors.New("policies[].name: required")
 	}
@@ -640,13 +730,13 @@ func normalizePolicy(raw rawPolicy, groups map[string][]string) (Policy, error) 
 	if raw.Include == nil {
 		return Policy{}, fmt.Errorf("policy %s.include: required mapping", *raw.Name)
 	}
-	include, includeCount, err := normalizeSelector(*raw.Include, groups, "policy "+*raw.Name+".include")
+	include, includeCount, err := normalizeSelector(*raw.Include, groups, ipLists, "policy "+*raw.Name+".include")
 	if err != nil {
 		return Policy{}, err
 	}
 	exclude := Selector{}
 	if raw.Exclude != nil {
-		exclude, _, err = normalizeSelector(*raw.Exclude, groups, "policy "+*raw.Name+".exclude")
+		exclude, _, err = normalizeSelector(*raw.Exclude, groups, ipLists, "policy "+*raw.Name+".exclude")
 		if err != nil {
 			return Policy{}, err
 		}
@@ -657,7 +747,7 @@ func normalizePolicy(raw rawPolicy, groups map[string][]string) (Policy, error) 
 	return Policy{Name: *raw.Name, Priority: *raw.Priority, Direction: *raw.Direction, Mode: *raw.Mode, Traffic: traffic, Include: include, Exclude: exclude}, nil
 }
 
-func normalizeSelector(raw rawSelector, groups map[string][]string, field string) (Selector, int, error) {
+func normalizeSelector(raw rawSelector, groups map[string][]string, ipLists map[string]IPListConfig, field string) (Selector, int, error) {
 	selector := Selector{}
 	count := 0
 	if raw.Countries != nil {
@@ -719,6 +809,20 @@ func normalizeSelector(raw rawSelector, groups map[string][]string, field string
 		}
 		selector.ASNs = sortedKeys(seen)
 		count += len(selector.ASNs)
+	}
+	if raw.IPLists != nil {
+		if len(*raw.IPLists) == 0 {
+			return Selector{}, 0, fmt.Errorf("%s.ip_lists: must be non-empty when present", field)
+		}
+		seen := map[string]struct{}{}
+		for i, name := range *raw.IPLists {
+			if _, ok := ipLists[name]; !ok {
+				return Selector{}, 0, fmt.Errorf("%s.ip_lists[%d]: unknown list", field, i)
+			}
+			seen[name] = struct{}{}
+		}
+		selector.IPLists = sortedKeys(seen)
+		count += len(selector.IPLists)
 	}
 	countrySet := make(map[string]struct{}, len(selector.Countries))
 	for _, country := range selector.Countries {
@@ -876,8 +980,14 @@ func validatePolicyUniqueness(policies []Policy) error {
 
 var namePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 
+// ValidName reports whether name uses perimeterd's lowercase DNS-label-like
+// identifier syntax.
+func ValidName(name string) bool {
+	return namePattern.MatchString(name)
+}
+
 func validateName(name, field string) error {
-	if !namePattern.MatchString(name) {
+	if !ValidName(name) {
 		return fmt.Errorf("%s: must be a lowercase DNS-label-like name", field)
 	}
 	return nil
@@ -1004,10 +1114,10 @@ func checkRootShape(root *yaml.Node) error {
 	}
 	return checkMappingFields(root, "configuration", map[string]nodeKind{
 		"version": kindInt, "logging": kindMap, "metrics": kindMap, "global": kindMap, "firewall": kindMap,
-		"geo": kindMap, "groups": kindMap, "policies": kindSeq, "crowdsec": kindMap,
+		"geo": kindMap, "ip_lists": kindMap, "groups": kindMap, "policies": kindSeq, "crowdsec": kindMap,
 	}, map[string]func(*yaml.Node, string) error{
 		"logging": checkLogging, "metrics": checkMetrics, "global": checkGlobal, "firewall": checkFirewall,
-		"geo": checkGeo, "groups": checkGroupsShape, "policies": checkPoliciesShape, "crowdsec": checkCrowdSec,
+		"geo": checkGeo, "ip_lists": checkIPListsShape, "groups": checkGroupsShape, "policies": checkPoliciesShape, "crowdsec": checkCrowdSec,
 	})
 }
 
@@ -1075,6 +1185,25 @@ func checkAttachmentsShape(node *yaml.Node, path string) error {
 	return nil
 }
 
+func checkIPListsShape(node *yaml.Node, path string) error {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+			return fmt.Errorf("%s: list names must be strings", path)
+		}
+		entryPath := path + "." + key.Value
+		if err := expectNode(value, kindMap, entryPath); err != nil {
+			return err
+		}
+		if err := checkMappingFields(value, entryPath, map[string]nodeKind{
+			"url": kindString, "refresh_interval": kindString, "request_timeout": kindString,
+		}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func checkGroupsShape(node *yaml.Node, path string) error {
 	for i := 0; i+1 < len(node.Content); i += 2 {
 		key, value := node.Content[i], node.Content[i+1]
@@ -1108,7 +1237,7 @@ func checkPolicyShape(node *yaml.Node, path string) error {
 }
 
 func checkSelectorShape(node *yaml.Node, path string) error {
-	return checkMappingFields(node, path, map[string]nodeKind{"countries": kindSeq, "rirs": kindSeq, "groups": kindSeq, "asns": kindSeq}, map[string]func(*yaml.Node, string) error{"countries": checkStringSequence, "rirs": checkStringSequence, "groups": checkStringSequence, "asns": checkStringSequence})
+	return checkMappingFields(node, path, map[string]nodeKind{"countries": kindSeq, "rirs": kindSeq, "groups": kindSeq, "asns": kindSeq, "ip_lists": kindSeq}, map[string]func(*yaml.Node, string) error{"countries": checkStringSequence, "rirs": checkStringSequence, "groups": checkStringSequence, "asns": checkStringSequence, "ip_lists": checkStringSequence})
 }
 
 func checkStringSequence(node *yaml.Node, path string) error {

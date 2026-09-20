@@ -5,8 +5,8 @@ milestones summarize delivered behavior; pending milestones retain their
 acceptance criteria. Detailed contracts live in the linked reference documents.
 
 The first release includes both native backends, CrowdSec, Docker coexistence,
-operational integration, and release gates. Implemented does not mean
-production-ready; the remaining gates below still apply.
+custom HTTP(S) text IP lists, operational integration, and release gates.
+Implemented does not mean production-ready; the remaining gates below still apply.
 
 ## Status at a glance
 
@@ -18,6 +18,7 @@ production-ready; the remaining gates below still apply.
 | iptables/ipset runtime and backend migration | Implemented | Maintain per-family recovery and ownership fencing |
 | CrowdSec | Implemented for both backends | Maintain authoritative synchronization, bounded leases, and pinned LAPI compatibility |
 | Coexistence | Implemented for custom attachments and Docker's iptables bridge backend | Maintain explicit interface constraints, ordering, and foreign-state preservation |
+| Custom HTTP(S) IP lists | Implemented for both backends | Maintain named include/exclude selectors, bounded fetching, exact cache identity, and per-list refresh/recovery |
 | Operations and delivery | Source-build CLI, logging, readiness, three HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
 
 ## 1. Foundation and offline configuration validation
@@ -65,7 +66,7 @@ commit boundary. The [native gate](development.md#privileged-end-to-end-suite)
 verifies enforcement, recovery, and ownership without using the development
 host's firewall.
 
-## 4. Complete static source-backed policy
+## 4. RIPEstat static source-backed policy
 
 **Status:** implemented for nftables and iptables/ipset.
 
@@ -119,7 +120,35 @@ The known LAPI query-error behavior is an accepted temporary upstream risk track
 It is not fault-tested or worked around with full-list polling; see
 [data sources](data-sources.md#supported-lapi-contract).
 
-## 6. Operational and release gates
+## 6. Custom HTTP(S) text IP lists
+
+**Status:** implemented for nftables and iptables/ipset.
+
+Named `ip_lists` definitions provide HTTP(S) URLs, per-list refresh intervals,
+and request timeouts. Both include and exclude selectors support list-only and
+mixed country/ASN/list policy through the existing union/subtraction compiler.
+Validation remains offline; unused lists are not fetched.
+
+The resolver validates complete bounded text responses and stages version-2
+immutable objects/manifests with exact list URL/parser identity. Version-1
+RIPEstat recovery still loads, stabilizes, and retains its original object IDs.
+The shared scheduler preserves independent deadlines and applies retry
+cooldowns only to selectors chosen for fetching. URL changes cannot use old
+endpoint fallback; malformed or unavailable feeds never publish partial state.
+
+Verification includes local HTTP/TLS fixtures, decoded-size and redirect
+boundaries, mixed-source compilation, legacy-cache recovery, and native
+dual-stack list lifecycle scenarios on nftables and both iptables tool families.
+The runnable example defines an unreferenced Zoom feed without introducing
+network access into the default empty policy.
+
+The [configuration contract](configuration.md#custom-ip-lists),
+[static source boundary](architecture.md#custom-ip-list-integration), and
+[source contract](data-sources.md#custom-https-ip-lists) own the implementation
+invariants. Keep the [verification matrix](development.md#verification-matrix)
+and existing writer, CrowdSec, ownership, and Docker gates passing.
+
+## 7. Operational and release gates
 
 **Status:** partially implemented.
 
@@ -137,13 +166,13 @@ release scaffolding only with working artifacts and executable checks.
 
 ## Immediate next task
 
-Complete the remaining operational and release gates in step 6: full metrics
-collection/export, installed service lifecycle, package lifecycle and architecture
-coverage, and signed release artifacts with executable release CI.
+Complete the remaining operational and release gates in step 7: full metrics
+collection/export, installed service lifecycle, package lifecycle and
+architecture coverage, and signed release artifacts with executable release CI.
 
-Static source-backed policy, both native backends, CrowdSec synchronization,
-decision lifecycle, and Docker iptables bridge coexistence are implemented.
-Keep their existing writer,
+Static source-backed policy, custom HTTP(S) lists, both native backends, CrowdSec
+synchronization and decision lifecycle, and Docker iptables bridge coexistence
+are implemented. Keep their existing writer,
 recovery, packet-path, and compatibility gates passing while adding the remaining
 features. Track new work as issues using acceptance criteria from the owning
 documents rather than maintaining another implementation or test plan.

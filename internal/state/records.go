@@ -119,10 +119,10 @@ func (s *Store) validateRevision(revision *Revision) error {
 		if err != nil {
 			return fmt.Errorf("state: revision %s manifest: %w", revision.ID, err)
 		}
-		snapshot = cached.Policy()
-		if !reflect.DeepEqual(cached.Policy().Selectors(), required) {
-			return fmt.Errorf("state: revision %s manifest selector coverage mismatch", revision.ID)
+		if err := cached.ValidateConfig(revision.Config); err != nil {
+			return fmt.Errorf("state: revision %s source identity: %w", revision.ID, err)
 		}
+		snapshot = cached.Policy()
 	}
 	compiled, err := policy.Compile(revision.Config, snapshot)
 	if err != nil {

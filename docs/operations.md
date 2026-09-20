@@ -8,8 +8,9 @@ native kernel behavior. The [implementation plan](implementation-plan.md) is
 authoritative for delivery status.
 
 > **Status boundary.** The source-build instructions in this document describe
-> what runs today, including Docker's iptables bridge integration. Installed
-> packages, systemd payloads, and release artifacts remain first-release work.
+> what runs today, including custom HTTP(S) text IP lists and Docker's iptables
+> bridge integration. Installed packages, systemd payloads, and release artifacts
+> remain first-release work.
 > A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
@@ -34,9 +35,9 @@ Docker coexistence is verified for Docker Engine 29.8.1's iptables bridge
 backend with both iptables tool families and IPv4/IPv6. Docker's native nftables
 backend, rootless networking, and Swarm are outside that verified scope.
 See the [Docker attachment contract](firewall-backends.md#docker-docker-user-attachment).
-Offline validation intentionally accepts the complete version-1 schema.
-`configs/perimeterd.yaml` is a full-schema example and must not be treated as a
-runnable capability list.
+Offline validation accepts `ip_lists` definitions and include/exclude selectors.
+`configs/perimeterd.yaml` includes an unreferenced example source, which causes
+no network access until an enabled policy references it.
 
 ### Source-build prerequisites
 
@@ -112,7 +113,7 @@ referenced cache evidence before mutating the firewall. Unreferenced cache
 files are collected only after startup recovery or explicit cleanup, not while
 source workers may be staging candidates.
 
-Refresh uses `geo.refresh_interval` (default `24h`) plus sampled jitter up to
+RIPEstat refresh uses `geo.refresh_interval` (default `24h`) plus sampled jitter up to
 `geo.refresh_jitter` (default `10m`). Each request defaults to a `30s` timeout;
 at most four source requests are in flight and at most 512 selectors are
 accepted. Incomplete, malformed, oversized, or otherwise unacceptable source
@@ -128,6 +129,35 @@ execution failure as unchanged enforcement: partial or ambiguous results follow
 the backend's compensation and recovery contract. See
 [firewall backends](firewall-backends.md) and
 [durable admission](architecture.md#durable-apply-and-crash-recovery).
+
+## Custom IP list operations
+
+Define reusable HTTP(S) sources under `ip_lists`, with a per-list
+`refresh_interval`, and reference names from policy include/exclude selectors.
+The [configuration example](configuration.md#custom-list-example) and
+[source contract](data-sources.md#custom-https-ip-lists) own the schema,
+text format, HTTP safeguards, and complete-snapshot refresh/fallback behavior.
+
+Prefer HTTPS and review the publisher's coverage before use, especially an
+IPv4-only list in a dual-stack allowlist. Lists inherit policy classification
+and precedence; an exclude is not a global bypass. Refreshes change only new
+flows. No custom list is fetched unless an enabled policy references it.
+Ensure the daemon can still reach the feed and DNS under any egress policy.
+Custom lists do not automatically allow their own HTTP(S) endpoints through the
+firewall; retain the necessary outbound access using existing policy controls.
+
+Reload URL, interval, and reference changes with `SIGHUP`; a rejected reload
+retains the old configuration and its timers. With no matching committed
+fallback, an unavailable required list prevents first-start readiness or rejects
+a reload. Later outages retain the entire committed static snapshot and retry
+on schedule; stale entries have no automatic expiry. Removing/disabling a
+policy, not serving an empty file, is the deliberate removal mechanism.
+Monitor source age and refresh errors, not enforcement health alone.
+
+List definitions may point to private servers reachable by the daemon.
+Plain HTTP trusts that network path as well as the publisher. Do not use URLs
+as secret storage: their identity is retained in root-only durable state, while
+logs should identify lists by name and omit URLs and query strings.
 
 ## Operator sequence
 
@@ -381,9 +411,10 @@ runtime watchdog and does not change reload semantics.
 - `perimeterd_enforcement_health` (unlabeled gauge): `1` only when the selected
   enforcement is healthy; it becomes `0` during degraded recovery. A listener
   failure terminates `run`, so the endpoint is no longer served.
-- `perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}` (gauge),
-  when a source-backed revision is active. It is the oldest required selector's
-  retrieval time, not manifest publication time.
+- `perimeterd_prefix_snapshot_timestamp_seconds{source}` (gauge), emitted
+  separately for each required static source kind: `ripestat` and `ip_list`.
+  It is the oldest committed retrieval time for that kind, not manifest
+  publication time. Unreferenced source kinds emit no timestamp.
 - `perimeterd_crowdsec_connected` (unlabeled gauge): the active integration's
   synchronization/poll outcome. It is `0` when disabled, not yet synchronized,
   or after a failed poll/reconnect, and `1` after successful polling/activation.
@@ -433,12 +464,14 @@ exports them:
 - `perimeterd_firewall_counter_timestamp_seconds{backend}` (gauge): timestamp
   of the last successful native counter read.
 
-The prefix gauge includes built-in local, configured global, and RIPEstat
-prefixes through fixed `source` and `type` label values. Allowed label values
+The prefix gauge includes built-in local, configured global, RIPEstat, and
+custom-list prefixes through fixed `source` and `type` label values;
+custom lists use `source="ip_list"` and `type="ip_list"`. Allowed label values
 remain bounded: firewall `reason` is `global_blocklist`, `crowdsec`, or
-`geo_policy`; `action` is `drop` or `reject`; and counter-read `result` is
-`success` or `error`. No metric label may contain an address, ASN, country,
-policy name, raw error, or unbounded remote revision.
+`geo_policy` (including list-based policies); `action` is `drop` or `reject`;
+and counter-read `result` is `success` or `error`. No metric label may contain
+an address, ASN, country, policy/list name, URL, raw error, or unbounded remote
+revision.
 
 The planned fixed 15-second background sampler reads native counters through the
 serialized backend path and serves last in-memory values without querying the

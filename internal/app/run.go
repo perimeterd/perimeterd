@@ -16,6 +16,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
@@ -249,14 +250,19 @@ func Run(ctx context.Context, options Options) error {
 		case <-runCtx.Done():
 			return stopService()
 		case <-sources.events():
-			sources.schedule()
+			sources.stopTimer()
 			if recovering || sources.active == nil || sources.refreshCancel != nil {
+				continue
+			}
+			if next := sources.nextRefresh(time.Now()); next.IsZero() || next.After(time.Now()) {
+				sources.schedule()
 				continue
 			}
 			revision := sources.active
 			sequence, admitErr := engine.AdmitRefresh(revision.Epoch)
 			if admitErr != nil {
 				publication.logger.Warn("source refresh admission failed", "error", admitErr)
+				sources.timer = time.NewTimer(time.Second)
 				continue
 			}
 			refreshCtx, cancel := context.WithCancel(producerCtx)
@@ -312,6 +318,8 @@ func Run(ctx context.Context, options Options) error {
 			if result.candidate.refresh != 0 && sources.refreshCancel != nil {
 				sources.refreshCancel()
 				sources.refreshCancel = nil
+				sources.attempted(result.attempted, time.Now())
+				sources.schedule()
 			}
 			if result.err != nil {
 				publication.logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
@@ -408,6 +416,7 @@ type stageResult struct {
 	logger     *slog.Logger
 	err        error
 	refreshErr error
+	attempted  []policy.Selector
 }
 
 func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver, epoch uint64, committed string) stageResult {

@@ -19,7 +19,7 @@ type metricsServer struct {
 	crowdConnected func() bool
 }
 
-func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int64) (*metricsServer, error) {
+func bindMetrics(listen string, health func() bool, snapshotTimestamps func() sourceTimestamps) (*metricsServer, error) {
 	if listen == "" {
 		return nil, nil
 	}
@@ -43,9 +43,16 @@ func bindMetrics(listen string, health func() bool, snapshotTimestamp func() int
 			value = 1
 		}
 		_, _ = fmt.Fprintf(writer, "# HELP perimeterd_enforcement_health Whether the selected firewall state is healthy.\n# TYPE perimeterd_enforcement_health gauge\nperimeterd_enforcement_health %d\n", value)
-		if snapshotTimestamp != nil {
-			if stamp := snapshotTimestamp(); stamp != 0 {
-				_, _ = fmt.Fprintf(writer, "# HELP perimeterd_prefix_snapshot_timestamp_seconds Oldest retrieval time in the committed prefix snapshot.\n# TYPE perimeterd_prefix_snapshot_timestamp_seconds gauge\nperimeterd_prefix_snapshot_timestamp_seconds{source=\"ripestat\"} %d\n", stamp)
+		if snapshotTimestamps != nil {
+			stamps := snapshotTimestamps()
+			if stamps.ripe != 0 || stamps.ipList != 0 {
+				_, _ = fmt.Fprint(writer, "# HELP perimeterd_prefix_snapshot_timestamp_seconds Oldest retrieval time in the committed prefix snapshot by source.\n# TYPE perimeterd_prefix_snapshot_timestamp_seconds gauge\n")
+			}
+			if stamps.ripe != 0 {
+				_, _ = fmt.Fprintf(writer, "perimeterd_prefix_snapshot_timestamp_seconds{source=\"ripestat\"} %d\n", stamps.ripe)
+			}
+			if stamps.ipList != 0 {
+				_, _ = fmt.Fprintf(writer, "perimeterd_prefix_snapshot_timestamp_seconds{source=\"ip_list\"} %d\n", stamps.ipList)
 			}
 		}
 		if metrics != nil && metrics.crowdConnected != nil {

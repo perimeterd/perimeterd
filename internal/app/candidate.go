@@ -2,6 +2,7 @@
 package app
 
 import (
+	"maps"
 	"slices"
 
 	"github.com/perimeterd/perimeterd/internal/config"
@@ -27,6 +28,9 @@ type Candidate struct {
 // the kernel. The candidate owns independent copies of cfg and its compiled
 // model, so later caller mutations cannot alter the desired revision.
 func NewCandidate(epoch uint64, path string, cfg config.Config, snapshot source.Snapshot) (Candidate, error) {
+	if err := snapshot.ValidateConfig(cfg); err != nil {
+		return Candidate{}, err
+	}
 	owned := cloneConfig(cfg)
 	if err := firewall.ValidateConfig(owned); err != nil {
 		return Candidate{}, err
@@ -42,6 +46,7 @@ func cloneConfig(value config.Config) config.Config {
 	value.Global.Allowlist = slices.Clone(value.Global.Allowlist)
 	value.Global.Blocklist = slices.Clone(value.Global.Blocklist)
 	value.Groups = cloneGroups(value.Groups)
+	value.IPLists = maps.Clone(value.IPLists)
 	value.Policies = clonePolicies(value.Policies)
 	value.Firewall.IPTables.Attachments = cloneAttachments(value.Firewall.IPTables.Attachments)
 	return value
@@ -78,6 +83,7 @@ func cloneSelector(value config.Selector) config.Selector {
 	value.RIRs = slices.Clone(value.RIRs)
 	value.Groups = slices.Clone(value.Groups)
 	value.ASNs = slices.Clone(value.ASNs)
+	value.IPLists = slices.Clone(value.IPLists)
 	value.ExpandedCountries = slices.Clone(value.ExpandedCountries)
 	return value
 }

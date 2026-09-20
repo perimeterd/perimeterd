@@ -1,9 +1,10 @@
 # Architecture
 
 This document owns component boundaries, writer ownership, revision admission,
-and durable recovery for the implemented native runtimes. Service packaging and
-the [future deployment boundaries](#future-deployment-boundaries) are not
-implemented deployment options.
+and durable recovery for the native runtimes, including custom HTTP(S) IP lists
+through the static-source boundary. Service packaging and the
+[future deployment boundaries](#future-deployment-boundaries) are not implemented
+deployment options.
 
 The [implementation plan](implementation-plan.md) owns milestone status.
 [Operations](operations.md#current-source-build-runtime) describes what can run
@@ -19,8 +20,10 @@ Related contracts live in [configuration](configuration.md),
 ```mermaid
 flowchart LR
     CS[Local config source] --> V[Strict validation]
-    V --> R[Selector resolver and RIPEstat cache]
+    V --> R[Selector resolver and immutable cache]
     R --> C[Policy compiler]
+    RIPE[RIPEstat] --> R
+    TXT[HTTP/S text IP lists] --> R
     L[CrowdSec LAPI stream] --> D[Dynamic decision store]
     C --> W[Serialized firewall writer]
     D --> W
@@ -101,6 +104,35 @@ export are planned. The collector must observe through the writer outside the
 HTTP request path, never mutate policy, and never change readiness.
 [Operations](operations.md#prometheus-metrics) owns collection cadence, failure
 handling, and process-lifetime counter semantics.
+
+### Custom IP list integration
+
+Named `ip_lists` extend static source resolution, not the dynamic CrowdSec path.
+Each definition supplies an HTTP(S) URL and its own refresh interval; policy
+`include.ip_lists` and `exclude.ip_lists` reference those names. The
+[configuration contract](configuration.md#custom-ip-lists) owns fields,
+defaults, validation, and policy semantics; [data sources](data-sources.md#custom-https-ip-lists)
+owns the text format, fetch limits, source identity, scheduling, and cache rules.
+
+The resolver fetches only lists referenced by enabled policies, normalizes their
+IPv4/IPv6 prefixes, and stages them alongside any required RIPEstat selectors
+in one complete immutable snapshot. The compiler performs the existing
+include-union minus exclude-union algebra without knowing URLs or making
+requests. Both backends consume the resulting static sets; list refreshes do
+not update live sets in place or create a new packet-path stage.
+
+A single static scheduler accounts for RIPEstat and per-list deadlines.
+Refreshes still carry the active configuration epoch and global static refresh
+sequence; separate list timers must not publish independently or overwrite
+another source's newer result. Reload stages list definitions and scheduling
+with the rest of the candidate. Only durable selection activates the new
+schedule; a rejected reload leaves the old definitions and refreshes running.
+
+The existing writer, journal, recovery, and complete-snapshot fallback
+boundaries apply unchanged. List URLs are part of source identity: changing a
+URL cannot reuse the old endpoint's prefixes as fallback under the same name.
+Persisted source evidence must remain sufficient to recover existing
+RIPEstat-only revisions as well as mixed-source revisions.
 
 ## Revision lifecycle
 
@@ -343,8 +375,8 @@ The last-known-good revision remains authoritative when a candidate is unsafe:
   obsolete custom parent does not prevent removal of remaining owned artifacts.
 - A failed nftables switch is atomic; a partially committed iptables update
   requires compensation and may enter degraded recovery.
-- First start with required geo selectors and neither a valid committed cache
-  nor a successful RIPEstat response fails before any new policy mutation.
+- First start with required static selectors and neither a valid committed cache
+  nor successful source responses fails before any new policy mutation.
 - A rejected reload leaves the prior revision running; apply/recovery failures
   follow the backend-specific guarantees rather than claiming universal atomicity.
 - Refresh failure retains cached prefixes and active rules. Current logs report
@@ -358,12 +390,16 @@ idempotently.
 
 ## Security and trust boundaries
 
-Configuration and credential files are privileged local input. RIPEstat and
-CrowdSec are network trust boundaries: responses are bounded, validated, and
-normalized before compilation. Firewall commands and netlink transactions are
+Configuration and credential files are privileged local input. RIPEstat,
+CrowdSec, and custom HTTP(S) lists are network trust boundaries: responses are
+bounded, validated, and normalized before compilation. Firewall commands and netlink transactions are
 output boundaries and accept only typed desired state, never source-provided
 firewall syntax. No source adapter can select commands, chain names, or raw
 rules.
+Custom-list publishers control the addresses contributed by their selectors;
+using HTTP also trusts the network path. Prefer HTTPS with normal certificate
+verification. The text-list adapter accepts addresses only, never scripts,
+includes, or remote configuration.
 
 `run` and `cleanup` require UID 0. The planned installed service adds the
 capability restrictions and systemd hardening in [operations](operations.md);

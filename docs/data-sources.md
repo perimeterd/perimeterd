@@ -13,6 +13,9 @@
 > below remains mandatory. The [implementation plan](implementation-plan.md)
 > owns delivery status; [operations](operations.md#current-source-build-runtime)
 > describes source-build use and its production-security limitations.
+>
+> Custom HTTP(S) text IP lists extend static snapshots without changing CrowdSec
+> authority or leases.
 
 ## Contents
 
@@ -28,6 +31,11 @@
   - [Snapshot manifests](#snapshot-manifests)
   - [Cache publication and durable-commit coupling](#cache-publication-and-durable-commit-coupling)
   - [Fresh reuse and stale fallback](#fresh-reuse-and-stale-fallback)
+- [Custom HTTP(S) IP lists](#custom-https-ip-lists)
+  - [Text format and validation](#text-format-and-validation)
+  - [HTTP transport](#http-transport)
+  - [List identity and immutable cache](#list-identity-and-immutable-cache)
+  - [Per-list refresh and complete snapshots](#per-list-refresh-and-complete-snapshots)
 - [CrowdSec stream](#crowdsec-stream)
   - [Supported LAPI contract](#supported-lapi-contract)
   - [Compatibility rationale and primary-source evidence](#compatibility-rationale-and-primary-source-evidence)
@@ -41,8 +49,9 @@
 - [CrowdSec availability, endpoint changes, and secrets](#crowdsec-availability-endpoint-changes-and-secrets)
 - [Source failure matrix](#source-failure-matrix)
 
-Version 1 uses RIPEstat for static country/ASN prefixes and CrowdSec LAPI for
-dynamic ingress bans. [Configuration](configuration.md) defines selectors and defaults;
+Version 1 uses RIPEstat for static country/ASN prefixes, custom HTTP(S)
+text lists as another static selector type, and CrowdSec LAPI for dynamic
+ingress bans. [Configuration](configuration.md) defines selectors and defaults;
 [architecture](architecture.md) defines revision admission, commit behavior,
 and process lifecycle. Sources produce typed data and never emit firewall
 syntax. This document owns source wire compatibility, source-side validation,
@@ -120,6 +129,9 @@ added until such an implementation exists.
 enabled policies and stages one complete immutable cache snapshot. Every
 resolution is a complete candidate, not a stream of independently publishable
 selector updates.
+The steps below describe RIPEstat resolution; the
+[custom-list extension](#custom-https-ip-lists) specifies how additional
+selectors join the same transaction.
 
 RIR service regions use a release-pinned, explicit country assignment from the
 [RIPE NCC country/RIR table](https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/),
@@ -197,6 +209,11 @@ credentials or other secrets.
 The prefix cache is a content-addressed object store, not a directory whose
 current files are assembled on restart. Source objects and manifests are
 immutable; publication selects one complete manifest.
+New objects and manifests use schema version 2; committed version-1 RIPEstat
+objects and manifests remain readable, stabilizable, and protected from
+collection by their original exact references. The fields below describe
+RIPEstat records; [list identity](#list-identity-and-immutable-cache) adds
+source-specific metadata within the same cache.
 
 ### Selector objects
 
@@ -258,7 +275,7 @@ recovery evidence.
 
 ### Fresh reuse and stale fallback
 
-Only currently referenced selectors refresh. The default schedule is once per
+Only currently referenced RIPEstat selectors refresh. The default schedule is once per
 `24h` interval plus an independently sampled delay from zero through `10m`;
 the request timeout defaults to `30s` and concurrency remains at most four.
 Freshness uses the configured refresh interval and recorded retrieval time;
@@ -291,6 +308,133 @@ policy mutation or readiness. Snapshot age uses the oldest retrieval time among
 required selectors, never the manifest creation time, so reusing stale data
 cannot make it appear fresh. Report refresh failure and retry at the next
 normal schedule.
+
+## Custom HTTP(S) IP lists
+
+Named `ip_lists` resolve operator-selected HTTP or HTTPS text feeds for
+`include.ip_lists` and `exclude.ip_lists`. They are independent of RIPEstat and
+do not infer countries or ASNs. [Configuration](configuration.md#custom-ip-lists)
+owns names, URL validation, defaults, references, and policy behavior.
+
+### Text format and validation
+
+- Accept UTF-8 plain text with LF or CRLF lines and an optional final newline.
+  Trim surrounding ASCII spaces and tabs; ignore blank lines and full-line
+  comments beginning with `#` after trimming.
+- Every remaining line must contain exactly one IPv4 or IPv6 address or CIDR.
+  Inline comments, comma-separated values, address ranges, hostnames, zone
+  identifiers, HTML/JSON, and directives to load other files are invalid.
+- Normalize with `net/netip`: bare addresses become `/32` or `/128`, CIDRs are
+  masked, and duplicates and contained prefixes are removed. Sort by family,
+  address, then prefix length. IPv4 and IPv6 may coexist in one file; `/0`
+  prefixes are valid and use the existing native lowering.
+- Validate the complete body, including entries from a disabled address family.
+  A malformed line rejects the whole response; never silently skip bad entries
+  or accept a valid prefix before a broken tail. Diagnostics identify the list
+  name and line number without logging complete response bodies.
+- An empty or comment-only body is invalid, not a request to clear enforcement.
+  A single-family list is valid, subject to the existing family-empty
+  allowlist/blocklist semantics. Exclusions that empty an enabled policy also
+  reject the candidate, as for other static selectors.
+
+The supplied
+[Zoom list](https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/zoom/zoom_ips.txt)
+is an example of this line-oriented IPv4/IPv6 format. Tests must use local
+fixtures rather than depend on that mutable public URL.
+
+### HTTP transport
+
+Fetch with HTTP GET. Require a final HTTP 200 and a fully read, validated body;
+204, unsolicited 304, other statuses, transport errors, truncated reads, or
+timeouts fail resolution. Parse the body as text regardless of MIME type or
+filename extension; a `.txt` suffix is not required.
+
+Use the list's `request_timeout` for the entire fetch, including redirects and
+body reading. Enforce the existing 32 MiB decoded-response cap, including after
+decompression. Across static providers, at most four requests may be in flight;
+list workers do not get an additional independent concurrency allowance.
+Reject a candidate with more than 512 distinct required static selectors
+(expanded country/ASN selectors plus named list identities) before requests.
+
+Follow at most ten redirects, applying the same URL constraints at every hop.
+HTTP-to-HTTPS and same-scheme redirects are allowed; HTTPS-to-HTTP downgrade is
+rejected. HTTPS uses normal certificate and hostname verification. No remote
+response can supply configuration or executable content.
+
+Configured endpoints may be public or private, including local HTTP servers.
+Configuring a URL therefore authorizes network access from the daemon; this is
+privileged local configuration, not an untrusted remote URL submission API.
+Prefer HTTPS and trust the publisher: HTTP permits in-transit policy changes,
+and HTTPS cannot ensure a publisher's list is correct. Do not log query strings,
+full URLs, or response bodies; use configured names for diagnostics. URLs may
+be persisted as source identity in root-only state, so they are not a supported
+secret-storage mechanism.
+
+### List identity and immutable cache
+
+Version-2 selector objects and manifest entries identify custom lists with
+`source_kind: "ip_list"` and `source_name` equal to the configured list name.
+Their `endpoint` is the configured URL and `api_version` is text-parser format
+`"1"`. `parameters` is empty and query-time fields are empty strings: a text
+source does not fabricate RIPEstat metadata. All-RIPEstat manifests retain
+`source: "ripestat"`; manifests containing lists use `source: "static"`. Use the
+configured URL with scheme and DNS host normalized to lowercase, preserving
+path and query bytes; redirect destinations do not replace that identity.
+Changing the name or URL requires resolution under a new identity; changing
+only the interval or timeout does not invalidate already validated prefixes.
+
+List objects store that identity, retrieval time, normalized family arrays,
+and content identifiers; RIPEstat query times and API metadata are not invented
+for a text source. Mixed manifests bind the complete required selector set to
+exact objects. A list referenced in multiple include/exclude positions uses one
+object. Different configured names remain distinct selectors even if they use
+the same URL.
+
+The same checksums, bounded decoding, durability barriers, exact-reference
+recovery, and garbage-collection rules apply. Recovery reads the object IDs
+recorded in the manifest rather than reconstructing IDs with the current schema.
+
+### Per-list refresh and complete snapshots
+
+Only lists referenced by enabled policies are fetched or scheduled. Each uses
+its own positive `refresh_interval` (default `24h`) and `request_timeout`
+(default `30s`), independent of `geo` timings. There is no additional custom-list
+jitter setting. Freshness is measured from successful retrieval, not manifest
+creation or firewall application.
+
+One static scheduler selects the earliest required source deadline, fetching
+due/missing selectors and reusing fresh objects from the committed manifest.
+RIPEstat retains its existing jittered schedule; a list deadline must not force
+a still-fresh RIPEstat selector or another list to be downloaded. Each attempt
+stages one complete candidate for the active configuration, with the existing
+epoch and refresh-sequence admission fences. A later candidate must account
+for all currently due selectors, not overwrite a newer source result from an
+independent list worker.
+
+A failed attempt retains the entire committed snapshot and its retrieval
+timestamps. Retry failed due selectors after their configured intervals, not in
+a tight loop caused by stale retrieval times; other sources keep their own
+deadlines. Do not publish successful partial fetches with stale replacements
+for failed selectors. Cache freshness and next retry time are separate concepts.
+Only selectors selected for fetching receive a retry deadline; a reused peer
+that expires during another request is not treated as failed. Because publication
+requires one complete snapshot, a stale selector's outstanding retry cooldown
+can defer the whole transaction, without moving other selectors' own deadlines.
+
+First start needs every required selector to resolve. Restart and reload may
+use the complete committed fallback only when it covers every required
+identity and still compiles under the candidate configuration; a subset manifest
+preserves its retrieval times. Adding a list or changing its URL cannot fall
+back to an unrelated or previously named endpoint. A failed reload keeps the
+old configuration and its schedule. Disabling/removing the last active reference
+stops that list's refresh after commit, without deleting cache evidence still
+required by a retained revision or journal.
+
+Refresh failures retain static enforcement without an expiry limit, unlike
+CrowdSec leases. This favors continuity over automatic removal of stale list
+entries; operators must monitor freshness. Source timestamp reporting uses the
+oldest required committed retrieval per source kind, never resets age on
+fallback, and must not label custom-list data as RIPEstat.
 
 ## CrowdSec stream
 
@@ -732,7 +876,7 @@ startup performs a new authoritative snapshot and reconciliation.
 
 ## Source failure matrix
 
-The rows below describe implemented source-backed and dynamic policy behavior.
+The following failure behavior is implemented for both static source kinds.
 
 ### RIPEstat and cache (implemented)
 
@@ -741,6 +885,15 @@ The rows below describe implemented source-backed and dynamic policy behavior.
 | Corrupt staged objects or orphaned/uncommitted manifests | Ignore them and fetch or use a complete valid committed manifest. First start fails if a complete candidate cannot be built. |
 | Corrupt objects referenced by recovery state | Do not silently substitute a newly fetched generation. Recovery validates the journal and committed references before admitting work; missing recovery evidence requires repair as specified in [architecture](architecture.md#durable-apply-and-crash-recovery). |
 | Initial backend application failure | Withhold readiness and perform backend-specific compensation; preserve recovery evidence if it fails. |
+
+### Custom HTTP(S) lists
+
+| Failure | Required behavior |
+| --- | --- |
+| Invalid line, empty body, failed status, timeout, redirect violation, or decoded-size overflow | Reject the complete candidate; retain the committed manifest and enforcement, report failure, and retry on schedule. |
+| New list or changed URL cannot resolve | Fail first-start readiness or reject the reload; never reuse the old endpoint under the new identity. |
+| Required list is stale and unavailable at restart | Use only a valid complete committed fallback that covers every required identity and compiles; otherwise withhold readiness without applying partial policy. |
+| List result succeeds but compilation, apply, or durable publication fails | Do not independently publish list cache selection; use the existing writer compensation/recovery rules. |
 
 ### CrowdSec integration
 

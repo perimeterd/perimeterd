@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
@@ -31,6 +32,7 @@ type runtimeReservation struct {
 	replace     bool
 	logger      *slog.Logger
 	refreshErr  error
+	attempted   []policy.Selector
 }
 
 func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger) *runtimePublication {
@@ -51,7 +53,7 @@ func (p *runtimePublication) reserve(result stageResult) error {
 	var staged *metricsServer
 	if replace {
 		var err error
-		staged, err = bindMetrics(result.cfg.Metrics.Listen, p.metricsHealthy, p.source.timestamp.Load)
+		staged, err = bindMetrics(result.cfg.Metrics.Listen, p.metricsHealthy, p.source.snapshotTimestamps)
 		if err != nil {
 			return err
 		}
@@ -64,6 +66,7 @@ func (p *runtimePublication) reserve(result stageResult) error {
 		replace:    replace,
 		logger:     result.logger,
 		refreshErr: result.refreshErr,
+		attempted:  result.attempted,
 	}
 	return nil
 }
@@ -108,6 +111,8 @@ func (p *runtimePublication) publishReservation(revision *state.Revision, reserv
 	}
 	p.logger = reservation.logger
 	if reservation.refreshErr != nil {
+		p.source.attempted(reservation.attempted, time.Now())
+		p.source.schedule()
 		p.logger.Warn("using committed source snapshot after refresh failure", "error", reservation.refreshErr, "snapshot_age", p.source.age())
 	}
 	if !reservation.replace {

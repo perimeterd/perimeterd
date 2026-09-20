@@ -22,6 +22,8 @@ const (
 	RIR SelectorKind = "rir"
 	// ASN selects an autonomous system number.
 	ASN SelectorKind = "asn"
+	// IPList selects a named configured HTTP(S) text list.
+	IPList SelectorKind = "ip_list"
 )
 
 // Selector is a canonical source identity used as a snapshot key.
@@ -59,6 +61,11 @@ func CanonicalSelector(kind SelectorKind, value string) (Selector, error) {
 		if !catalog.ValidASN(value) {
 			return Selector{}, fmt.Errorf("ASN selector %q must use canonical AS<number> form", value)
 		}
+	case IPList:
+		if !config.ValidName(value) {
+			return Selector{}, fmt.Errorf("IP list selector %q must use a lowercase DNS-label-like name", value)
+		}
+		canonical.Value = value
 	default:
 		return Selector{}, fmt.Errorf("unknown selector kind %q", kind)
 	}
@@ -195,7 +202,7 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 	if len(selection.Groups) > 0 && len(selection.ExpandedCountries) == 0 {
 		return nil, fmt.Errorf("groups are unresolved")
 	}
-	seen := make(map[Selector]struct{}, len(selection.Countries)+len(selection.ExpandedCountries)+len(selection.RIRs)+len(selection.ASNs))
+	seen := make(map[Selector]struct{}, len(selection.Countries)+len(selection.ExpandedCountries)+len(selection.RIRs)+len(selection.ASNs)+len(selection.IPLists))
 	addCountry := func(value string) error {
 		selector, err := CanonicalSelector(Country, value)
 		if err != nil {
@@ -222,6 +229,13 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 	}
 	for _, asn := range selection.ASNs {
 		selector, err := CanonicalSelector(ASN, asn)
+		if err != nil {
+			return nil, err
+		}
+		seen[selector] = struct{}{}
+	}
+	for _, list := range selection.IPLists {
+		selector, err := CanonicalSelector(IPList, list)
 		if err != nil {
 			return nil, err
 		}

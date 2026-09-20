@@ -16,12 +16,19 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
-func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedManifest string, allowStale bool) (Resolution, error) {
+func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedManifest string, allowStale bool) (resolution Resolution, resolveErr error) {
+	var attempted []policy.Selector
+	defer func() {
+		if attempted != nil {
+			resolution.Attempted = append([]policy.Selector(nil), attempted...)
+		}
+	}()
 	if err := ctx.Err(); err != nil {
 		return Resolution{}, err
 	}
@@ -41,6 +48,11 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 	if r.cache == nil {
 		return Resolution{}, errors.New("source: cache is required for non-empty resolution")
 	}
+	for _, selector := range required {
+		if _, _, err := selectorTiming(cfg, selector); err != nil {
+			return Resolution{}, err
+		}
+	}
 
 	var committed Snapshot
 	if committedManifest != "" {
@@ -52,7 +64,8 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 	committedBySelector := recordsBySelector(committed.Records())
 	committedCovers := true
 	for _, selector := range required {
-		if _, ok := committedBySelector[selector]; !ok {
+		record, ok := committedBySelector[selector]
+		if !ok || !recordMatchesConfig(record, cfg) {
 			committedCovers = false
 			break
 		}
@@ -62,11 +75,12 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 	stale := make([]policy.Selector, 0, len(required))
 	for _, selector := range required {
 		record, ok := committedBySelector[selector]
-		if !ok {
+		if !ok || !recordMatchesConfig(record, cfg) {
 			stale = append(stale, selector)
 			continue
 		}
-		if recordFresh(record, cfg.Geo.RefreshInterval) {
+		interval, _, _ := selectorTiming(cfg, selector)
+		if recordFresh(record, interval) {
 			candidate[selector] = record
 		} else {
 			stale = append(stale, selector)
@@ -118,7 +132,8 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 		return Resolution{Snapshot: snapshot}, nil
 	}
 
-	fetched, fetchErr := r.fetchAll(ctx, cfg.Geo.RequestTimeout, stale)
+	attempted = append([]policy.Selector(nil), stale...)
+	fetched, fetchErr := r.fetchAll(ctx, cfg, stale)
 	if fetchErr != nil {
 		return refreshFailure(fetchErr)
 	}
@@ -172,16 +187,102 @@ func recordFresh(record Record, interval time.Duration) bool {
 	return age >= 0 && age < interval
 }
 
+func selectorTiming(cfg config.Config, selector policy.Selector) (time.Duration, time.Duration, error) {
+	if selector.Kind != policy.IPList {
+		return cfg.Geo.RefreshInterval, cfg.Geo.RequestTimeout, nil
+	}
+	list, ok := cfg.IPLists[selector.Value]
+	if !ok {
+		return 0, 0, fmt.Errorf("source: custom list %q is not configured", selector.Value)
+	}
+	if list.RefreshInterval <= 0 || list.RequestTimeout <= 0 {
+		return 0, 0, fmt.Errorf("source: custom list %q has invalid timing", selector.Value)
+	}
+	return list.RefreshInterval, list.RequestTimeout, nil
+}
+
+func recordMatchesConfig(record Record, cfg config.Config) bool {
+	switch record.Selector.Kind {
+	case policy.IPList:
+		list, ok := cfg.IPLists[record.Selector.Value]
+		if !ok {
+			return false
+		}
+		endpoint, err := normalizeListURL(list.URL)
+		return err == nil && record.SourceKind == listSourceKind && record.SourceName == record.Selector.Value && record.Endpoint == endpoint && record.APIVersion == listFormatVersion
+	case policy.Country, policy.ASN:
+		if record.SourceKind != "" && record.SourceKind != ripeSourceKind {
+			return false
+		}
+		expected := countryEndpoint
+		version := endpointVersions[countryEndpoint]
+		if record.Selector.Kind == policy.ASN {
+			expected = asnEndpoint
+			version = endpointVersions[asnEndpoint]
+		}
+		return record.Endpoint == expected && record.APIVersion == version
+	default:
+		return false
+	}
+}
+
+type listRequestMarker struct{}
+
+func markListRequest(ctx context.Context) context.Context {
+	return context.WithValue(ctx, listRequestMarker{}, true)
+}
+
+func isListRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	marked, _ := req.Context().Value(listRequestMarker{}).(bool)
+	return marked
+}
+
+func validateListURL(value *url.URL) error {
+	if value == nil {
+		return errors.New("invalid custom list URL")
+	}
+	_, err := normalizeListURL(value.String())
+	return err
+}
+
+func normalizeListURL(raw string) (string, error) {
+	return config.NormalizeIPListURL(raw)
+}
+
+func classifyListRequestError(err error) error {
+	var wrapped *url.Error
+	if errors.As(err, &wrapped) {
+		err = wrapped.Err
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("request timed out")
+	}
+	if errors.Is(err, context.Canceled) {
+		return errors.New("request canceled")
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "downgrade"):
+		return errors.New("redirect downgrade rejected")
+	case strings.Contains(message, "too many redirects"):
+		return errors.New("too many redirects")
+	case strings.Contains(message, "certificate"), strings.Contains(message, "tls"):
+		return errors.New("TLS verification failed")
+	default:
+		return errors.New("request failed")
+	}
+}
+
 type fetchResult struct {
 	selector policy.Selector
 	record   Record
 	err      error
 }
 
-func (r *Resolver) fetchAll(ctx context.Context, timeout time.Duration, selectors []policy.Selector) (map[policy.Selector]Record, error) {
-	if timeout <= 0 {
-		return nil, errors.New("source: request timeout must be positive")
-	}
+func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []policy.Selector) (map[policy.Selector]Record, error) {
 	requestCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan policy.Selector)
@@ -203,7 +304,7 @@ func (r *Resolver) fetchAll(ctx context.Context, timeout time.Duration, selector
 					if !ok {
 						return
 					}
-					record, err := r.fetchOne(requestCtx, timeout, selector)
+					record, err := r.fetchOne(requestCtx, cfg, selector)
 					select {
 					case results <- fetchResult{selector: selector, record: record, err: err}:
 					case <-requestCtx.Done():
@@ -254,44 +355,82 @@ func (r *Resolver) fetchAll(ctx context.Context, timeout time.Duration, selector
 	return fetched, nil
 }
 
-func (r *Resolver) fetchOne(parent context.Context, timeout time.Duration, selector policy.Selector) (Record, error) {
-	select {
-	case r.slots <- struct{}{}:
-		defer func() { <-r.slots }()
-	case <-parent.Done():
-		return Record{}, parent.Err()
-	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
-	values := url.Values{"sourceapp": {"perimeterd"}}
-	endpoint := countryEndpoint
-	switch selector.Kind {
-	case policy.Country:
-		values.Set("resource", selector.Value)
-		values.Set("v4_format", "prefix")
-	case policy.ASN:
-		endpoint = asnEndpoint
-		values.Set("resource", selector.Value[2:])
-	default:
-		return Record{}, fmt.Errorf("unsupported source selector kind %q", selector.Kind)
-	}
-	u, err := url.Parse(endpoint)
+func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector policy.Selector) (Record, error) {
+	_, timeout, err := selectorTiming(cfg, selector)
 	if err != nil {
 		return Record{}, err
 	}
-	u.RawQuery = values.Encode()
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	select {
+	case r.slots <- struct{}{}:
+		defer func() { <-r.slots }()
+	case <-ctx.Done():
+		return Record{}, ctx.Err()
+	}
+
+	list := selector.Kind == policy.IPList
+	values := url.Values{"sourceapp": {"perimeterd"}}
+	endpoint := countryEndpoint
+	if list {
+		configured, ok := cfg.IPLists[selector.Value]
+		if !ok {
+			return Record{}, fmt.Errorf("custom list %q is not configured", selector.Value)
+		}
+		endpoint, err = normalizeListURL(configured.URL)
+		if err != nil {
+			return Record{}, fmt.Errorf("custom list %q has invalid URL", selector.Value)
+		}
+	} else {
+		switch selector.Kind {
+		case policy.Country:
+			values.Set("resource", selector.Value)
+			values.Set("v4_format", "prefix")
+		case policy.ASN:
+			endpoint = asnEndpoint
+			values.Set("resource", selector.Value[2:])
+		default:
+			return Record{}, fmt.Errorf("unsupported source selector kind %q", selector.Kind)
+		}
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		if list {
+			return Record{}, errors.New("invalid custom list URL")
+		}
+		return Record{}, err
+	}
+	if list {
+		ctx = markListRequest(ctx)
+	} else {
+		u.RawQuery = values.Encode()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
+		if list {
+			return Record{}, errors.New("create request failed")
+		}
 		return Record{}, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Accept", "application/json")
+	if list {
+		req.Header.Set("Accept", "text/plain")
+	} else {
+		req.Header.Set("Accept", "application/json")
+	}
 	resp, err := r.client.Do(req)
 	if err != nil {
+		if list {
+			return Record{}, classifyListRequestError(err)
+		}
 		return Record{}, fmt.Errorf("request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return Record{}, fmt.Errorf("HTTP status %s", resp.Status)
+	if list {
+		if resp.StatusCode != http.StatusOK {
+			return Record{}, fmt.Errorf("HTTP status %d", resp.StatusCode)
+		}
+	} else if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return Record{}, fmt.Errorf("HTTP status %d", resp.StatusCode)
 	}
 	var decoded io.Reader = resp.Body
 	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && !resp.Uncompressed {
@@ -312,6 +451,9 @@ func (r *Resolver) fetchOne(parent context.Context, timeout time.Duration, selec
 	if len(body) > maxBodyBytes {
 		return Record{}, fmt.Errorf("response exceeds %d-byte limit", maxBodyBytes)
 	}
+	if list {
+		return parseList(body, endpoint, selector)
+	}
 	params := make(map[string]string, len(values))
 	for key, list := range values {
 		if len(list) != 1 {
@@ -323,6 +465,65 @@ func (r *Resolver) fetchOne(parent context.Context, timeout time.Duration, selec
 		return parseCountry(body, endpoint, params, selector)
 	}
 	return parseASN(body, endpoint, params, selector)
+}
+
+func parseList(body []byte, endpoint string, selector policy.Selector) (Record, error) {
+	if !utf8.Valid(body) {
+		return Record{}, fmt.Errorf("custom list %q line data is not valid UTF-8", selector.Value)
+	}
+	ipv4 := make([]netip.Prefix, 0)
+	ipv6 := make([]netip.Prefix, 0)
+	found := false
+	lineNumber := 0
+	offset := 0
+	for raw := range strings.SplitSeq(string(body), "\n") {
+		lineNumber++
+		line := raw
+		if strings.HasSuffix(line, "\r") && offset+len(raw) < len(body) {
+			line = strings.TrimSuffix(line, "\r")
+		}
+		offset += len(raw) + 1
+		line = strings.Trim(line, " \t")
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		found = true
+		prefix, err := netip.ParsePrefix(line)
+		if err != nil {
+			address, addressErr := netip.ParseAddr(line)
+			if addressErr != nil || address.Zone() != "" {
+				return Record{}, fmt.Errorf("custom list %q line %d is not one IP address or CIDR", selector.Value, lineNumber)
+			}
+			bits := 128
+			if address.Is4() {
+				bits = 32
+			}
+			prefix = netip.PrefixFrom(address, bits)
+		}
+		if prefix.Addr().Is4() {
+			ipv4 = append(ipv4, prefix)
+		} else if prefix.Addr().Is6() && prefix.Addr().Zone() == "" {
+			ipv6 = append(ipv6, prefix)
+		} else {
+			return Record{}, fmt.Errorf("custom list %q line %d contains an unsupported address", selector.Value, lineNumber)
+		}
+	}
+	if !found {
+		return Record{}, fmt.Errorf("custom list %q is empty", selector.Value)
+	}
+	normalized4, err := normalizeFamily(ipv4, true)
+	if err != nil {
+		return Record{}, fmt.Errorf("custom list %q IPv4: %w", selector.Value, err)
+	}
+	normalized6, err := normalizeFamily(ipv6, false)
+	if err != nil {
+		return Record{}, fmt.Errorf("custom list %q IPv6: %w", selector.Value, err)
+	}
+	normalizedEndpoint, err := normalizeListURL(endpoint)
+	if err != nil {
+		return Record{}, fmt.Errorf("custom list %q has invalid endpoint", selector.Value)
+	}
+	return Record{Selector: selector, SourceKind: listSourceKind, SourceName: selector.Value, Endpoint: normalizedEndpoint, APIVersion: listFormatVersion, Parameters: map[string]string{}, RetrievedAt: time.Now().UTC(), IPv4: normalized4, IPv6: normalized6}, nil
 }
 
 type envelope struct {

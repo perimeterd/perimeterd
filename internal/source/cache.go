@@ -28,13 +28,15 @@ import (
 )
 
 const (
-	cacheSchemaVersion   = 1
+	cacheSchemaVersion   = 2
 	cacheIDLength        = sha256.Size * 2
 	maxCacheObjectBytes  = 32 << 20
 	maxCacheManifestSize = 16 << 20
 	cacheDirMode         = 0o700
 	cacheFileMode        = 0o600
 )
+
+const legacyCacheSchemaVersion = 1
 
 // Cache is an immutable content-addressed store of selector objects and
 // complete manifests. It never selects an object by scanning the cache.
@@ -111,6 +113,9 @@ func (c *Cache) Stage(records []Record) (Snapshot, error) {
 	}
 	entries := make([]manifestEntry, 0, len(canonical))
 	for index, record := range canonical {
+		if record.SourceKind == listSourceKind && len(record.IPv4) == 0 && len(record.IPv6) == 0 {
+			return Snapshot{}, errors.New("custom list selector contains no prefixes")
+		}
 		object := objectFromRecord(record)
 		objectBytes, err := canonicalJSON(object)
 		if err != nil {
@@ -125,7 +130,14 @@ func (c *Cache) Stage(records []Record) (Snapshot, error) {
 		}
 		entries = append(entries, manifestEntryFromRecord(record, objectID))
 	}
-	manifest := manifestFile{SchemaVersion: cacheSchemaVersion, Source: "ripestat", Entries: entries}
+	source := "ripestat"
+	for _, record := range canonical {
+		if record.SourceKind == listSourceKind {
+			source = "static"
+			break
+		}
+	}
+	manifest := manifestFile{SchemaVersion: cacheSchemaVersion, Source: source, Entries: entries}
 	manifestBytes, err := canonicalJSON(manifest)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("manifest: %w", err)
@@ -166,7 +178,7 @@ func (c *Cache) Load(id string) (Snapshot, error) {
 	records := make([]Record, 0, len(manifest.Entries))
 	resolved := make([]policy.ResolvedSelector, 0, len(manifest.Entries))
 	for index, entry := range manifest.Entries {
-		record, err := c.loadObject(entry)
+		record, err := c.loadObject(entry, manifest.SchemaVersion)
 		if err != nil {
 			return Snapshot{}, fmt.Errorf("manifest %s selector %d: %w", id, index, err)
 		}
@@ -196,11 +208,11 @@ func (c *Cache) Stabilize(id string) error {
 	if err := syncCacheRegular(c.manifestPath(snapshot.ManifestID())); err != nil {
 		return fmt.Errorf("manifest sync: %w", err)
 	}
-	for _, record := range snapshot.records {
-		object, err := c.objectForRecord(record)
-		if err != nil {
-			return err
-		}
+	objectIDs, err := c.manifestObjectIDs(snapshot.ManifestID())
+	if err != nil {
+		return err
+	}
+	for _, object := range objectIDs {
 		if err := syncCacheRegular(c.objectPath(object)); err != nil {
 			return fmt.Errorf("object %s sync: %w", object, err)
 		}
@@ -284,6 +296,8 @@ type selectorWire struct {
 type objectFile struct {
 	SchemaVersion int               `json:"schema_version"`
 	Selector      selectorWire      `json:"selector"`
+	SourceKind    string            `json:"source_kind,omitempty"`
+	SourceName    string            `json:"source_name,omitempty"`
 	Endpoint      string            `json:"endpoint"`
 	APIVersion    string            `json:"api_version"`
 	Parameters    map[string]string `json:"parameters"`
@@ -294,10 +308,11 @@ type objectFile struct {
 	IPv4          []string          `json:"ipv4"`
 	IPv6          []string          `json:"ipv6"`
 }
-
 type manifestEntry struct {
 	Selector    selectorWire      `json:"selector"`
 	Object      string            `json:"object"`
+	SourceKind  string            `json:"source_kind,omitempty"`
+	SourceName  string            `json:"source_name,omitempty"`
 	Endpoint    string            `json:"endpoint"`
 	APIVersion  string            `json:"api_version"`
 	Parameters  map[string]string `json:"parameters"`
@@ -316,20 +331,29 @@ func objectFromRecord(record Record) objectFile {
 	return objectFile{
 		SchemaVersion: cacheSchemaVersion,
 		Selector:      selectorWire{Kind: string(record.Selector.Kind), Value: record.Selector.Value},
+		SourceKind:    record.SourceKind,
+		SourceName:    record.SourceName,
 		Endpoint:      record.Endpoint,
 		APIVersion:    record.APIVersion,
 		Parameters:    cloneParameters(record.Parameters),
-		QueryStart:    canonicalTime(record.QueryStart), QueryEnd: canonicalTime(record.QueryEnd), RetrievedAt: canonicalTime(record.RetrievedAt),
+		QueryStart:    storedTime(record.QueryStart), QueryEnd: storedTime(record.QueryEnd), RetrievedAt: canonicalTime(record.RetrievedAt),
 		ContentID: prefixContentID(record.IPv4, record.IPv6),
 		IPv4:      prefixStrings(record.IPv4), IPv6: prefixStrings(record.IPv6),
 	}
 }
 
 func manifestEntryFromRecord(record Record, object string) manifestEntry {
-	return manifestEntry{Selector: selectorWire{Kind: string(record.Selector.Kind), Value: record.Selector.Value}, Object: object, Endpoint: record.Endpoint, APIVersion: record.APIVersion, Parameters: cloneParameters(record.Parameters), QueryStart: canonicalTime(record.QueryStart), QueryEnd: canonicalTime(record.QueryEnd), RetrievedAt: canonicalTime(record.RetrievedAt)}
+	return manifestEntry{
+		Selector: selectorWire{Kind: string(record.Selector.Kind), Value: record.Selector.Value},
+		Object:   object, SourceKind: record.SourceKind, SourceName: record.SourceName,
+		Endpoint: record.Endpoint, APIVersion: record.APIVersion,
+		Parameters: cloneParameters(record.Parameters),
+		QueryStart: storedTime(record.QueryStart), QueryEnd: storedTime(record.QueryEnd),
+		RetrievedAt: canonicalTime(record.RetrievedAt),
+	}
 }
 
-func (c *Cache) loadObject(entry manifestEntry) (Record, error) {
+func (c *Cache) loadObject(entry manifestEntry, schemaVersion int) (Record, error) {
 	data, err := c.readBounded(c.objectPath(entry.Object), maxCacheObjectBytes)
 	if err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
@@ -341,11 +365,14 @@ func (c *Cache) loadObject(entry manifestEntry) (Record, error) {
 	if err := decodeCanonical(data, &object, maxCacheObjectBytes); err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
+	if object.SchemaVersion != schemaVersion {
+		return Record{}, errors.New("manifest and selector object schema versions differ")
+	}
 	record, err := validateObject(object)
 	if err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
-	if object.Selector != entry.Selector || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt {
+	if object.Selector != entry.Selector || object.SourceKind != entry.SourceKind || object.SourceName != entry.SourceName || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt {
 		return Record{}, errors.New("manifest metadata does not match selector object")
 	}
 	return record, nil
@@ -361,7 +388,7 @@ func recordFromObject(object objectFile) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return Record{Selector: selector, Endpoint: object.Endpoint, APIVersion: object.APIVersion, Parameters: cloneParameters(object.Parameters), QueryStart: parseCanonicalTime(object.QueryStart), QueryEnd: parseCanonicalTime(object.QueryEnd), RetrievedAt: parseCanonicalTime(object.RetrievedAt), IPv4: ipv4, IPv6: ipv6}, nil
+	return Record{Selector: selector, SourceKind: object.SourceKind, SourceName: object.SourceName, Endpoint: object.Endpoint, APIVersion: object.APIVersion, Parameters: cloneParameters(object.Parameters), QueryStart: parseStoredTime(object.QueryStart), QueryEnd: parseStoredTime(object.QueryEnd), RetrievedAt: parseCanonicalTime(object.RetrievedAt), IPv4: ipv4, IPv6: ipv6}, nil
 }
 
 func (c *Cache) objectForRecord(record Record) (string, error) {
@@ -405,6 +432,44 @@ func canonicalRecord(record Record) (Record, error) {
 	selector, err := policy.CanonicalSelector(record.Selector.Kind, record.Selector.Value)
 	if err != nil {
 		return Record{}, err
+	}
+	sourceKind := record.SourceKind
+	if sourceKind == "" {
+		sourceKind = ripeSourceKind
+	}
+	if sourceKind == listSourceKind {
+		if selector.Kind != policy.IPList || record.SourceName != selector.Value {
+			return Record{}, errors.New("custom list identity does not match selector")
+		}
+		endpoint, err := normalizeListURL(record.Endpoint)
+		if err != nil || endpoint != record.Endpoint {
+			return Record{}, errors.New("custom list URL is not canonical")
+		}
+		if record.APIVersion != listFormatVersion {
+			return Record{}, errors.New("unsupported custom list parser version")
+		}
+		if len(record.Parameters) != 0 {
+			return Record{}, errors.New("custom list request metadata is not empty")
+		}
+		if !record.QueryStart.IsZero() || !record.QueryEnd.IsZero() {
+			return Record{}, errors.New("custom list query timestamps are not allowed")
+		}
+		retrievedAt, err := canonicalTimestamp(record.RetrievedAt, "retrieved_at")
+		if err != nil {
+			return Record{}, err
+		}
+		v4, err := normalizeFamily(record.IPv4, true)
+		if err != nil {
+			return Record{}, fmt.Errorf("IPv4: %w", err)
+		}
+		v6, err := normalizeFamily(record.IPv6, false)
+		if err != nil {
+			return Record{}, fmt.Errorf("IPv6: %w", err)
+		}
+		return Record{Selector: selector, SourceKind: listSourceKind, SourceName: record.SourceName, Endpoint: endpoint, APIVersion: record.APIVersion, Parameters: map[string]string{}, RetrievedAt: retrievedAt, IPv4: v4, IPv6: v6}, nil
+	}
+	if sourceKind != ripeSourceKind || record.SourceName != "" {
+		return Record{}, errors.New("unsupported source identity")
 	}
 	expectedEndpoint := countryEndpoint
 	expectedParams := map[string]string{"resource": selector.Value, "sourceapp": "perimeterd", "v4_format": "prefix"}
@@ -466,16 +531,22 @@ func normalizeFamily(values []netip.Prefix, ipv4 bool) ([]netip.Prefix, error) {
 }
 
 func validateManifest(manifest manifestFile) error {
-	if manifest.SchemaVersion != cacheSchemaVersion {
+	if manifest.SchemaVersion != legacyCacheSchemaVersion && manifest.SchemaVersion != cacheSchemaVersion {
 		return fmt.Errorf("unsupported schema version %d", manifest.SchemaVersion)
 	}
-	if manifest.Source != "ripestat" {
+	if manifest.SchemaVersion == legacyCacheSchemaVersion && manifest.Source != ripeSourceKind {
+		return fmt.Errorf("unsupported source %q", manifest.Source)
+	}
+	if manifest.SchemaVersion == cacheSchemaVersion && manifest.Source != ripeSourceKind && manifest.Source != "static" {
 		return fmt.Errorf("unsupported source %q", manifest.Source)
 	}
 	if len(manifest.Entries) == 0 || len(manifest.Entries) > maxSelectors {
 		return errors.New("manifest selector count is invalid")
 	}
 	for i, entry := range manifest.Entries {
+		if manifest.SchemaVersion == legacyCacheSchemaVersion && (entry.SourceKind != "" || entry.SourceName != "") {
+			return errors.New("legacy manifest contains custom source metadata")
+		}
 		if err := validateManifestEntry(entry, i); err != nil {
 			return err
 		}
@@ -501,31 +572,37 @@ func validateManifestEntry(entry manifestEntry, index int) error {
 	if entry.Parameters == nil {
 		return fmt.Errorf("selector %d metadata parameters are null", index)
 	}
-	start := parseCanonicalTime(entry.QueryStart)
-	end := parseCanonicalTime(entry.QueryEnd)
+	start := parseStoredTime(entry.QueryStart)
+	end := parseStoredTime(entry.QueryEnd)
 	retrieved := parseCanonicalTime(entry.RetrievedAt)
-	record := Record{Selector: selector, Endpoint: entry.Endpoint, APIVersion: entry.APIVersion, Parameters: entry.Parameters, QueryStart: start, QueryEnd: end, RetrievedAt: retrieved}
+	record := Record{Selector: selector, SourceKind: entry.SourceKind, SourceName: entry.SourceName, Endpoint: entry.Endpoint, APIVersion: entry.APIVersion, Parameters: entry.Parameters, QueryStart: start, QueryEnd: end, RetrievedAt: retrieved}
 	if _, err := canonicalRecord(record); err != nil {
 		return fmt.Errorf("selector %d metadata: %w", index, err)
 	}
-	if canonicalTime(start) != entry.QueryStart || canonicalTime(end) != entry.QueryEnd || canonicalTime(retrieved) != entry.RetrievedAt {
+	if storedTime(start) != entry.QueryStart || storedTime(end) != entry.QueryEnd || canonicalTime(retrieved) != entry.RetrievedAt {
 		return fmt.Errorf("selector %d metadata timestamps are not canonical UTC values", index)
 	}
 	return nil
 }
 
 func validateObject(object objectFile) (Record, error) {
-	if object.SchemaVersion != cacheSchemaVersion {
+	if object.SchemaVersion != legacyCacheSchemaVersion && object.SchemaVersion != cacheSchemaVersion {
 		return Record{}, fmt.Errorf("unsupported schema version %d", object.SchemaVersion)
+	}
+	if object.SchemaVersion == legacyCacheSchemaVersion && (object.SourceKind != "" || object.SourceName != "") {
+		return Record{}, errors.New("legacy object contains custom source metadata")
 	}
 	if object.Parameters == nil || object.IPv4 == nil || object.IPv6 == nil {
 		return Record{}, errors.New("object contains null parameters or family array")
+	}
+	if object.SourceKind == listSourceKind && len(object.IPv4) == 0 && len(object.IPv6) == 0 {
+		return Record{}, errors.New("custom list object contains no prefixes")
 	}
 	record, err := recordFromObject(object)
 	if err != nil {
 		return Record{}, err
 	}
-	if canonicalTime(record.QueryStart) != object.QueryStart || canonicalTime(record.QueryEnd) != object.QueryEnd || canonicalTime(record.RetrievedAt) != object.RetrievedAt {
+	if storedTime(record.QueryStart) != object.QueryStart || storedTime(record.QueryEnd) != object.QueryEnd || canonicalTime(record.RetrievedAt) != object.RetrievedAt {
 		return Record{}, errors.New("timestamps are not canonical UTC values")
 	}
 	canonical, err := canonicalRecord(record)
@@ -580,6 +657,20 @@ func canonicalTimestamp(value time.Time, field string) (time.Time, error) {
 }
 
 func canonicalTime(value time.Time) string { return value.UTC().Format(time.RFC3339Nano) }
+func storedTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return canonicalTime(value)
+}
+
+func parseStoredTime(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	return parseCanonicalTime(value)
+}
+
 func parseCanonicalTime(value string) time.Time {
 	parsed, _ := time.Parse(time.RFC3339Nano, value)
 	return parsed.UTC()

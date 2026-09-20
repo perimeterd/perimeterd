@@ -44,6 +44,14 @@ geo:
 
 groups: {}
 
+# Named HTTP(S) text feeds: one IP/CIDR per line. Unreferenced lists are not fetched.
+# Reference this with include.ip_lists: [zoom] or exclude.ip_lists: [zoom] in a policy.
+ip_lists:
+  zoom:
+    url: https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/zoom/zoom_ips.txt
+    refresh_interval: 6h
+    request_timeout: 30s
+
 policies: []
 
 crowdsec:

@@ -503,3 +503,89 @@ policies:
 		t.Fatal("model getter exposed mutable prefix storage")
 	}
 }
+
+func TestCompileIPListAndMixedSelectors(t *testing.T) {
+	cfg := parseTestConfig(t, `version: 1
+firewall:
+  backend: nftables
+  ipv4: true
+  ipv6: true
+ip_lists:
+  zoom:
+    url: https://example.com/zoom
+policies:
+  - name: mixed
+    priority: 10
+    direction: ingress
+    mode: blocklist
+    traffic: [any]
+    include:
+      countries: [US]
+      ip_lists: [zoom]
+    exclude:
+      countries: [CA]
+  - name: list-only
+    priority: 10
+    direction: egress
+    mode: allowlist
+    traffic: [any]
+    include:
+      ip_lists: [zoom]
+  - name: disabled-list
+    priority: 20
+    direction: ingress
+    mode: disabled
+    traffic: [any]
+    include:
+      ip_lists: [zoom]
+`)
+	required, err := policy.RequiredSelectors(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRequired := []policy.Selector{
+		{Kind: policy.Country, Value: "CA"},
+		{Kind: policy.Country, Value: "US"},
+		{Kind: policy.IPList, Value: "zoom"},
+	}
+	if !reflect.DeepEqual(required, wantRequired) {
+		t.Fatalf("required selectors = %#v, want %#v", required, wantRequired)
+	}
+
+	snapshot := mustSnapshot(t,
+		snapshotRecord{kind: policy.Country, value: "US", ipv4: []netip.Prefix{mustPrefix("8.0.0.0/8")}},
+		snapshotRecord{kind: policy.Country, value: "CA", ipv4: []netip.Prefix{mustPrefix("8.0.0.0/9")}},
+		snapshotRecord{kind: policy.IPList, value: "zoom", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/8")}, ipv6: []netip.Prefix{mustPrefix("2001:db8::/32")}},
+	)
+	state, err := policy.Compile(cfg, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingress := findPlan(t, state, policy.IPv4, policy.Ingress)
+	foundMixed := false
+	for _, set := range ingress.Sets {
+		if set.ID != "geo/mixed" {
+			continue
+		}
+		foundMixed = true
+		if !containsPrefix(set.Prefixes, mustPrefix("8.128.0.0/9")) || !containsPrefix(set.Prefixes, mustPrefix("9.0.0.0/8")) {
+			t.Fatalf("mixed list/country union-subtraction was not compiled: %v", set.Prefixes)
+		}
+		if containsPrefix(set.Prefixes, mustPrefix("8.0.0.0/9")) {
+			t.Fatalf("excluded country prefix remained in mixed policy: %v", set.Prefixes)
+		}
+	}
+	if !foundMixed {
+		t.Fatal("mixed policy set was not emitted")
+	}
+	egress := findPlan(t, state, policy.IPv6, policy.Egress)
+	foundListOnly := false
+	for _, set := range egress.Sets {
+		if set.ID == "geo/list-only" {
+			foundListOnly = containsPrefix(set.Prefixes, mustPrefix("2001:db8::/32"))
+		}
+	}
+	if !foundListOnly {
+		t.Fatal("list-only policy did not retain custom-list IPv6 prefixes")
+	}
+}

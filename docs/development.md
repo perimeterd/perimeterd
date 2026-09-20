@@ -59,7 +59,7 @@ The most useful file boundaries when changing an existing path are:
   lifecycle, record validation/encoding, and filesystem barriers.
 - `tests/e2e/`: namespace admission and isolation (`harness_test.go`), traffic
   probes (`network_test.go`), daemon lifecycle (`daemon_test.go`), geo
-  scenarios (`geo_test.go`), native backend scenarios (`nftables_test.go` and
+  scenarios (`geo_test.go` and `custom_list_test.go`), native backend scenarios (`nftables_test.go` and
   `iptables_test.go`), real Docker coexistence (`docker_harness_test.go`,
   `docker_test.go`), runtime/recovery boundaries (`runtime_test.go`,
   `recovery_test.go`), and failure injection (`crash_test.go`).
@@ -381,9 +381,9 @@ implicit timing or throughput targets.
 
 The remaining sections are the complete first-release contract, not a list of
 currently passing tests. The local commands above describe what can run now.
-Static source-backed policy, CrowdSec, both native backend paths, and Docker's
-iptables bridge integration are implemented; package/systemd integration and
-release workflows remain planned. The
+Static source-backed policy, including HTTP(S) IP lists, CrowdSec, both native
+backend paths, and Docker's iptables bridge integration are implemented;
+package/systemd integration and release workflows remain planned. The
 [implementation plan](implementation-plan.md) tracks milestone status.
 
 ## Verification matrix
@@ -417,6 +417,8 @@ than one layer when the real boundary matters.
 | Policy cleanup | `disabled` and removed policies clean up their owned enforcement. | Privileged IPv4/IPv6 netns E2E |
 | Full-range boundaries | IPv4 `/0` and IPv6 `/0` global and dynamic entries retain allow precedence. | Privileged IPv4/IPv6 netns E2E where applicable |
 | Empty geo state | Empty geo policies retain direct global blocks; a truly empty desired state removes accounting and allow-only artifacts. | Privileged IPv4/IPv6 netns E2E |
+| Custom list selectors | Both include and exclude accept named lists; reject unknown names, invalid URLs/durations, and empty reference lists without network I/O. Disabled policies validate references without fetching. | Unit; offline CLI smoke |
+| Mixed-source policy | List-only and mixed country/ASN/list union and cross-category subtraction preserve priority, classifier, global/CrowdSec precedence, family-empty behavior, and `/0` lowering. | Unit; both-backend IPv4/IPv6 netns E2E |
 
 ### Sources and compatibility
 
@@ -424,6 +426,11 @@ than one layer when the real boundary matters.
 | --- | --- | --- |
 | RIPEstat country adapter | Checked-in bounded actual-response fixtures cover country success without an echo, validation of an echo when present, unexpected/mismatched identities, and failed status. | Unit with checked-in fixtures; PR and release CI |
 | RIPEstat ASN adapter | Checked-in bounded actual-response fixtures cover normalized ASN identity checks, unexpected/mismatched echoes, failed status, and prefix visibility at `query_endtime`. | Unit with checked-in fixtures; PR and release CI |
+| Text list parsing | IPv4/IPv6 hosts and CIDRs, host-bit masking, duplicate/contained prefixes, LF/CRLF, blank/comment lines, and final lines without newline normalize correctly; malformed tails, empty/comment-only bodies, and disabled-family errors reject the entire response. | Unit fixtures |
+| List transport | Local HTTP and TLS fixtures exercise success, certificate failure, redirects/downgrade/loop limits, failed status, truncation, timeout, and decoded-size overflow; shared source concurrency and selector caps remain bounded. | Local HTTP(S) fixture tests |
+| Mixed-source cache | Complete manifests bind source/name/URL/format identity; changed URLs cannot reuse old fallback. Existing RIPEstat-only recovery evidence remains readable and stabilizable by original object IDs; missing/corrupt referenced objects block unsafe recovery. | Unit; durable-store fault tests |
+| Per-list scheduling | Distinct intervals fetch due lists without downloading fresh peers; retry deadlines do not busy-loop or delay unattempted peers, partial failures never publish, stale candidates cannot overwrite newer snapshots, and rejected reloads keep old timers. | Clock-controlled scheduler and app/fixture tests |
+| List lifecycle | Refresh changes new-flow enforcement; outage/restart retain complete committed fallback, first start/new-URL failure withhold activation, and disabling/removing references stops fetching after commit. | Both-backend IPv4/IPv6 netns E2E with local fixtures |
 | CrowdSec snapshot authority | Authoritative initial/reconnect snapshots, decision-ID deletion, overlapping ranges with independent expiry, endpoint replacement, disable, and failed-delta recovery from the current desired projection are preserved. | Unit fixture; privileged netns E2E |
 | Raw CrowdSec envelope | Before dependency decoding, HTTP 200 with empty/truncated bodies, missing or duplicate list keys, wrong list types, trailing JSON, or decompressed-size overflow rejects the snapshot and retains existing bans. | Unit fixture; privileged netns E2E |
 | Valid empty CrowdSec lists | Complete empty/null lists from a supported server legitimately clear an authoritative snapshot. | Unit fixture; privileged netns E2E |

@@ -76,6 +76,13 @@ perimeterd denial source. Global lists match the remote address (source on
 ingress, destination on egress); geo evaluation bypasses remaining
 non-global, non-routable space.
 
+**Custom IP lists** compile into the same static policy sets on both
+backends. They add no packet-path stage, native fetcher, or source-specific
+verdict. “Geo policy” and the existing `geo_policy` accounting role also cover
+list-only policies; the classifier, global allow precedence, first matching
+traffic scope, `/0` lowering, and new-flow-only behavior remain unchanged. See
+[configuration](configuration.md#custom-ip-lists) for the schema.
+
 ## Logical packet path
 
 ```text

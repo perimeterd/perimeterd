@@ -1,8 +1,10 @@
-// Package source resolves RIPEstat selectors into immutable cached snapshots.
+// Package source resolves static selectors into immutable cached snapshots.
 package source
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"time"
@@ -11,11 +13,22 @@ import (
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
-// Record is one complete, validated RIPEstat selector result. Prefix slices and
+const (
+	ripeSourceKind    = "ripestat"
+	listSourceKind    = "ip_list"
+	listFormatVersion = "1"
+)
+
+// Record is one complete, validated static selector result. Prefix slices and
 // Parameters are owned by the source layer; callers receive defensive copies
 // from cache snapshots.
+//
+// SourceKind and SourceName are populated for custom lists. Existing RIPEstat
+// records leave SourceKind empty for on-disk compatibility.
 type Record struct {
 	Selector    policy.Selector
+	SourceKind  string
+	SourceName  string
 	Endpoint    string
 	APIVersion  string
 	Parameters  map[string]string
@@ -32,9 +45,13 @@ type Record struct {
 type Resolution struct {
 	Snapshot     Snapshot
 	RefreshError error
+	// Attempted lists the complete due/missing transaction selected for fetch,
+	// including selectors in a failed or rejected refresh.
+	Attempted []policy.Selector
 }
 
-// Resolver fetches RIPEstat data and stages complete immutable cache manifests.
+// Resolver fetches RIPEstat and custom-list data and stages complete immutable
+// cache manifests.
 type Resolver struct {
 	cache  *Cache
 	client *http.Client
@@ -42,14 +59,27 @@ type Resolver struct {
 }
 
 // NewResolver constructs a resolver. A nil client uses the standard HTTPS
-// client and is intentionally not configurable through user configuration.
+// client. Redirects are handled only for custom-list requests; RIPEstat keeps
+// its existing final-response behavior.
 func NewResolver(cache *Cache, client *http.Client) *Resolver {
 	if client == nil {
 		client = http.DefaultClient
 	}
 	owned := *client
-	owned.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
+	owned.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !isListRequest(req) {
+			return http.ErrUseLastResponse
+		}
+		if len(via) > maxRedirects {
+			return errors.New("too many redirects")
+		}
+		if err := validateListURL(req.URL); err != nil {
+			return errors.New("invalid redirect target")
+		}
+		if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme == "http" {
+			return errors.New("redirect downgrade rejected")
+		}
+		return nil
 	}
 	return &Resolver{cache: cache, client: &owned, slots: make(chan struct{}, maxConcurrent)}
 }
@@ -61,10 +91,34 @@ func (r *Resolver) Resolve(ctx context.Context, cfg config.Config, committedMani
 	return r.resolve(ctx, cfg, committedManifest, allowStale)
 }
 
+// ValidateConfig reports whether this snapshot is an exact, identity-matching
+// source result for cfg. It is intentionally independent of policy compilation
+// so callers can use it at recovery and publication boundaries.
+func (s Snapshot) ValidateConfig(cfg config.Config) error {
+	required, err := policy.RequiredSelectors(cfg)
+	if err != nil {
+		return err
+	}
+	if len(s.records) != len(required) {
+		return fmt.Errorf("source snapshot selector coverage mismatch")
+	}
+	for index, selector := range required {
+		record := s.records[index]
+		if record.Selector != selector {
+			return fmt.Errorf("source snapshot selector coverage mismatch")
+		}
+		if !recordMatchesConfig(record, cfg) {
+			return fmt.Errorf("source snapshot identity mismatch for %s/%s", selector.Kind, selector.Value)
+		}
+	}
+	return nil
+}
+
 const (
 	maxConcurrent = 4
 	maxSelectors  = 512
 	maxBodyBytes  = 32 << 20
+	maxRedirects  = 10
 
 	countryEndpoint = "https://stat.ripe.net/data/country-resource-list/data.json"
 	asnEndpoint     = "https://stat.ripe.net/data/announced-prefixes/data.json"

@@ -1,8 +1,9 @@
 # Configuration
 
-> **Schema and policy reference.** Offline validation supports the schema below;
-> runtime support is narrower. Check the [implementation plan](implementation-plan.md)
-> and [current runtime instructions](operations.md#current-source-build-runtime)
+> **Schema and policy reference.** Offline validation and the source-build
+> runtime support the fields below, including `ip_lists`. Check the
+> [implementation plan](implementation-plan.md) and
+> [current runtime instructions](operations.md#current-source-build-runtime)
 > before using a configuration for enforcement.
 
 This document owns the version 1 YAML schema, defaults, local validation, and
@@ -17,8 +18,8 @@ install that path. The planned package uses it as its configuration location.
 The runtime defaults state and prefix caches to `/var/lib/perimeterd` and
 creates missing directories when invoked as root. Parsing accepts exactly one
 YAML document. Each schema-defined mapping rejects unknown and duplicate
-fields; `groups` is intentionally a map whose keys are user-defined group
-names. Scalar types are checked without coercion, and `version` must be
+fields; `groups` and `ip_lists` are intentionally maps whose keys
+are user-defined names. Scalar types are checked without coercion, and `version` must be
 exactly `1`. Explicit nulls, aliases, and merge keys are rejected rather than
 silently defaulted or expanded.
 
@@ -35,6 +36,8 @@ running `perimeterd validate`; a fragment is not a standalone configuration.
 Omitted optional fields take the defaults shown here. `version` and
 `firewall.backend` are required even when their displayed values are used.
 The displayed `crowdsec.api_key_file` path is an example, not a default.
+Custom-list definitions and include/exclude usage are shown in the
+[custom list example](#custom-list-example).
 
 ```yaml
 version: 1
@@ -71,6 +74,8 @@ geo:
   refresh_jitter: 10m
 
 groups: {}
+
+ip_lists: {}
 
 policies: []
 
@@ -116,6 +121,10 @@ and are always validated; only the selected backend is applied.
 | `geo.request_timeout` | duration | `30s` | Positive, per request |
 | `geo.refresh_jitter` | duration | `10m` | Positive upper delay |
 | `groups` | map | `{}` | Lowercase name to countries |
+| `ip_lists` | map | `{}` | List name to HTTP(S) text source |
+| `ip_lists.<name>.url` | URL | — | Required absolute HTTP(S) URL |
+| `ip_lists.<name>.refresh_interval` | duration | `24h` | Positive per-list interval |
+| `ip_lists.<name>.request_timeout` | duration | `30s` | Positive timeout for a complete fetch |
 | `policies` | list | `[]` | Explicit priority order |
 | `crowdsec.enabled` | bool | `false` | Enable the supported LAPI stream integration |
 | `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
@@ -208,6 +217,74 @@ rules owned by other managers may still deny it.
 As with every perimeterd policy, list changes affect new flows and do not
 terminate established connections.
 
+## Custom IP lists
+
+`ip_lists` is a top-level map of reusable text-list sources. Names follow the
+same lowercase DNS-label-like syntax as policy names and occupy a separate
+namespace from `groups`. Each definition accepts only `url`, `refresh_interval`,
+and `request_timeout`; defaults are listed above. Definitions are validated even
+when unreferenced. An omitted or empty `ip_lists` map defines no sources.
+
+`url` must be an absolute `http` or `https` URL with a host, no user information,
+and no fragment. Query strings are permitted; file paths and other schemes are
+not. HTTPS is recommended; HTTP deliberately provides no transport authenticity
+or confidentiality. There are no custom authentication, header, or TLS-bypass
+fields. Offline validation checks URL syntax and references without fetching
+content, resolving DNS, or checking availability.
+
+Policies reference names through the separate `ip_lists` selector category in
+both `include` and `exclude`. Every referenced name must exist, including in
+disabled policies. An explicitly empty `ip_lists: []` selector is invalid,
+matching other selector categories. A list referenced several times is resolved
+once per candidate; unused definitions and references only in disabled policies
+cause no network requests.
+
+Each source serves plain text with one IPv4/IPv6 address or CIDR per line.
+See [the source contract](data-sources.md#custom-https-ip-lists) for
+normalization, blank/comment lines, invalid or empty responses, and cache
+fallback. `refresh_interval` is independent for each list and is not controlled
+by `geo.refresh_interval` or `geo.refresh_jitter`.
+
+### Custom list example
+
+This root-level fragment illustrates both selector positions and mixed
+country/list policy using the supplied
+[Zoom IP feed](https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/zoom/zoom_ips.txt):
+
+```yaml
+ip_lists:
+  zoom:
+    url: https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/zoom/zoom_ips.txt
+    refresh_interval: 6h
+    request_timeout: 30s
+
+policies:
+  - name: zoom-egress
+    priority: 100
+    direction: egress
+    mode: allowlist
+    traffic: ["any"]
+    include:
+      ip_lists: [zoom]
+  - name: ingress-except-zoom
+    priority: 100
+    direction: ingress
+    mode: blocklist
+    traffic: ["any"]
+    include:
+      countries: [US]
+    exclude:
+      ip_lists: [zoom]
+```
+
+**Expected:** the egress policy permits listed destinations
+at the policy stage and denies other geo-eligible destinations. The ingress
+policy denies US prefixes minus the Zoom list; exclusion is subtraction from
+this policy, not a global allow overriding CrowdSec or global blocks. Existing
+established-flow, local-range, and surrounding-firewall behavior remains intact.
+The public feed is an illustrative operator-selected dependency, not a pinned
+or endorsed perimeterd source.
+
 ## Policy schema
 
 Each policy accepts exactly these keys:
@@ -252,17 +329,18 @@ only list entry.
 
 ### Selectors
 
-`include` and `exclude` each accept only these optional list fields:
+`include` and `exclude` each accept these optional list fields:
 
 - `countries`: ISO-3166-1 alpha-2 codes, case-insensitive on input and
   normalized to uppercase;
 - `rirs`: `AFRINIC`, `APNIC`, `ARIN`, `LACNIC`, or `RIPE`;
 - `groups`: built-in or configured group names;
 - `asns`: strings in canonical `AS<number>` form for unsigned 32-bit values
-  `AS0` through `AS4294967295`; leading zeroes are not accepted.
+  `AS0` through `AS4294967295`; leading zeroes are not accepted;
+- `ip_lists`: names defined by the top-level `ip_lists` map.
 
-Unknown countries, RIRs, groups, malformed ASNs, and explicitly present empty
-category lists are errors. An empty selector mapping is allowed for `exclude`
+Unknown countries, RIRs, groups, list names, malformed ASNs, and explicitly
+present empty category lists are errors. An empty selector mapping is allowed for `exclude`
 and for a disabled policy's `include`; an enabled policy must have a non-empty
 `include` and must resolve to at least one prefix overall before firewall
 mutation.
@@ -307,6 +385,13 @@ If an enabled policy resolves prefixes overall but a selected address family
 has none, a blocklist is a no-op for that family; an allowlist denies every
 globally routable address in that family. This fail-closed allowlist behavior
 is intentional and must be reviewed when enabling both families.
+
+These same rules apply to custom-list-only and mixed-source policies. Custom
+lists do not extend `global.allowlist` or `global.blocklist` and do not bypass
+the [geo address classifier](#geo-address-classification). The existing term
+“geo policy” denotes this policy stage even when all its selectors are custom
+lists. Exclusions subtract from the union of every include category, not just
+from lists; removing all effective prefixes rejects an enabled policy.
 
 ### Disabled policy
 

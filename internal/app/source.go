@@ -9,20 +9,36 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
+	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
-// sourceRuntime belongs to the event loop. Only the timestamp is read by HTTP
+// sourceRuntime belongs to the event loop. Only timestamps are read by HTTP
 // handlers; workers receive immutable configuration and manifest identities.
 type sourceRuntime struct {
 	cache         *source.Cache
 	resolver      *source.Resolver
 	active        *state.Revision
-	timestamp     atomic.Int64
+	timestamps    atomic.Pointer[sourceTimestamps]
+	deadlines     map[policy.Selector]sourceDeadline
 	timer         *time.Timer
 	reloadCancel  context.CancelFunc
 	refreshCancel context.CancelFunc
+}
+
+type sourceTimestamps struct {
+	ripe   int64
+	ipList int64
+}
+
+type sourceDeadline struct {
+	endpoint  string
+	retrieved time.Time
+	interval  time.Duration
+	jitter    time.Duration
+	due       time.Time
+	retry     time.Time
 }
 
 func newSourceRuntime(cache *source.Cache, client *http.Client) *sourceRuntime {
@@ -44,39 +60,96 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision) error {
 			s.refreshCancel = nil
 		}
 	}
-	s.active = revision
-	stamp := int64(0)
-	if oldest := snapshot.OldestRetrieved(); !oldest.IsZero() {
-		stamp = oldest.Unix()
+	deadlines := make(map[policy.Selector]sourceDeadline)
+	timestamps := &sourceTimestamps{}
+	if revision != nil {
+		for _, record := range snapshot.Records() {
+			interval, jitter := revision.Config.Geo.RefreshInterval, revision.Config.Geo.RefreshJitter
+			stamp := &timestamps.ripe
+			if record.Selector.Kind == policy.IPList {
+				interval, jitter = revision.Config.IPLists[record.Selector.Value].RefreshInterval, 0
+				stamp = &timestamps.ipList
+			}
+			if unix := record.RetrievedAt.Unix(); *stamp == 0 || unix < *stamp {
+				*stamp = unix
+			}
+			deadline, exists := s.deadlines[record.Selector]
+			if !exists || deadline.endpoint != record.Endpoint || !deadline.retrieved.Equal(record.RetrievedAt) || deadline.interval != interval || deadline.jitter != jitter {
+				deadline = sourceDeadline{
+					endpoint: record.Endpoint, retrieved: record.RetrievedAt,
+					interval: interval, jitter: jitter,
+					due: record.RetrievedAt.Add(refreshDelay(interval, jitter)),
+				}
+			}
+			deadlines[record.Selector] = deadline
+		}
 	}
-	s.timestamp.Store(stamp)
+	s.active = revision
+	s.deadlines = deadlines
+	s.timestamps.Store(timestamps)
 	s.schedule()
 	return nil
 }
 
 func (s *sourceRuntime) schedule() {
+	s.stopTimer()
+	if next := s.nextRefresh(time.Now()); !next.IsZero() {
+		s.timer = time.NewTimer(max(0, time.Until(next)))
+	}
+}
+
+func (s *sourceRuntime) stopTimer() {
 	if s.timer != nil {
 		s.timer.Stop()
 		s.timer = nil
 	}
-	if s.active == nil || s.active.Manifest == "" {
-		return
+}
+
+// A complete candidate cannot publish while any stale selector is in retry
+// cooldown. Preserve other deadlines, but wait for that barrier rather than
+// refetching a failed source early or combining partial success with stale data.
+func (s *sourceRuntime) nextRefresh(now time.Time) time.Time {
+	var next, barrier time.Time
+	for _, deadline := range s.deadlines {
+		if next.IsZero() || deadline.due.Before(next) {
+			next = deadline.due
+		}
+		if !deadline.retrieved.Add(deadline.interval).After(now) && deadline.retry.After(barrier) {
+			barrier = deadline.retry
+		}
 	}
-	geo := s.active.Config.Geo
+	if !next.IsZero() && barrier.After(next) {
+		return barrier
+	}
+	return next
+}
+
+// Retry only selectors chosen by the resolver, not fresh peers that happened
+// to expire while its HTTP requests were in flight.
+func (s *sourceRuntime) attempted(selectors []policy.Selector, now time.Time) {
+	for _, selector := range selectors {
+		if deadline, ok := s.deadlines[selector]; ok {
+			deadline.retry = now.Add(refreshDelay(deadline.interval, deadline.jitter))
+			s.deadlines[selector] = deadline
+		}
+	}
+}
+
+func refreshDelay(interval, maximumJitter time.Duration) time.Duration {
 	const maximum = time.Duration(1<<63 - 1)
 	var jitter time.Duration
-	if geo.RefreshJitter == maximum {
+	if maximumJitter == maximum {
 		jitter = time.Duration(rand.Int64()) // #nosec G404 -- non-security scheduling jitter.
-	} else {
-		jitter = rand.N(geo.RefreshJitter + 1) // #nosec G404 -- non-security scheduling jitter.
+	} else if maximumJitter > 0 {
+		jitter = rand.N(maximumJitter + 1) // #nosec G404 -- non-security scheduling jitter.
 	}
-	delay := geo.RefreshInterval
+	delay := interval
 	if jitter > maximum-delay {
 		delay = maximum
 	} else {
 		delay += jitter
 	}
-	s.timer = time.NewTimer(delay)
+	return delay
 }
 
 func (s *sourceRuntime) events() <-chan time.Time {
@@ -94,17 +167,26 @@ func (s *sourceRuntime) manifest() string {
 }
 
 func (s *sourceRuntime) age() time.Duration {
-	stamp := s.timestamp.Load()
+	timestamps := s.snapshotTimestamps()
+	stamp := timestamps.ripe
+	if stamp == 0 || (timestamps.ipList != 0 && timestamps.ipList < stamp) {
+		stamp = timestamps.ipList
+	}
 	if stamp == 0 {
 		return 0
 	}
 	return max(0, time.Since(time.Unix(stamp, 0)))
 }
 
-func (s *sourceRuntime) close() {
-	if s.timer != nil {
-		s.timer.Stop()
+func (s *sourceRuntime) snapshotTimestamps() sourceTimestamps {
+	if timestamps := s.timestamps.Load(); timestamps != nil {
+		return *timestamps
 	}
+	return sourceTimestamps{}
+}
+
+func (s *sourceRuntime) close() {
+	s.stopTimer()
 	if s.reloadCancel != nil {
 		s.reloadCancel()
 	}
@@ -132,6 +214,7 @@ func collectPrefixes(store *state.Store) error {
 func stageSource(ctx context.Context, opts Options, resolver *source.Resolver, epoch, refresh uint64, cfg config.Config, committed string) stageResult {
 	result := stageResult{candidate: Candidate{epoch: epoch, refresh: refresh}, cfg: cfg}
 	resolved, err := resolver.Resolve(ctx, cfg, committed, refresh == 0)
+	result.attempted = resolved.Attempted
 	if err != nil {
 		result.err = fmt.Errorf("resolve source snapshot: %w", err)
 		return result
