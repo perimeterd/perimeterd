@@ -59,7 +59,7 @@ The most useful file boundaries when changing an existing path are:
   lifecycle, record validation/encoding, and filesystem barriers.
 - `tests/e2e/`: namespace admission and isolation (`harness_test.go`), traffic
   probes (`network_test.go`), daemon lifecycle (`daemon_test.go`), geo
-  scenarios (`geo_test.go` and `custom_list_test.go`), native backend scenarios (`nftables_test.go` and
+  scenarios (`geo_test.go`, `custom_list_test.go`, and `providers_test.go`), native backend scenarios (`nftables_test.go` and
   `iptables_test.go`), real Docker coexistence (`docker_harness_test.go`,
   `docker_test.go`), runtime/recovery boundaries (`runtime_test.go`,
   `recovery_test.go`), and failure injection (`crash_test.go`).
@@ -381,9 +381,10 @@ implicit timing or throughput targets.
 
 The remaining sections are the complete first-release contract, not a list of
 currently passing tests. The local commands above describe what can run now.
-Static source-backed policy, including HTTP(S) IP lists, CrowdSec, both native
-backend paths, and Docker's iptables bridge integration are implemented;
-package/systemd integration and release workflows remain planned. The
+Static source-backed policy, including HTTP(S) IP lists and direct dynamic
+provider selectors, CrowdSec, both native backend paths, and Docker's iptables
+bridge integration are implemented; package/systemd integration and release
+workflows remain planned. The
 [implementation plan](implementation-plan.md) tracks milestone status.
 
 ## Verification matrix
@@ -419,6 +420,7 @@ than one layer when the real boundary matters.
 | Empty geo state | Empty geo policies retain direct global blocks; a truly empty desired state removes accounting and allow-only artifacts. | Privileged IPv4/IPv6 netns E2E |
 | Custom list selectors | Both include and exclude accept named lists; reject unknown names, invalid URLs/durations, and empty reference lists without network I/O. Disabled policies validate references without fetching. | Unit; offline CLI smoke |
 | Mixed-source policy | List-only and mixed country/ASN/list union and cross-category subtraction preserve priority, classifier, global/CrowdSec precedence, family-empty behavior, and `/0` lowering. | Unit; both-backend IPv4/IPv6 netns E2E |
+| Provider selectors | Validate safe ID syntax including underscores without network or catalog membership checks; reject unsafe paths and empty selector lists. Disabled policies do not resolve. Provider-only and mixed-source union/subtraction preserve classification and precedence, and provider/custom-list names do not collide. | Unit; offline CLI smoke |
 
 ### Sources and compatibility
 
@@ -431,6 +433,10 @@ than one layer when the real boundary matters.
 | Mixed-source cache | Complete manifests bind source/name/URL/format identity; changed URLs cannot reuse old fallback. Existing RIPEstat-only recovery evidence remains readable and stabilizable by original object IDs; missing/corrupt referenced objects block unsafe recovery. | Unit; durable-store fault tests |
 | Per-list scheduling | Distinct intervals fetch due lists without downloading fresh peers; retry deadlines do not busy-loop or delay unattempted peers, partial failures never publish, stale candidates cannot overwrite newer snapshots, and rejected reloads keep old timers. | Clock-controlled scheduler and app/fixture tests |
 | List lifecycle | Refresh changes new-flow enforcement; outage/restart retain complete committed fallback, first start/new-URL failure withhold activation, and disabling/removing references stops fetching after commit. | Both-backend IPv4/IPv6 netns E2E with local fixtures |
+| Dynamic provider existence | A fixture ID absent from any source-code enumeration resolves through the exact jsDelivr `@main` merged-file template; an unknown ID fails on 404. No inventory, metadata, or GitHub API request is needed. A failed first attempt must not permanently cache absence. | Local HTTP(S) fixtures with transport injection |
+| Provider failure and identity | Missing/invalid include or exclude providers prevent first-start activation or reject reload without silently dropping selectors; exact-identity complete fallback preserves committed policy on refresh/restart. Cross-provider and custom-list cache substitution fail; old cache generations still recover. | Unit; durable-store and app fixtures |
+| Provider timing and publication | Shared provider settings remain independent of geo/custom-list timings; only missing/due enabled references fetch. Rejected reloads retain schedules, fresh peers are reused, only attempted selectors enter cooldown, and a mixed-source failure cannot partially publish. | Clock-controlled app/fixture tests |
+| Provider native lifecycle | Provider-only and mixed include/exclude, both policy modes, changed feeds, 404 retention, unknown-ID reload rejection, restart fallback, and final-reference removal affect actual new-flow enforcement on nftables and both iptables tool families with IPv4/IPv6. No live CDN dependency in CI. | Privileged netns E2E with local fixtures |
 | CrowdSec snapshot authority | Authoritative initial/reconnect snapshots, decision-ID deletion, overlapping ranges with independent expiry, endpoint replacement, disable, and failed-delta recovery from the current desired projection are preserved. | Unit fixture; privileged netns E2E |
 | Raw CrowdSec envelope | Before dependency decoding, HTTP 200 with empty/truncated bodies, missing or duplicate list keys, wrong list types, trailing JSON, or decompressed-size overflow rejects the snapshot and retains existing bans. | Unit fixture; privileged netns E2E |
 | Valid empty CrowdSec lists | Complete empty/null lists from a supported server legitimately clear an authoritative snapshot. | Unit fixture; privileged netns E2E |

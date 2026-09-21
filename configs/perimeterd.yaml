@@ -42,6 +42,13 @@ geo:
   request_timeout: 30s
   refresh_jitter: 10m
 
+# Dynamic IDs in policy include.providers/exclude.providers use jsDelivr @main.
+# No catalog or per-provider definition is needed; only enabled references fetch.
+# Example selectors: include.providers: [aws, alibaba], exclude.providers: [datadog].
+providers:
+  refresh_interval: 24h
+  request_timeout: 30s
+
 groups: {}
 
 # Named HTTP(S) text feeds: one IP/CIDR per line. Unreferenced lists are not fetched.

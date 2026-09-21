@@ -113,7 +113,10 @@ func (c *Cache) Stage(records []Record) (Snapshot, error) {
 	}
 	entries := make([]manifestEntry, 0, len(canonical))
 	for index, record := range canonical {
-		if record.SourceKind == listSourceKind && len(record.IPv4) == 0 && len(record.IPv6) == 0 {
+		if (record.SourceKind == listSourceKind || record.SourceKind == providerSourceKind) && len(record.IPv4) == 0 && len(record.IPv6) == 0 {
+			if record.SourceKind == providerSourceKind {
+				return Snapshot{}, errors.New("provider selector contains no prefixes")
+			}
 			return Snapshot{}, errors.New("custom list selector contains no prefixes")
 		}
 		object := objectFromRecord(record)
@@ -132,7 +135,7 @@ func (c *Cache) Stage(records []Record) (Snapshot, error) {
 	}
 	source := "ripestat"
 	for _, record := range canonical {
-		if record.SourceKind == listSourceKind {
+		if record.SourceKind == listSourceKind || record.SourceKind == providerSourceKind {
 			source = "static"
 			break
 		}
@@ -437,22 +440,32 @@ func canonicalRecord(record Record) (Record, error) {
 	if sourceKind == "" {
 		sourceKind = ripeSourceKind
 	}
-	if sourceKind == listSourceKind {
-		if selector.Kind != policy.IPList || record.SourceName != selector.Value {
-			return Record{}, errors.New("custom list identity does not match selector")
+	if sourceKind == listSourceKind || sourceKind == providerSourceKind {
+		expectedKind, label := policy.IPList, "custom list"
+		if sourceKind == providerSourceKind {
+			expectedKind, label = policy.Provider, "provider"
+		}
+		if selector.Kind != expectedKind || record.SourceName != selector.Value {
+			return Record{}, fmt.Errorf("%s identity does not match selector", label)
 		}
 		endpoint, err := normalizeListURL(record.Endpoint)
 		if err != nil || endpoint != record.Endpoint {
-			return Record{}, errors.New("custom list URL is not canonical")
+			return Record{}, fmt.Errorf("%s URL is not canonical", label)
+		}
+		if sourceKind == providerSourceKind {
+			expectedEndpoint, err := providerEndpoint(selector.Value)
+			if err != nil || endpoint != expectedEndpoint {
+				return Record{}, errors.New("provider URL does not match selector")
+			}
 		}
 		if record.APIVersion != listFormatVersion {
-			return Record{}, errors.New("unsupported custom list parser version")
+			return Record{}, fmt.Errorf("unsupported %s parser version", label)
 		}
 		if len(record.Parameters) != 0 {
-			return Record{}, errors.New("custom list request metadata is not empty")
+			return Record{}, fmt.Errorf("%s request metadata is not empty", label)
 		}
 		if !record.QueryStart.IsZero() || !record.QueryEnd.IsZero() {
-			return Record{}, errors.New("custom list query timestamps are not allowed")
+			return Record{}, fmt.Errorf("%s query timestamps are not allowed", label)
 		}
 		retrievedAt, err := canonicalTimestamp(record.RetrievedAt, "retrieved_at")
 		if err != nil {
@@ -466,7 +479,12 @@ func canonicalRecord(record Record) (Record, error) {
 		if err != nil {
 			return Record{}, fmt.Errorf("IPv6: %w", err)
 		}
-		return Record{Selector: selector, SourceKind: listSourceKind, SourceName: record.SourceName, Endpoint: endpoint, APIVersion: record.APIVersion, Parameters: map[string]string{}, RetrievedAt: retrievedAt, IPv4: v4, IPv6: v6}, nil
+		return Record{
+			Selector: selector, SourceKind: sourceKind, SourceName: record.SourceName,
+			Endpoint: endpoint, APIVersion: record.APIVersion,
+			Parameters: map[string]string{}, RetrievedAt: retrievedAt,
+			IPv4: v4, IPv6: v6,
+		}, nil
 	}
 	if sourceKind != ripeSourceKind || record.SourceName != "" {
 		return Record{}, errors.New("unsupported source identity")
@@ -595,12 +613,15 @@ func validateObject(object objectFile) (Record, error) {
 	if object.Parameters == nil || object.IPv4 == nil || object.IPv6 == nil {
 		return Record{}, errors.New("object contains null parameters or family array")
 	}
-	if object.SourceKind == listSourceKind && len(object.IPv4) == 0 && len(object.IPv6) == 0 {
-		return Record{}, errors.New("custom list object contains no prefixes")
-	}
 	record, err := recordFromObject(object)
 	if err != nil {
 		return Record{}, err
+	}
+	if (object.SourceKind == listSourceKind || object.SourceKind == providerSourceKind) && len(object.IPv4) == 0 && len(object.IPv6) == 0 {
+		if object.SourceKind == providerSourceKind {
+			return Record{}, errors.New("provider object contains no prefixes")
+		}
+		return Record{}, errors.New("custom list object contains no prefixes")
 	}
 	if storedTime(record.QueryStart) != object.QueryStart || storedTime(record.QueryEnd) != object.QueryEnd || canonicalTime(record.RetrievedAt) != object.RetrievedAt {
 		return Record{}, errors.New("timestamps are not canonical UTC values")

@@ -82,6 +82,9 @@ verdict. “Geo policy” and the existing `geo_policy` accounting role also cov
 list-only policies; the classifier, global allow precedence, first matching
 traffic scope, `/0` lowering, and new-flow-only behavior remain unchanged. See
 [configuration](configuration.md#custom-ip-lists) for the schema.
+The [named-provider selectors](configuration.md#named-providers)
+use these same static sets and invariants. They add no provider-specific kernel
+objects, verdict stage, or source-fetching responsibility to either backend.
 
 ## Logical packet path
 

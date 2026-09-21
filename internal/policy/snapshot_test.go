@@ -293,3 +293,50 @@ func TestCanonicalSelectorASNSyntax(t *testing.T) {
 		}
 	}
 }
+
+func TestProviderSelectorsAcceptArbitrarySafeIDsAndRejectPathSyntax(t *testing.T) {
+	for _, value := range []string{"future-id", "alpha_beta", "_", "-", "0"} {
+		got, err := policy.CanonicalSelector(policy.Provider, value)
+		if err != nil {
+			t.Errorf("provider %q rejected: %v", value, err)
+			continue
+		}
+		if got != (policy.Selector{Kind: policy.Provider, Value: value}) {
+			t.Errorf("provider %q canonicalized to %#v", value, got)
+		}
+	}
+	for _, value := range []string{"", "../escape", "foo/bar", "foo?bar", "Foo", "foo.bar", "foo\nbar"} {
+		if _, err := policy.CanonicalSelector(policy.Provider, value); err == nil {
+			t.Errorf("unsafe provider %q accepted", value)
+		}
+	}
+}
+
+func TestRequiredSelectorsKeepProviderAndListNamespacesSeparate(t *testing.T) {
+	cfg := config.Config{Policies: []config.Policy{
+		{
+			Mode: "allowlist",
+			Include: config.Selector{
+				IPLists:   []string{"same"},
+				Providers: []string{"same", "future_id"},
+			},
+			Exclude: config.Selector{Providers: []string{"future_id"}},
+		},
+		{
+			Mode:    "disabled",
+			Include: config.Selector{Providers: []string{"disabled_future"}},
+		},
+	}}
+	got, err := policy.RequiredSelectors(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []policy.Selector{
+		{Kind: policy.IPList, Value: "same"},
+		{Kind: policy.Provider, Value: "future_id"},
+		{Kind: policy.Provider, Value: "same"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("required selectors = %#v, want %#v", got, want)
+	}
+}

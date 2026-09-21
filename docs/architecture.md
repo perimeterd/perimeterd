@@ -2,7 +2,8 @@
 
 This document owns component boundaries, writer ownership, revision admission,
 and durable recovery for the native runtimes, including custom HTTP(S) IP lists
-through the static-source boundary. Service packaging and the
+and direct named-provider feeds through the static-source boundary.
+Service packaging and the
 [future deployment boundaries](#future-deployment-boundaries) are not implemented
 deployment options.
 
@@ -24,6 +25,7 @@ flowchart LR
     R --> C[Policy compiler]
     RIPE[RIPEstat] --> R
     TXT[HTTP/S text IP lists] --> R
+    PROVIDERS[jsDelivr main provider feeds] --> R
     L[CrowdSec LAPI stream] --> D[Dynamic decision store]
     C --> W[Serialized firewall writer]
     D --> W
@@ -87,10 +89,11 @@ to the current files.
 | Native backend | Preflight, apply, retire, and clean up exact owned targets; preserve native accounting objects | Fetching source data or selecting the durable active revision |
 | Runtime publication | Publish the selected source snapshot, logger, and listener; retain or discard staged resources according to the selected transaction | Treating an uncertain commit as success |
 
-The current configuration ingress is a local file, reloaded with `SIGHUP`; the
-current static provider is RIPEstat. Future configuration or prefix providers
-must preserve these boundaries and produce complete candidates rather than
-bypass admission or call a backend directly.
+The current configuration ingress is a local file, reloaded with `SIGHUP`;
+implemented static sources are RIPEstat, custom HTTP(S) lists, and dynamic
+named-provider feeds. Any future configuration or prefix providers must
+preserve these boundaries and produce complete candidates rather than bypass
+admission or call a backend directly.
 
 Static reconciliation remains separate from the incremental CrowdSec
 path: individual decisions must not rebuild global or geo sets. Both paths use
@@ -133,6 +136,38 @@ boundaries apply unchanged. List URLs are part of source identity: changing a
 URL cannot reuse the old endpoint's prefixes as fallback under the same name.
 Persisted source evidence must remain sufficient to recover existing
 RIPEstat-only revisions as well as mixed-source revisions.
+
+### Named provider integration
+
+The distinct `provider` selector/source kind implements
+`include.providers` and `exclude.providers`, backed by the published merged
+dual-stack TXT files in `rezmoss/cloud-provider-ip-addresses`. The
+[configuration contract](configuration.md#named-providers) owns ID syntax
+and timing defaults; [data sources](data-sources.md#named-provider-feeds)
+owns the exact jsDelivr `@main` URL mapping, validation, and failure semantics.
+
+There is no embedded provider catalog, release-pinned membership, user-defined
+source map, or runtime inventory download. Configuration validation remains
+offline and checks safe ID syntax only. The resolver determines existence by
+fetching the required provider file; a syntactically valid unknown ID must fail
+runtime resolution rather than silently disappear from the compiled policy.
+Only enabled-policy references resolve, and a newly published provider needs no
+binary update.
+
+Reuse the existing HTTP transport, strict text parser, shared resource limits,
+immutable source store, static scheduler, and serialized writer. Preserve
+provider identity separately from custom-list names even when both use the
+same spelling or URL. Do not introduce `go-cloudip`, its embedded database,
+another background updater, or backend-specific fetching. The compiler remains
+pure and treats provider prefix sets like other static selector sets.
+
+The default follows mutable `main` through jsDelivr; this does not promise that
+different provider downloads represent one upstream commit. The guarantee is a
+complete, atomically selected local candidate. Unknown providers without exact
+committed fallback prevent activation; failed refreshes retain the previous
+complete revision and its retrieval evidence. Reloaded timing/reference changes
+take effect only after durable selection, and rejected reloads retain old timers.
+Existing RIPEstat and custom-list recovery evidence must remain readable.
 
 ## Revision lifecycle
 

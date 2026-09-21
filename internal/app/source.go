@@ -28,8 +28,9 @@ type sourceRuntime struct {
 }
 
 type sourceTimestamps struct {
-	ripe   int64
-	ipList int64
+	ripe     int64
+	ipList   int64
+	provider int64
 }
 
 type sourceDeadline struct {
@@ -66,9 +67,13 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision) error {
 		for _, record := range snapshot.Records() {
 			interval, jitter := revision.Config.Geo.RefreshInterval, revision.Config.Geo.RefreshJitter
 			stamp := &timestamps.ripe
-			if record.Selector.Kind == policy.IPList {
+			switch record.Selector.Kind {
+			case policy.IPList:
 				interval, jitter = revision.Config.IPLists[record.Selector.Value].RefreshInterval, 0
 				stamp = &timestamps.ipList
+			case policy.Provider:
+				interval, jitter = revision.Config.Providers.RefreshInterval, 0
+				stamp = &timestamps.provider
 			}
 			if unix := record.RetrievedAt.Unix(); *stamp == 0 || unix < *stamp {
 				*stamp = unix
@@ -171,6 +176,9 @@ func (s *sourceRuntime) age() time.Duration {
 	stamp := timestamps.ripe
 	if stamp == 0 || (timestamps.ipList != 0 && timestamps.ipList < stamp) {
 		stamp = timestamps.ipList
+	}
+	if stamp == 0 || (timestamps.provider != 0 && timestamps.provider < stamp) {
+		stamp = timestamps.provider
 	}
 	if stamp == 0 {
 		return 0

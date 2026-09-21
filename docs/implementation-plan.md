@@ -5,7 +5,8 @@ milestones summarize delivered behavior; pending milestones retain their
 acceptance criteria. Detailed contracts live in the linked reference documents.
 
 The first release includes both native backends, CrowdSec, Docker coexistence,
-custom HTTP(S) text IP lists, operational integration, and release gates.
+custom HTTP(S) text IP lists, dynamic named-provider feeds, operational integration,
+and release gates.
 Implemented does not mean production-ready; the remaining gates below still apply.
 
 ## Status at a glance
@@ -19,6 +20,7 @@ Implemented does not mean production-ready; the remaining gates below still appl
 | CrowdSec | Implemented for both backends | Maintain authoritative synchronization, bounded leases, and pinned LAPI compatibility |
 | Coexistence | Implemented for custom attachments and Docker's iptables bridge backend | Maintain explicit interface constraints, ordering, and foreign-state preservation |
 | Custom HTTP(S) IP lists | Implemented for both backends | Maintain named include/exclude selectors, bounded fetching, exact cache identity, and per-list refresh/recovery |
+| Named provider feeds | Implemented for both backends | Maintain dynamic include/exclude IDs, jsDelivr `@main` resolution without a catalog, exact cache identity, and complete-snapshot publication |
 | Operations and delivery | Source-build CLI, logging, readiness, three HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
 
 ## 1. Foundation and offline configuration validation
@@ -148,7 +150,47 @@ The [configuration contract](configuration.md#custom-ip-lists),
 invariants. Keep the [verification matrix](development.md#verification-matrix)
 and existing writer, CrowdSec, ownership, and Docker gates passing.
 
-## 7. Operational and release gates
+## 7. Dynamic named-provider feeds
+
+**Status:** implemented for nftables and iptables/ipset.
+
+`include.providers` and `exclude.providers` accept safe provider IDs, including
+new IDs and underscores, without compiled-in membership or per-provider source
+definitions. Offline validation checks syntax and source-wide positive timing
+settings; runtime resolution determines existence by fetching:
+
+```text
+https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/{id}/{id}_ips_merged.txt
+```
+
+No catalog, metadata/discovery request, GitHub API, alternate mirror, or
+`go-cloudip` dependency is used. Only missing/due enabled references fetch,
+with `24h` refresh and `30s` request timeout defaults. Provider records use the
+shared bounded text pipeline and version-2 static manifests; existing RIPEstat
+and custom-list cache generations remain recoverable.
+
+The existing scheduler, exact attempted-selector retry evidence, and writer
+preserve complete-snapshot publication. New missing IDs prevent activation or
+reject reload; later 404/invalid responses retain exact committed fallback.
+Freshness is reported with the fixed `source="provider"` label, separately from
+RIPEstat and custom lists. Provider and custom-list names do not collide.
+
+Verification covers dynamic existence and later appearance, unsafe IDs,
+mixed-source compilation/failure retention, durable identity, independent timing,
+and new-flow IPv4/IPv6 lifecycle on nftables and both iptables tool families.
+The actual CLI is also exercised against an isolated HTTPS CDN fixture, including
+unknown-ID startup failure, rejected-reload timer preservation, restart fallback,
+and final-reference removal. Tests do not depend on live CDN data.
+
+The [configuration contract](configuration.md#named-providers),
+[static source boundary](architecture.md#named-provider-integration), and
+[source contract](data-sources.md#named-provider-feeds) own implementation
+invariants. Whole-provider sets follow mutable `main`; service/region filters and
+a common upstream Git revision are not implied. Keep the
+[verification matrix](development.md#verification-matrix) and existing source,
+writer, CrowdSec, and Docker gates passing.
+
+## 8. Operational and release gates
 
 **Status:** partially implemented.
 
@@ -166,13 +208,13 @@ release scaffolding only with working artifacts and executable checks.
 
 ## Immediate next task
 
-Complete the remaining operational and release gates in step 7: full metrics
-collection/export, installed service lifecycle, package lifecycle and
-architecture coverage, and signed release artifacts with executable release CI.
+Complete step 8: full metrics collection and export, installed service lifecycle,
+package lifecycle and architecture coverage, and signed release artifacts with
+executable release CI.
 
-Static source-backed policy, custom HTTP(S) lists, both native backends, CrowdSec
-synchronization and decision lifecycle, and Docker iptables bridge coexistence
-are implemented. Keep their existing writer,
+Static source-backed policy, custom HTTP(S) lists, dynamic named providers, both
+native backends, CrowdSec synchronization and decision lifecycle, and Docker
+iptables bridge coexistence are implemented. Keep their existing writer,
 recovery, packet-path, and compatibility gates passing while adding the remaining
 features. Track new work as issues using acceptance criteria from the owning
 documents rather than maintaining another implementation or test plan.

@@ -8,9 +8,9 @@ native kernel behavior. The [implementation plan](implementation-plan.md) is
 authoritative for delivery status.
 
 > **Status boundary.** The source-build instructions in this document describe
-> what runs today, including custom HTTP(S) text IP lists and Docker's iptables
-> bridge integration. Installed packages, systemd payloads, and release artifacts
-> remain first-release work.
+> what runs today, including custom HTTP(S) text IP lists, direct named-provider
+> selectors, and Docker's iptables bridge integration. Installed packages,
+> systemd payloads, and release artifacts remain first-release work.
 > A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
@@ -158,6 +158,32 @@ List definitions may point to private servers reachable by the daemon.
 Plain HTTP trusts that network path as well as the publisher. Do not use URLs
 as secret storage: their identity is retained in root-only durable state, while
 logs should identify lists by name and omit URLs and query strings.
+
+## Named provider operations
+
+Use provider IDs directly in
+`include.providers`/`exclude.providers`; no `ip_lists` declaration or compiled-in
+provider list is needed. See the [example](configuration.md#named-provider-example)
+and [source contract](data-sources.md#named-provider-feeds).
+
+Offline validation verifies ID syntax, not remote membership. A typo that is
+syntactically valid can therefore pass `validate` but fail startup/reload when
+the corresponding jsDelivr `@main` merged TXT URL is fetched. Disabled policies
+do not contact the CDN; their IDs are checked remotely only when enabled. A new
+missing provider fails activation, never becoming an empty or ignored selector.
+
+Only providers used by enabled policies are fetched, with source-wide refresh
+and request timeout settings. Keep DNS and HTTPS access to jsDelivr and any
+permitted redirect destinations available under restrictive egress policy;
+there is no automatic firewall bypass for the daemon's own source requests.
+
+A later 404, CDN outage, malformed response, or upstream removal fails refresh
+but retains complete committed enforcement. Exact-identity complete fallback is
+also eligible on restart/reload; it does not reset source age. Monitor refresh
+errors and committed retrieval age, not just enforcement health. CDN caching
+can delay newly published IDs and changed feeds; no purge or original-provider
+freshness guarantee is implied. Do not remove exclusions to work around a
+missing feed without considering the resulting policy expansion.
 
 ## Operator sequence
 
@@ -412,13 +438,16 @@ runtime watchdog and does not change reload semantics.
   enforcement is healthy; it becomes `0` during degraded recovery. A listener
   failure terminates `run`, so the endpoint is no longer served.
 - `perimeterd_prefix_snapshot_timestamp_seconds{source}` (gauge), emitted
-  separately for each required static source kind: `ripestat` and `ip_list`.
+  separately for each required static source kind: `ripestat`, `ip_list`, and `provider`.
   It is the oldest committed retrieval time for that kind, not manifest
   publication time. Unreferenced source kinds emit no timestamp.
 - `perimeterd_crowdsec_connected` (unlabeled gauge): the active integration's
   synchronization/poll outcome. It is `0` when disabled, not yet synchronized,
   or after a failed poll/reconnect, and `1` after successful polling/activation.
   It is separate from enforcement health and does not count current bans.
+
+The `source="provider"` timestamp series uses the oldest retrieval among
+required committed provider objects. Provider IDs are never metric labels.
 
 `perimeterd_enforcement_health` reports the last acknowledged enforcement and
 recovery outcome, not an atomicity guarantee for an in-flight native operation.
@@ -466,11 +495,13 @@ exports them:
 
 The prefix gauge includes built-in local, configured global, RIPEstat, and
 custom-list prefixes through fixed `source` and `type` label values;
-custom lists use `source="ip_list"` and `type="ip_list"`. Allowed label values
-remain bounded: firewall `reason` is `global_blocklist`, `crowdsec`, or
+custom lists use `source="ip_list"` and `type="ip_list"`.
+Provider data uses the fixed `source="provider"` and
+`type="provider"` values, not per-provider label values.
+Allowed label values remain bounded: firewall `reason` is `global_blocklist`, `crowdsec`, or
 `geo_policy` (including list-based policies); `action` is `drop` or `reject`;
 and counter-read `result` is `success` or `error`. No metric label may contain
-an address, ASN, country, policy/list name, URL, raw error, or unbounded remote
+an address, ASN, country, policy/list/provider name, URL, raw error, or unbounded remote
 revision.
 
 The planned fixed 15-second background sampler reads native counters through the

@@ -26,16 +26,17 @@ import (
 // Prefixes and selector values are normalized deterministically for consumers
 // such as the policy compiler.
 type Config struct {
-	Version  int                     `yaml:"version"`
-	Logging  LoggingConfig           `yaml:"logging"`
-	Metrics  MetricsConfig           `yaml:"metrics"`
-	Global   GlobalConfig            `yaml:"global"`
-	Firewall FirewallConfig          `yaml:"firewall"`
-	Geo      GeoConfig               `yaml:"geo"`
-	IPLists  map[string]IPListConfig `yaml:"ip_lists"`
-	Groups   map[string][]string     `yaml:"groups"`
-	Policies []Policy                `yaml:"policies"`
-	CrowdSec CrowdSecConfig          `yaml:"crowdsec"`
+	Version   int                     `yaml:"version"`
+	Logging   LoggingConfig           `yaml:"logging"`
+	Metrics   MetricsConfig           `yaml:"metrics"`
+	Global    GlobalConfig            `yaml:"global"`
+	Firewall  FirewallConfig          `yaml:"firewall"`
+	Geo       GeoConfig               `yaml:"geo"`
+	Providers ProvidersConfig         `yaml:"providers"`
+	IPLists   map[string]IPListConfig `yaml:"ip_lists"`
+	Groups    map[string][]string     `yaml:"groups"`
+	Policies  []Policy                `yaml:"policies"`
+	CrowdSec  CrowdSecConfig          `yaml:"crowdsec"`
 }
 
 // IPListConfig describes one named HTTP(S) text source.
@@ -101,6 +102,12 @@ type GeoConfig struct {
 	RefreshJitter   time.Duration `yaml:"refresh_jitter"`
 }
 
+// ProvidersConfig controls the shared refresh timing for named-provider feeds.
+type ProvidersConfig struct {
+	RefreshInterval time.Duration `yaml:"refresh_interval"`
+	RequestTimeout  time.Duration `yaml:"request_timeout"`
+}
+
 // CrowdSecConfig controls the optional CrowdSec LAPI stream.
 type CrowdSecConfig struct {
 	Enabled         bool          `yaml:"enabled"`
@@ -145,6 +152,7 @@ type Selector struct {
 	Groups            []string `yaml:"groups"`
 	ASNs              []string `yaml:"asns"`
 	IPLists           []string `yaml:"ip_lists"`
+	Providers         []string `yaml:"providers"`
 	ExpandedCountries []string `yaml:"expanded_countries"`
 }
 
@@ -199,16 +207,17 @@ func Load(path string) (Config, error) {
 }
 
 type rawConfig struct {
-	Version  *int                  `yaml:"version"`
-	Logging  *rawLogging           `yaml:"logging"`
-	Metrics  *rawMetrics           `yaml:"metrics"`
-	Global   *rawGlobal            `yaml:"global"`
-	Firewall *rawFirewall          `yaml:"firewall"`
-	Geo      *rawGeo               `yaml:"geo"`
-	IPLists  map[string]*rawIPList `yaml:"ip_lists"`
-	Groups   map[string][]string   `yaml:"groups"`
-	Policies []rawPolicy           `yaml:"policies"`
-	CrowdSec *rawCrowdSec          `yaml:"crowdsec"`
+	Version   *int                  `yaml:"version"`
+	Logging   *rawLogging           `yaml:"logging"`
+	Metrics   *rawMetrics           `yaml:"metrics"`
+	Global    *rawGlobal            `yaml:"global"`
+	Firewall  *rawFirewall          `yaml:"firewall"`
+	Geo       *rawGeo               `yaml:"geo"`
+	Providers *rawProviders         `yaml:"providers"`
+	IPLists   map[string]*rawIPList `yaml:"ip_lists"`
+	Groups    map[string][]string   `yaml:"groups"`
+	Policies  []rawPolicy           `yaml:"policies"`
+	CrowdSec  *rawCrowdSec          `yaml:"crowdsec"`
 }
 
 type rawIPList struct {
@@ -263,6 +272,11 @@ type rawGeo struct {
 	RefreshJitter   *string `yaml:"refresh_jitter"`
 }
 
+type rawProviders struct {
+	RefreshInterval *string `yaml:"refresh_interval"`
+	RequestTimeout  *string `yaml:"request_timeout"`
+}
+
 type rawCrowdSec struct {
 	Enabled         *bool   `yaml:"enabled"`
 	LAPIURL         *string `yaml:"lapi_url"`
@@ -286,6 +300,7 @@ type rawSelector struct {
 	Groups    *[]string `yaml:"groups"`
 	ASNs      *[]string `yaml:"asns"`
 	IPLists   *[]string `yaml:"ip_lists"`
+	Providers *[]string `yaml:"providers"`
 }
 
 func normalize(raw rawConfig) (Config, error) {
@@ -314,11 +329,12 @@ func normalize(raw rawConfig) (Config, error) {
 			Nftables: NftablesConfig{Table: "perimeterd", Priority: -10},
 			IPTables: IPTablesConfig{Attachments: defaultAttachments()},
 		},
-		Geo:      GeoConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second, RefreshJitter: 10 * time.Minute},
-		IPLists:  make(map[string]IPListConfig),
-		Groups:   make(map[string][]string),
-		Policies: []Policy{},
-		CrowdSec: CrowdSecConfig{Enabled: false, LAPIURL: "http://127.0.0.1:8080", UpdateFrequency: 10 * time.Second},
+		Geo:       GeoConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second, RefreshJitter: 10 * time.Minute},
+		Providers: ProvidersConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second},
+		IPLists:   make(map[string]IPListConfig),
+		Groups:    make(map[string][]string),
+		Policies:  []Policy{},
+		CrowdSec:  CrowdSecConfig{Enabled: false, LAPIURL: "http://127.0.0.1:8080", UpdateFrequency: 10 * time.Second},
 	}
 
 	if raw.Logging != nil {
@@ -432,6 +448,26 @@ func normalize(raw rawConfig) (Config, error) {
 	}
 	if cfg.Geo.RefreshJitter <= 0 {
 		return Config{}, errors.New("geo.refresh_jitter: must be positive")
+	}
+	if raw.Providers != nil {
+		if raw.Providers.RefreshInterval != nil {
+			cfg.Providers.RefreshInterval, err = positiveDuration(*raw.Providers.RefreshInterval, "providers.refresh_interval")
+			if err != nil {
+				return Config{}, err
+			}
+		}
+		if raw.Providers.RequestTimeout != nil {
+			cfg.Providers.RequestTimeout, err = positiveDuration(*raw.Providers.RequestTimeout, "providers.request_timeout")
+			if err != nil {
+				return Config{}, err
+			}
+		}
+	}
+	if cfg.Providers.RefreshInterval <= 0 {
+		return Config{}, errors.New("providers.refresh_interval: must be positive")
+	}
+	if cfg.Providers.RequestTimeout <= 0 {
+		return Config{}, errors.New("providers.request_timeout: must be positive")
 	}
 
 	if raw.CrowdSec != nil {
@@ -824,6 +860,20 @@ func normalizeSelector(raw rawSelector, groups map[string][]string, ipLists map[
 		selector.IPLists = sortedKeys(seen)
 		count += len(selector.IPLists)
 	}
+	if raw.Providers != nil {
+		if len(*raw.Providers) == 0 {
+			return Selector{}, 0, fmt.Errorf("%s.providers: must be non-empty when present", field)
+		}
+		seen := make(map[string]struct{}, len(*raw.Providers))
+		for i, id := range *raw.Providers {
+			if !ValidProviderID(id) {
+				return Selector{}, 0, fmt.Errorf("%s.providers[%d]: must use a lowercase provider ID containing only letters, digits, hyphens, or underscores", field, i)
+			}
+			seen[id] = struct{}{}
+		}
+		selector.Providers = sortedKeys(seen)
+		count += len(selector.Providers)
+	}
 	countrySet := make(map[string]struct{}, len(selector.Countries))
 	for _, country := range selector.Countries {
 		countrySet[country] = struct{}{}
@@ -986,6 +1036,14 @@ func ValidName(name string) bool {
 	return namePattern.MatchString(name)
 }
 
+var providerIDPattern = regexp.MustCompile(`^[a-z0-9_-]+$`)
+
+// ValidProviderID reports whether an external named-provider ID is safe to use
+// in the fixed source endpoint path. It intentionally does not check membership.
+func ValidProviderID(id string) bool {
+	return providerIDPattern.MatchString(id)
+}
+
 func validateName(name, field string) error {
 	if !ValidName(name) {
 		return fmt.Errorf("%s: must be a lowercase DNS-label-like name", field)
@@ -1114,10 +1172,10 @@ func checkRootShape(root *yaml.Node) error {
 	}
 	return checkMappingFields(root, "configuration", map[string]nodeKind{
 		"version": kindInt, "logging": kindMap, "metrics": kindMap, "global": kindMap, "firewall": kindMap,
-		"geo": kindMap, "ip_lists": kindMap, "groups": kindMap, "policies": kindSeq, "crowdsec": kindMap,
+		"geo": kindMap, "providers": kindMap, "ip_lists": kindMap, "groups": kindMap, "policies": kindSeq, "crowdsec": kindMap,
 	}, map[string]func(*yaml.Node, string) error{
 		"logging": checkLogging, "metrics": checkMetrics, "global": checkGlobal, "firewall": checkFirewall,
-		"geo": checkGeo, "ip_lists": checkIPListsShape, "groups": checkGroupsShape, "policies": checkPoliciesShape, "crowdsec": checkCrowdSec,
+		"geo": checkGeo, "providers": checkProviders, "ip_lists": checkIPListsShape, "groups": checkGroupsShape, "policies": checkPoliciesShape, "crowdsec": checkCrowdSec,
 	})
 }
 
@@ -1155,6 +1213,10 @@ func checkGlobal(node *yaml.Node, path string) error {
 
 func checkGeo(node *yaml.Node, path string) error {
 	return checkMappingFields(node, path, map[string]nodeKind{"refresh_interval": kindString, "request_timeout": kindString, "refresh_jitter": kindString}, nil)
+}
+
+func checkProviders(node *yaml.Node, path string) error {
+	return checkMappingFields(node, path, map[string]nodeKind{"refresh_interval": kindString, "request_timeout": kindString}, nil)
 }
 
 func checkCrowdSec(node *yaml.Node, path string) error {
@@ -1237,7 +1299,7 @@ func checkPolicyShape(node *yaml.Node, path string) error {
 }
 
 func checkSelectorShape(node *yaml.Node, path string) error {
-	return checkMappingFields(node, path, map[string]nodeKind{"countries": kindSeq, "rirs": kindSeq, "groups": kindSeq, "asns": kindSeq, "ip_lists": kindSeq}, map[string]func(*yaml.Node, string) error{"countries": checkStringSequence, "rirs": checkStringSequence, "groups": checkStringSequence, "asns": checkStringSequence, "ip_lists": checkStringSequence})
+	return checkMappingFields(node, path, map[string]nodeKind{"countries": kindSeq, "rirs": kindSeq, "groups": kindSeq, "asns": kindSeq, "ip_lists": kindSeq, "providers": kindSeq}, map[string]func(*yaml.Node, string) error{"countries": checkStringSequence, "rirs": checkStringSequence, "groups": checkStringSequence, "asns": checkStringSequence, "ip_lists": checkStringSequence, "providers": checkStringSequence})
 }
 
 func checkStringSequence(node *yaml.Node, path string) error {

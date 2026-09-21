@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -160,13 +161,19 @@ policies:
     traffic: ["any"]
     include:
       ip_lists: [service]
+      providers: [service]
 `, server.URL)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	engine, store := newTestEngine(t, &recordingBackend{}, nil)
 	defer engine.Close()
-	resolution, err := source.NewResolver(store.Prefixes(), server.Client()).Resolve(t.Context(), cfg, "", false)
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: fixtureSourceTransport{target: target, base: http.DefaultTransport}}
+	resolution, err := source.NewResolver(store.Prefixes(), client).Resolve(t.Context(), cfg, "", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,6 +191,7 @@ policies:
 	list.URL = server.URL + "/different"
 	cfg.IPLists["service"] = list
 	cfg.Policies[0].Include.IPLists[0] = "missing"
+	cfg.Policies[0].Include.Providers[0] = "missing"
 	outcome, err := engine.Apply(t.Context(), candidate)
 	if err != nil || !outcome.Committed {
 		t.Fatalf("caller mutation changed candidate identity: committed=%v error=%v", outcome.Committed, err)

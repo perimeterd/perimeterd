@@ -589,3 +589,64 @@ policies:
 		t.Fatal("list-only policy did not retain custom-list IPv6 prefixes")
 	}
 }
+
+func TestCompileProviderMixedUnionAndSubtraction(t *testing.T) {
+	cfg := parseTestConfig(t, `version: 1
+firewall:
+  backend: nftables
+  ipv4: true
+  ipv6: true
+ip_lists:
+  same:
+    url: https://example.com/feed
+policies:
+  - name: provider-mixed
+    priority: 10
+    direction: ingress
+    mode: blocklist
+    traffic: [any]
+    include:
+      countries: [US]
+      ip_lists: [same]
+      providers: [future_id]
+    exclude:
+      countries: [CA]
+      providers: [future_id]
+`)
+	required, err := policy.RequiredSelectors(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRequired := []policy.Selector{
+		{Kind: policy.Country, Value: "CA"},
+		{Kind: policy.Country, Value: "US"},
+		{Kind: policy.IPList, Value: "same"},
+		{Kind: policy.Provider, Value: "future_id"},
+	}
+	if !reflect.DeepEqual(required, wantRequired) {
+		t.Fatalf("required selectors = %#v, want %#v", required, wantRequired)
+	}
+	state, err := policy.Compile(cfg, mustSnapshot(t,
+		snapshotRecord{kind: policy.Country, value: "US", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/8")}},
+		snapshotRecord{kind: policy.Country, value: "CA", ipv4: []netip.Prefix{mustPrefix("9.0.0.0/9")}},
+		snapshotRecord{kind: policy.IPList, value: "same", ipv4: []netip.Prefix{mustPrefix("10.0.0.0/8")}},
+		snapshotRecord{kind: policy.Provider, value: "future_id", ipv4: []netip.Prefix{mustPrefix("8.0.0.0/8")}},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := findPlan(t, state, policy.IPv4, policy.Ingress)
+	for _, set := range plan.Sets {
+		if set.ID != "geo/provider-mixed" {
+			continue
+		}
+		if !containsPrefix(set.Prefixes, mustPrefix("9.128.0.0/9")) || !containsPrefix(set.Prefixes, mustPrefix("10.0.0.0/8")) {
+			t.Fatalf("provider/list/country union-subtraction lost expected prefixes: %v", set.Prefixes)
+		}
+		if containsPrefix(set.Prefixes, mustPrefix("8.0.0.0/8")) || containsPrefix(set.Prefixes, mustPrefix("9.0.0.0/9")) {
+			t.Fatalf("excluded provider/country prefixes remained: %v", set.Prefixes)
+		}
+		return
+	}
+	t.Fatal("provider mixed policy set was not emitted")
+}

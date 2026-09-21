@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"net/netip"
 	"strings"
 	"testing"
@@ -288,5 +289,64 @@ func TestIPListURLPreservesIPv6InterfaceZone(t *testing.T) {
 	got, err := NormalizeIPListURL("HTTP://[fe80::1%25FeedNIC]/list")
 	if err != nil || got != want {
 		t.Fatalf("IPv6 interface identity changed: URL=%q error=%v", got, err)
+	}
+}
+
+func TestParseProvidersDefaultsAndArbitraryIDs(t *testing.T) {
+	base := "version: 1\nfirewall:\n  backend: nftables\n"
+	cfg, err := Parse([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers.RefreshInterval != 24*time.Hour || cfg.Providers.RequestTimeout != 30*time.Second {
+		t.Fatalf("provider defaults = %#v", cfg.Providers)
+	}
+
+	cfg, err = Parse([]byte(base + `providers:
+  refresh_interval: 6h
+  request_timeout: 45s
+policies:
+  - name: disabled
+    priority: 1
+    direction: ingress
+    mode: disabled
+    traffic: [any]
+    include:
+      providers: [future_feed, alpha_beta, future_feed, "0"]
+    exclude:
+      providers: [future_feed]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Providers.RefreshInterval != 6*time.Hour || cfg.Providers.RequestTimeout != 45*time.Second {
+		t.Fatalf("provider settings = %#v", cfg.Providers)
+	}
+	got := cfg.Policies[0].Include.Providers
+	if strings.Join(got, ",") != "0,alpha_beta,future_feed" {
+		t.Fatalf("provider IDs were not sorted/deduplicated: %v", got)
+	}
+	if got := cfg.Policies[0].Exclude.Providers; len(got) != 1 || got[0] != "future_feed" {
+		t.Fatalf("disabled provider exclusion was not normalized: %v", got)
+	}
+}
+
+func TestParseRejectsUnsafeProviderIDsAndSettings(t *testing.T) {
+	base := "version: 1\nfirewall:\n  backend: nftables\npolicies:\n  - name: p\n    priority: 1\n    direction: ingress\n    mode: disabled\n    traffic: [any]\n    include:\n      providers: [%s]\n"
+	for _, id := range []string{`""`, `"../escape"`, `"foo/bar"`, `"foo?bar"`, `"Foo"`, `"foo.bar"`, `"foo\nbar"`} {
+		if _, err := Parse([]byte(fmt.Sprintf(base, id))); err == nil {
+			t.Errorf("unsafe provider ID %s was accepted", id)
+		}
+	}
+	for _, input := range []string{
+		"version: 1\nfirewall: {backend: nftables}\nproviders:\n  refresh_interval: 0s\n",
+		"version: 1\nfirewall: {backend: nftables}\nproviders:\n  request_timeout: nope\n",
+		"version: 1\nfirewall: {backend: nftables}\nproviders:\n  unknown: 1\n",
+		"version: 1\nfirewall: {backend: nftables}\nproviders: []\n",
+		"version: 1\nfirewall: {backend: nftables}\npolicies:\n  - name: p\n    priority: 1\n    direction: ingress\n    mode: disabled\n    traffic: [any]\n    include:\n      providers: nope\n",
+	} {
+		if _, err := Parse([]byte(input)); err == nil {
+			t.Errorf("invalid provider configuration was accepted:\n%s", input)
+		}
 	}
 }

@@ -1,7 +1,8 @@
 # Configuration
 
 > **Schema and policy reference.** Offline validation and the source-build
-> runtime support the fields below, including `ip_lists`. Check the
+> runtime support the fields below, including `ip_lists` and dynamic `providers`
+> settings and selectors. Check the
 > [implementation plan](implementation-plan.md) and
 > [current runtime instructions](operations.md#current-source-build-runtime)
 > before using a configuration for enforcement.
@@ -38,6 +39,8 @@ Omitted optional fields take the defaults shown here. `version` and
 The displayed `crowdsec.api_key_file` path is an example, not a default.
 Custom-list definitions and include/exclude usage are shown in the
 [custom list example](#custom-list-example).
+Named-provider include/exclude usage is shown in the
+[provider example](#named-provider-example).
 
 ```yaml
 version: 1
@@ -76,6 +79,10 @@ geo:
 groups: {}
 
 ip_lists: {}
+
+providers:
+  refresh_interval: 24h
+  request_timeout: 30s
 
 policies: []
 
@@ -125,6 +132,8 @@ and are always validated; only the selected backend is applied.
 | `ip_lists.<name>.url` | URL | — | Required absolute HTTP(S) URL |
 | `ip_lists.<name>.refresh_interval` | duration | `24h` | Positive per-list interval |
 | `ip_lists.<name>.request_timeout` | duration | `30s` | Positive timeout for a complete fetch |
+| `providers.refresh_interval` | duration | `24h` | Positive interval shared by named-provider sources |
+| `providers.request_timeout` | duration | `30s` | Positive timeout for a complete provider fetch |
 | `policies` | list | `[]` | Explicit priority order |
 | `crowdsec.enabled` | bool | `false` | Enable the supported LAPI stream integration |
 | `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
@@ -285,6 +294,75 @@ established-flow, local-range, and surrounding-firewall behavior remains intact.
 The public feed is an illustrative operator-selected dependency, not a pinned
 or endorsed perimeterd source.
 
+## Named providers
+
+`include.providers` and `exclude.providers` refer directly to provider IDs from
+[`rezmoss/cloud-provider-ip-addresses`](https://github.com/rezmoss/cloud-provider-ip-addresses).
+No top-level per-provider definitions, `ip_lists` entries, embedded catalog, or
+release-pinned provider membership are required. New upstream provider IDs work
+without a perimeterd release once their feeds are available.
+
+The optional top-level `providers` mapping accepts only `refresh_interval` and
+`request_timeout`, both positive durations. It controls this source type as a
+whole, independently of `geo` and custom-list timings. Omission or `{}` uses the
+defaults in the field table. There are no per-provider overrides, URL/ref
+settings, or additional jitter setting in this initial contract. Use `ip_lists`
+for an explicitly selected alternate endpoint or pinned revision.
+
+Provider IDs are literal, case-sensitive upstream slugs matching
+`^[a-z0-9_-]+$`: non-empty lowercase ASCII letters, digits, hyphens, and
+underscores. Do not derive IDs from display names or substitute aliases.
+Reject whitespace, uppercase letters, dots, slashes, backslashes, percent
+escapes, and URL/ref/query syntax rather than allowing path construction to
+escape the fixed endpoint template. Underscores are valid, unlike custom-list
+names; for example, `apple_private_relay` is a provider ID.
+
+Offline `validate` checks syntax, scalar types, positive durations, and non-empty
+selector lists; it **does not check remote existence**. A syntactically valid but
+nonexistent ID therefore passes offline validation and fails runtime resolution.
+Disabled policies have the same local checks but cause no provider requests;
+their IDs are checked for existence when enabled.
+
+Resolution fetches the required provider's merged TXT file dynamically, using
+the [jsDelivr `@main` contract](data-sources.md#named-provider-feeds).
+A 404 or other unsuccessful/invalid response is an error, never an empty set or
+an ignored selector. A new unknown provider has no matching committed fallback:
+it prevents first-start readiness or rejects a reload before applying policy.
+An existing active revision is not discarded on resolution failure. The source
+contract defines exact-identity restart fallback and refresh failure behavior.
+
+Repeated IDs are deduplicated, and only providers referenced by enabled policies
+are resolved. `providers: [aws]` and `ip_lists: [aws]` are distinct selectors;
+neither shadows the other. Provider sets use the same family-aware union and
+subtraction as other categories, including cross-category exclusions. They do
+not extend global allow/block lists or bypass address classification, global
+allow precedence, CrowdSec, or established-flow handling.
+
+### Named provider example
+
+```yaml
+providers:
+  refresh_interval: 6h
+  request_timeout: 30s
+
+policies:
+  - name: selected-providers
+    priority: 100
+    direction: ingress
+    mode: blocklist
+    traffic: ["any"]
+    include:
+      providers: [aws, alibaba]
+    exclude:
+      providers: [datadog]
+```
+
+**Expected:** block new ingress flows whose source is in
+`(AWS union Alibaba) minus Datadog`, subject to the existing classifier and
+precedence rules. Provider sets may overlap; an exclusion is subtraction, not a
+global allow. Each ID represents the entire published provider address set, not
+a service/region filter or authenticated provider identity.
+
 ## Policy schema
 
 Each policy accepts exactly these keys:
@@ -337,13 +415,17 @@ only list entry.
 - `groups`: built-in or configured group names;
 - `asns`: strings in canonical `AS<number>` form for unsigned 32-bit values
   `AS0` through `AS4294967295`; leading zeroes are not accepted;
-- `ip_lists`: names defined by the top-level `ip_lists` map.
+- `ip_lists`: names defined by the top-level `ip_lists` map;
+- `providers`: dynamically resolved upstream provider IDs, with no
+  embedded catalog or user-defined source entry.
 
 Unknown countries, RIRs, groups, list names, malformed ASNs, and explicitly
 present empty category lists are errors. An empty selector mapping is allowed for `exclude`
 and for a disabled policy's `include`; an enabled policy must have a non-empty
 `include` and must resolve to at least one prefix overall before firewall
 mutation.
+Provider IDs are the exception to local membership checks: their syntax is
+validated offline, but existence requires runtime resolution as described above.
 
 Union selectors within and across categories, then subtract exclusions
 independently for each address family. An excluded prefix wins over every
@@ -392,6 +474,8 @@ the [geo address classifier](#geo-address-classification). The existing term
 “geo policy” denotes this policy stage even when all its selectors are custom
 lists. Exclusions subtract from the union of every include category, not just
 from lists; removing all effective prefixes rejects an enabled policy.
+Provider selectors obey these same rules, including when all
+selectors in a policy are providers.
 
 ### Disabled policy
 

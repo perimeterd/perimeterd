@@ -79,3 +79,61 @@ func TestCustomListSnapshotBindsURLAndRejectsInvalidEvidence(t *testing.T) {
 		t.Fatal("custom-list cache accepted an empty source object")
 	}
 }
+
+func TestProviderSnapshotBindsDerivedEndpointAndIdentity(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	id := "future_provider_via_code"
+	selector := policy.Selector{Kind: policy.Provider, Value: id}
+	endpoint, err := providerEndpoint(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := parseList([]byte("198.51.100.0/24\n"), endpoint, selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := cache.Stage([]Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Providers: config.ProvidersConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second},
+		Policies:  []config.Policy{{Mode: "blocklist", Include: config.Selector{Providers: []string{id}}}},
+	}
+	if err := snapshot.ValidateConfig(cfg); err != nil {
+		t.Fatalf("provider snapshot rejected under matching config: %v", err)
+	}
+	if err := cache.Stabilize(snapshot.ManifestID()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Collect([]string{snapshot.ManifestID()}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := cache.Load(snapshot.ManifestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefixes, ok := loaded.Policy().Lookup(selector)
+	if !ok || !reflect.DeepEqual(prefixStrings(prefixes.Prefixes()), []string{"198.51.100.0/24"}) {
+		t.Fatalf("provider policy did not survive durable cache recovery: %v", prefixes.Prefixes())
+	}
+	cfg.Policies[0].Include.Providers[0] = "another_provider"
+	if err := loaded.ValidateConfig(cfg); err == nil {
+		t.Fatal("provider evidence was admitted under a different required identity")
+	}
+
+	for name, mutate := range map[string]func(*Record){
+		"endpoint":    func(value *Record) { value.Endpoint += "?mirror=1" },
+		"name":        func(value *Record) { value.SourceName = "other_provider" },
+		"parser":      func(value *Record) { value.APIVersion = "2" },
+		"source-kind": func(value *Record) { value.SourceKind = listSourceKind },
+	} {
+		t.Run(name, func(t *testing.T) {
+			corrupt := record
+			mutate(&corrupt)
+			if _, err := cache.Stage([]Record{corrupt}); err == nil {
+				t.Fatalf("cache accepted corrupted provider %s identity", name)
+			}
+		})
+	}
+}

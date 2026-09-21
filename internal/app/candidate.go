@@ -84,6 +84,7 @@ func cloneSelector(value config.Selector) config.Selector {
 	value.Groups = slices.Clone(value.Groups)
 	value.ASNs = slices.Clone(value.ASNs)
 	value.IPLists = slices.Clone(value.IPLists)
+	value.Providers = slices.Clone(value.Providers)
 	value.ExpandedCountries = slices.Clone(value.ExpandedCountries)
 	return value
 }

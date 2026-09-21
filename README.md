@@ -7,7 +7,8 @@ existing Linux firewall. It filters unwanted ingress and egress traffic; the
 parent firewall remains responsible for permitting services and ports.
 
 > **Implemented:** offline validation, source-backed nftables and iptables/ipset
-> enforcement, custom HTTP(S) text IP lists, CrowdSec ingress bans, and Docker bridge coexistence through
+> enforcement, custom HTTP(S) text IP lists, dynamic named-provider selectors,
+> CrowdSec ingress bans, and Docker bridge coexistence through
 > `DOCKER-USER` with Docker's iptables backend. The runtime includes durable
 > recovery, static caching, renewable leases, and isolated packet-path tests.
 >
@@ -37,9 +38,10 @@ Try enforcement only in a disposable VM or isolated network namespace. See
 
 Version 1 targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
 RIPEstat-derived geographic/ASN policy, custom HTTP(S) text IP lists in policy
-include/exclude selectors with per-list refresh intervals, and CrowdSec ingress
-bans. Docker coexistence, complete observability, systemd packaging, and signed
-RPM/DEB releases are part of that target, not all currently available features.
+include/exclude selectors with per-list refresh intervals, direct provider IDs
+resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
+coexistence, complete observability, systemd packaging, and signed RPM/DEB
+releases are part of that target, not all currently available features.
 
 The documents below own the detailed contracts. The implementation plan records
 which parts are implemented; source-build commands do not imply installed
@@ -56,7 +58,7 @@ verify changes.
 | [Implementation plan](docs/implementation-plan.md) | Milestone status, remaining gates, and next work |
 | [Architecture](docs/architecture.md) | Component boundaries, writer ownership, revision admission, commit, and recovery |
 | [Configuration](docs/configuration.md) | YAML schema, defaults, validation, policy semantics, and examples |
-| [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text lists, and CrowdSec wire compatibility, authority, projection, and leases |
+| [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
 | [Firewall backends](docs/firewall-backends.md) | Packet paths, native ownership, commit/rollback guarantees, and attachments |
 | [Operations](docs/operations.md) | Source-build procedures, health/metrics, and planned service/package lifecycle |
 | [Development](docs/development.md) | Repository map, commands, verification matrix, measurements, CI, and release requirements |

@@ -16,6 +16,9 @@
 >
 > Custom HTTP(S) text IP lists extend static snapshots without changing CrowdSec
 > authority or leases.
+>
+> Named provider selectors reuse this static-source pipeline with dynamic
+> provider resolution through jsDelivr; no embedded provider catalog is required.
 
 ## Contents
 
@@ -36,6 +39,11 @@
   - [HTTP transport](#http-transport)
   - [List identity and immutable cache](#list-identity-and-immutable-cache)
   - [Per-list refresh and complete snapshots](#per-list-refresh-and-complete-snapshots)
+- [Named provider feeds](#named-provider-feeds)
+  - [Dynamic IDs and jsDelivr mapping](#dynamic-ids-and-jsdelivr-mapping)
+  - [Provider identity, refresh, and fallback](#provider-identity-refresh-and-fallback)
+  - [Upstream meaning and freshness limits](#upstream-meaning-and-freshness-limits)
+  - [Why not go-cloudip](#why-not-go-cloudip)
 - [CrowdSec stream](#crowdsec-stream)
   - [Supported LAPI contract](#supported-lapi-contract)
   - [Compatibility rationale and primary-source evidence](#compatibility-rationale-and-primary-source-evidence)
@@ -51,7 +59,8 @@
 
 Version 1 uses RIPEstat for static country/ASN prefixes, custom HTTP(S)
 text lists as another static selector type, and CrowdSec LAPI for dynamic
-ingress bans. [Configuration](configuration.md) defines selectors and defaults;
+ingress bans. Named feeds from `rezmoss/cloud-provider-ip-addresses` also use
+the static-source pipeline. [Configuration](configuration.md) defines selectors and defaults;
 [architecture](architecture.md) defines revision admission, commit behavior,
 and process lifecycle. Sources produce typed data and never emit firewall
 syntax. This document owns source wire compatibility, source-side validation,
@@ -435,6 +444,131 @@ CrowdSec leases. This favors continuity over automatic removal of stale list
 entries; operators must monitor freshness. Source timestamp reporting uses the
 oldest required committed retrieval per source kind, never resets age on
 fallback, and must not label custom-list data as RIPEstat.
+
+## Named provider feeds
+
+Provider-wide IP/CIDR sets come from
+[`rezmoss/cloud-provider-ip-addresses`](https://github.com/rezmoss/cloud-provider-ip-addresses),
+using its merged, dual-stack text files. The
+[configuration contract](configuration.md#named-providers) owns selector
+syntax, defaults, and policy semantics. No provider catalog is embedded or
+required at runtime; provider IDs are resolved dynamically.
+
+### Dynamic IDs and jsDelivr mapping
+
+For a locally validated ID, construct the default URL exactly as:
+
+```text
+https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/{id}/{id}_ips_merged.txt
+```
+
+For `zoom`, this is:
+
+```text
+https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/zoom/zoom_ips_merged.txt
+```
+
+Use jsDelivr and the `main` branch by default, not raw GitHub, a dated release,
+or a bundled classification database. The initial configuration exposes timing
+settings only; custom `ip_lists` remain available for alternate URLs or pinned
+revisions. Do not silently fail over to another origin or branch.
+
+The required file is the existence check: issue one bounded content GET per
+missing/due provider, not a preliminary HEAD request, repository listing,
+GitHub API lookup, `summary.json` catalog fetch, or metadata request. The
+repository and path template are fixed source configuration; provider names
+are not compiled-in membership. IDs not known when perimeterd was built must
+still resolve if a valid feed is now served at the mapped URL.
+
+Require a final HTTP 200 with a non-empty, fully validated body under the existing
+[text format](#text-format-and-validation) and [transport rules](#http-transport).
+Reuse UTF-8/IP/CIDR normalization, invalid-line rejection, TLS verification,
+redirect limits, HTTPS downgrade rejection, whole-request timeout, and the
+32 MiB decoded-body cap. Each distinct provider counts toward the shared
+512-selector cap and uses the same four-request allowance as other static
+sources. Fetch both address families and validate the whole file even when one
+firewall family is disabled.
+
+HTTP 404 means resolution failed at the mapped endpoint; report the provider ID
+and failure status without interpreting it as an empty provider or silently
+removing its selector. CDN caching can delay both newly added feeds and updates,
+so a missing file is not proof that the provider is permanently absent upstream.
+Other failed statuses, malformed/empty bodies, and transport failures also fail
+resolution. Diagnostics must distinguish offline syntax errors from runtime
+source failures; never dump response bodies.
+
+### Provider identity, refresh, and fallback
+
+The separate `provider` selector/source kind is keyed by the exact provider ID,
+not a synthetic entry in the user-defined `ip_lists` namespace. Its version-2
+objects and manifest entries store `source_kind: "provider"`, `source_name`
+equal to that ID, `endpoint` equal to the derived CDN URL, and `api_version: "1"`
+for the shared text parser. Retrieval time, normalized family arrays, and
+content identifiers follow the existing static-source format.
+The derived URL and parser identity must match the candidate's source mapping;
+an old object for another provider, endpoint, or format is not fallback.
+Changing only refresh/timeout settings does not change source identity.
+
+Provider-containing manifests retain the version-2 `source: "static"` root and
+bind every required selector to an exact immutable object. There is no parallel
+cache. Existing version-1 RIPEstat and version-2 custom-list evidence remains
+readable and stabilizable by its exact stored object references. Provider
+request parameters and query-time fields are empty rather than invented
+RIPEstat metadata.
+
+Each required provider uses `providers.refresh_interval` (default `24h`) and
+`providers.request_timeout` (default `30s`). The interval is measured from its
+successful retrieval; sharing settings does not force downloading fresh peers.
+Only enabled-policy references fetch, repeated references resolve once, and
+removing the final active reference stops refresh after commit. The existing
+static scheduler, epoch/sequence fences, exact attempted-selector retry tracking,
+and writer govern provider results as well as other static sources.
+
+A new unknown provider cannot borrow another provider's data or an unrelated
+custom-list object. Without a valid complete committed fallback covering every
+required identity, failed resolution prevents startup readiness or rejects a
+reload before activation. A rejected reload leaves the old configuration and
+schedule running. A later 404 or outage fails the refresh and retains the entire
+committed snapshot; it does not terminate healthy retained enforcement or clear
+that provider's prefixes. Restart/reload fallback is permitted only for the
+same previously committed identities and a still-valid complete policy.
+Fallback never counts as a successful fetch or resets retrieval timestamps.
+
+Provider failures do not publish successful partial updates from other sources.
+Use the existing retry cooldown and complete-snapshot barrier; do not cache a
+missing provider permanently, so subsequent attempts can recover when its feed
+becomes available. Stale static enforcement has no automatic expiry.
+
+### Upstream meaning and freshness limits
+
+The default follows mutable `main` through a CDN. Independent provider requests
+may observe different cache ages or repository commits. Perimeterd guarantees
+atomic local candidate publication, not a common upstream Git revision. The
+initial feature does not resolve a shared commit SHA or promise a CDN purge SLA.
+
+A successful retrieval proves that the CDN supplied a syntactically acceptable
+set, not that every original provider feed was freshly or completely collected.
+Upstream `generated_date`, `last_changed_date`, and `content_sha256` are not
+runtime acceptance inputs: publication time is not original-source freshness,
+unchanged sets can be old without being stale, and the metadata hash is not
+necessarily a published TXT file's byte checksum. Perimeterd uses its own
+immutable content identities and reports its committed retrieval time.
+
+Provider sets can overlap and contain infrastructure used by unrelated tenants.
+Whole-provider TXT discards service/region labels. Some providers, such as
+[Alibaba](https://github.com/rezmoss/cloud-provider-ip-addresses/blob/main/alibaba/README.md),
+are BGP-derived rather than official customer/service feeds; do not imply
+stronger attribution or coverage guarantees. The publisher and CDN are network
+trust boundaries, not sources of executable firewall scripts or configuration.
+
+### Why not go-cloudip
+
+Do not add [`go-cloudip`](https://github.com/rezmoss/go-cloudip) for this adapter.
+Its public API is for point-IP classification, not bulk CIDR enumeration, and
+its separate `cloudip-db` pipeline currently covers a smaller provider set.
+Its own cache, embedded fallback, and update lifecycle are not perimeterd's
+committed-source authority. Reuse the existing text transport/parser and static
+transaction path instead.
 
 ## CrowdSec stream
 
@@ -894,6 +1028,15 @@ The following failure behavior is implemented for both static source kinds.
 | New list or changed URL cannot resolve | Fail first-start readiness or reject the reload; never reuse the old endpoint under the new identity. |
 | Required list is stale and unavailable at restart | Use only a valid complete committed fallback that covers every required identity and compiles; otherwise withhold readiness without applying partial policy. |
 | List result succeeds but compilation, apply, or durable publication fails | Do not independently publish list cache selection; use the existing writer compensation/recovery rules. |
+
+### Named provider failures
+
+| Failure | Required behavior |
+| --- | --- |
+| Provider ID has unsafe syntax | Reject offline, without network access. |
+| New syntactically valid ID returns 404 or invalid content | Fail runtime resolution and first-start readiness, or reject the reload; never omit the selector or treat it as empty. |
+| Previously committed provider returns 404, 5xx, or invalid content | Fail the refresh, keep the complete committed snapshot and its timestamps, and retry; only exact-identity complete fallback is eligible on restart/reload. |
+| One provider succeeds while another required source fails | Do not publish a partial candidate or independently advance cache selection. |
 
 ### CrowdSec integration
 

@@ -24,6 +24,8 @@ const (
 	ASN SelectorKind = "asn"
 	// IPList selects a named configured HTTP(S) text list.
 	IPList SelectorKind = "ip_list"
+	// Provider selects a dynamically resolved named-provider feed.
+	Provider SelectorKind = "provider"
 )
 
 // Selector is a canonical source identity used as a snapshot key.
@@ -64,6 +66,11 @@ func CanonicalSelector(kind SelectorKind, value string) (Selector, error) {
 	case IPList:
 		if !config.ValidName(value) {
 			return Selector{}, fmt.Errorf("IP list selector %q must use a lowercase DNS-label-like name", value)
+		}
+		canonical.Value = value
+	case Provider:
+		if !config.ValidProviderID(value) {
+			return Selector{}, fmt.Errorf("provider selector %q must use a lowercase ID containing only letters, digits, hyphens, or underscores", value)
 		}
 		canonical.Value = value
 	default:
@@ -202,7 +209,7 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 	if len(selection.Groups) > 0 && len(selection.ExpandedCountries) == 0 {
 		return nil, fmt.Errorf("groups are unresolved")
 	}
-	seen := make(map[Selector]struct{}, len(selection.Countries)+len(selection.ExpandedCountries)+len(selection.RIRs)+len(selection.ASNs)+len(selection.IPLists))
+	seen := make(map[Selector]struct{}, len(selection.Countries)+len(selection.ExpandedCountries)+len(selection.RIRs)+len(selection.ASNs)+len(selection.IPLists)+len(selection.Providers))
 	addCountry := func(value string) error {
 		selector, err := CanonicalSelector(Country, value)
 		if err != nil {
@@ -236,6 +243,13 @@ func selectorKeys(selection config.Selector) ([]Selector, error) {
 	}
 	for _, list := range selection.IPLists {
 		selector, err := CanonicalSelector(IPList, list)
+		if err != nil {
+			return nil, err
+		}
+		seen[selector] = struct{}{}
+	}
+	for _, id := range selection.Providers {
+		selector, err := CanonicalSelector(Provider, id)
 		if err != nil {
 			return nil, err
 		}

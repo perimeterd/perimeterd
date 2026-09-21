@@ -188,17 +188,24 @@ func recordFresh(record Record, interval time.Duration) bool {
 }
 
 func selectorTiming(cfg config.Config, selector policy.Selector) (time.Duration, time.Duration, error) {
-	if selector.Kind != policy.IPList {
+	switch selector.Kind {
+	case policy.IPList:
+		list, ok := cfg.IPLists[selector.Value]
+		if !ok {
+			return 0, 0, fmt.Errorf("source: custom list %q is not configured", selector.Value)
+		}
+		if list.RefreshInterval <= 0 || list.RequestTimeout <= 0 {
+			return 0, 0, fmt.Errorf("source: custom list %q has invalid timing", selector.Value)
+		}
+		return list.RefreshInterval, list.RequestTimeout, nil
+	case policy.Provider:
+		if cfg.Providers.RefreshInterval <= 0 || cfg.Providers.RequestTimeout <= 0 {
+			return 0, 0, errors.New("source: provider refresh interval and request timeout must be positive")
+		}
+		return cfg.Providers.RefreshInterval, cfg.Providers.RequestTimeout, nil
+	default:
 		return cfg.Geo.RefreshInterval, cfg.Geo.RequestTimeout, nil
 	}
-	list, ok := cfg.IPLists[selector.Value]
-	if !ok {
-		return 0, 0, fmt.Errorf("source: custom list %q is not configured", selector.Value)
-	}
-	if list.RefreshInterval <= 0 || list.RequestTimeout <= 0 {
-		return 0, 0, fmt.Errorf("source: custom list %q has invalid timing", selector.Value)
-	}
-	return list.RefreshInterval, list.RequestTimeout, nil
 }
 
 func recordMatchesConfig(record Record, cfg config.Config) bool {
@@ -209,7 +216,18 @@ func recordMatchesConfig(record Record, cfg config.Config) bool {
 			return false
 		}
 		endpoint, err := normalizeListURL(list.URL)
-		return err == nil && record.SourceKind == listSourceKind && record.SourceName == record.Selector.Value && record.Endpoint == endpoint && record.APIVersion == listFormatVersion
+		return err == nil &&
+			record.SourceKind == listSourceKind &&
+			record.SourceName == record.Selector.Value &&
+			record.Endpoint == endpoint &&
+			record.APIVersion == listFormatVersion
+	case policy.Provider:
+		expected, err := providerEndpoint(record.Selector.Value)
+		return err == nil &&
+			record.SourceKind == providerSourceKind &&
+			record.SourceName == record.Selector.Value &&
+			record.Endpoint == expected &&
+			record.APIVersion == listFormatVersion
 	case policy.Country, policy.ASN:
 		if record.SourceKind != "" && record.SourceKind != ripeSourceKind {
 			return false
@@ -369,10 +387,13 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		return Record{}, ctx.Err()
 	}
 
-	list := selector.Kind == policy.IPList
-	values := url.Values{"sourceapp": {"perimeterd"}}
+	text := selector.Kind == policy.IPList || selector.Kind == policy.Provider
 	endpoint := countryEndpoint
-	if list {
+	sourceLabel := ""
+	values := url.Values{"sourceapp": {"perimeterd"}}
+	switch selector.Kind {
+	case policy.IPList:
+		sourceLabel = fmt.Sprintf("custom list %q", selector.Value)
 		configured, ok := cfg.IPLists[selector.Value]
 		if !ok {
 			return Record{}, fmt.Errorf("custom list %q is not configured", selector.Value)
@@ -381,52 +402,62 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		if err != nil {
 			return Record{}, fmt.Errorf("custom list %q has invalid URL", selector.Value)
 		}
-	} else {
-		switch selector.Kind {
-		case policy.Country:
-			values.Set("resource", selector.Value)
-			values.Set("v4_format", "prefix")
-		case policy.ASN:
-			endpoint = asnEndpoint
-			values.Set("resource", selector.Value[2:])
-		default:
-			return Record{}, fmt.Errorf("unsupported source selector kind %q", selector.Kind)
+	case policy.Provider:
+		sourceLabel = fmt.Sprintf("provider %q", selector.Value)
+		endpoint, err = providerEndpoint(selector.Value)
+		if err != nil {
+			return Record{}, err
 		}
+	case policy.Country:
+		values.Set("resource", selector.Value)
+		values.Set("v4_format", "prefix")
+	case policy.ASN:
+		endpoint = asnEndpoint
+		values.Set("resource", selector.Value[2:])
+	default:
+		return Record{}, fmt.Errorf("unsupported source selector kind %q", selector.Kind)
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		if list {
-			return Record{}, errors.New("invalid custom list URL")
+		if text {
+			return Record{}, fmt.Errorf("%s has invalid URL", sourceLabel)
 		}
 		return Record{}, err
 	}
-	if list {
+	if text {
 		ctx = markListRequest(ctx)
 	} else {
 		u.RawQuery = values.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		if list {
-			return Record{}, errors.New("create request failed")
+		if text {
+			return Record{}, fmt.Errorf("%s: create request failed", sourceLabel)
 		}
 		return Record{}, fmt.Errorf("create request: %w", err)
 	}
-	if list {
+	if text {
 		req.Header.Set("Accept", "text/plain")
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
 	resp, err := r.client.Do(req)
 	if err != nil {
-		if list {
-			return Record{}, classifyListRequestError(err)
+		if text {
+			requestErr := classifyListRequestError(err)
+			if selector.Kind == policy.Provider {
+				return Record{}, fmt.Errorf("%s request: %w", sourceLabel, requestErr)
+			}
+			return Record{}, requestErr
 		}
 		return Record{}, fmt.Errorf("request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if list {
+	if text {
 		if resp.StatusCode != http.StatusOK {
+			if selector.Kind == policy.Provider {
+				return Record{}, fmt.Errorf("%s: HTTP status %d", sourceLabel, resp.StatusCode)
+			}
 			return Record{}, fmt.Errorf("HTTP status %d", resp.StatusCode)
 		}
 	} else if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -451,8 +482,8 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	if len(body) > maxBodyBytes {
 		return Record{}, fmt.Errorf("response exceeds %d-byte limit", maxBodyBytes)
 	}
-	if list {
-		return parseList(body, endpoint, selector)
+	if text {
+		return parseTextList(body, endpoint, selector)
 	}
 	params := make(map[string]string, len(values))
 	for key, list := range values {
@@ -468,8 +499,19 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 }
 
 func parseList(body []byte, endpoint string, selector policy.Selector) (Record, error) {
+	return parseTextList(body, endpoint, selector)
+}
+
+func parseTextList(body []byte, endpoint string, selector policy.Selector) (Record, error) {
+	sourceKind := listSourceKind
+	sourceLabel := "custom list"
+	if selector.Kind == policy.Provider {
+		sourceKind = providerSourceKind
+		sourceLabel = "provider"
+	}
+	description := fmt.Sprintf("%s %q", sourceLabel, selector.Value)
 	if !utf8.Valid(body) {
-		return Record{}, fmt.Errorf("custom list %q line data is not valid UTF-8", selector.Value)
+		return Record{}, fmt.Errorf("%s line data is not valid UTF-8", description)
 	}
 	ipv4 := make([]netip.Prefix, 0)
 	ipv6 := make([]netip.Prefix, 0)
@@ -492,7 +534,7 @@ func parseList(body []byte, endpoint string, selector policy.Selector) (Record, 
 		if err != nil {
 			address, addressErr := netip.ParseAddr(line)
 			if addressErr != nil || address.Zone() != "" {
-				return Record{}, fmt.Errorf("custom list %q line %d is not one IP address or CIDR", selector.Value, lineNumber)
+				return Record{}, fmt.Errorf("%s line %d is not one IP address or CIDR", description, lineNumber)
 			}
 			bits := 128
 			if address.Is4() {
@@ -505,25 +547,30 @@ func parseList(body []byte, endpoint string, selector policy.Selector) (Record, 
 		} else if prefix.Addr().Is6() && prefix.Addr().Zone() == "" {
 			ipv6 = append(ipv6, prefix)
 		} else {
-			return Record{}, fmt.Errorf("custom list %q line %d contains an unsupported address", selector.Value, lineNumber)
+			return Record{}, fmt.Errorf("%s line %d contains an unsupported address", description, lineNumber)
 		}
 	}
 	if !found {
-		return Record{}, fmt.Errorf("custom list %q is empty", selector.Value)
+		return Record{}, fmt.Errorf("%s is empty", description)
 	}
 	normalized4, err := normalizeFamily(ipv4, true)
 	if err != nil {
-		return Record{}, fmt.Errorf("custom list %q IPv4: %w", selector.Value, err)
+		return Record{}, fmt.Errorf("%s IPv4: %w", description, err)
 	}
 	normalized6, err := normalizeFamily(ipv6, false)
 	if err != nil {
-		return Record{}, fmt.Errorf("custom list %q IPv6: %w", selector.Value, err)
+		return Record{}, fmt.Errorf("%s IPv6: %w", description, err)
 	}
 	normalizedEndpoint, err := normalizeListURL(endpoint)
 	if err != nil {
-		return Record{}, fmt.Errorf("custom list %q has invalid endpoint", selector.Value)
+		return Record{}, fmt.Errorf("%s has invalid endpoint", description)
 	}
-	return Record{Selector: selector, SourceKind: listSourceKind, SourceName: selector.Value, Endpoint: normalizedEndpoint, APIVersion: listFormatVersion, Parameters: map[string]string{}, RetrievedAt: time.Now().UTC(), IPv4: normalized4, IPv6: normalized6}, nil
+	return Record{
+		Selector: selector, SourceKind: sourceKind, SourceName: selector.Value,
+		Endpoint: normalizedEndpoint, APIVersion: listFormatVersion,
+		Parameters: map[string]string{}, RetrievedAt: time.Now().UTC(),
+		IPv4: normalized4, IPv6: normalized6,
+	}, nil
 }
 
 type envelope struct {
