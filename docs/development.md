@@ -13,10 +13,11 @@ The Go module pins Go 1.27.1; see the official
 ```text
 cmd/perimeterd/main.go
 internal/app/                 lifecycle, candidates, serialized writer, HTTP and notifications
-internal/cli/                 command dispatch, validation and version reporting
+internal/cli/                 command dispatch, validation, lookup and version reporting
 internal/config/              YAML schema, defaults and strict validation
 internal/config/catalog/      checked-in selector catalogs
 internal/crowdsec/            bounded LAPI adapter, authoritative store and timed projection
+internal/lookup/              pure applied-state evaluation, attribution and private query transport
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
@@ -47,6 +48,10 @@ The most useful file boundaries when changing an existing path are:
   reconciliation, independent expiry/renewal workers, and reconnect handover.
 - `internal/crowdsec/`: response validation, decision identity, absolute
   deadlines, and maximum-expiry overlap projection.
+- `internal/app/lookup.go`: atomic applied-view publication, invalidation,
+  acknowledged dynamic lease evidence, and query completion fencing.
+- `internal/lookup/`: complete address/traffic partitions, source explanation,
+  strict bounded HTTP-over-Unix transport, and the daemon client.
 - `internal/config/catalog/`: checked-in country, RIR, and ASN vocabulary.
 - `internal/firewall/exec.go`: bounded native subprocess I/O shared by
   backends.
@@ -61,8 +66,9 @@ The most useful file boundaries when changing an existing path are:
   probes (`network_test.go`), daemon lifecycle (`daemon_test.go`), geo
   scenarios (`geo_test.go`, `custom_list_test.go`, and `providers_test.go`), native backend scenarios (`nftables_test.go` and
   `iptables_test.go`), real Docker coexistence (`docker_harness_test.go`,
-  `docker_test.go`), runtime/recovery boundaries (`runtime_test.go`,
-  `recovery_test.go`), and failure injection (`crash_test.go`).
+  `docker_test.go`), actual daemon lookup and packet parity (`lookup_test.go`),
+  runtime/recovery boundaries (`runtime_test.go`, `recovery_test.go`), and
+  failure injection (`crash_test.go`).
 
 ### Planned additions
 
@@ -485,6 +491,24 @@ than one layer when the real boundary matters.
 | Flow symmetry | Established-flow behavior is symmetric for host-originated and inbound connections in both directions. | Privileged IPv4/IPv6 netns E2E where applicable |
 | Docker coexistence | A remapped host port receives an ingress policy through `DOCKER-USER` constrained to the external interface with original-destination matching, while unrelated container egress still works. | Separate privileged Docker job |
 | Backend tool families | Both validated iptables-legacy and iptables-nft tool families are exercised; save/restore variants are never mixed in one run. | Privileged iptables/ipset netns E2E |
+
+### Lookup and explanation
+
+The [operator contract](operations.md#ipcidr-lookup),
+[query architecture](architecture.md#read-only-lookup-and-explanation),
+and [provenance contract](data-sources.md#lookup-source-attribution)
+own behavior; keep their checks in the existing verification gates.
+
+| Contract | Concrete behavior or boundary | Verification layer |
+| --- | --- | --- |
+| Evaluation parity | New-flow global allow/block, CrowdSec, classifier, first traffic-matching policy and terminal pass, family-empty allowlists, both deny actions, both directions, disabled families, and confirmed empty managed state agree with native behavior. Non-new-flow bypass is disclosed rather than probing conntrack. | Pure evaluator cases; actual CLI and IPv4/IPv6 packet probes on nftables and both iptables tool families |
+| Full query coverage | IP hosts, canonicalized CIDRs, `/0`, nested exclusions, sparse/partial coverage, and omitted protocol/port/direction produce a complete non-overlapping partition and correct aggregate verdict without host enumeration. Reject malformed/mapped/zoned addresses and invalid flag combinations. | Deterministic prefix/flow cases; CLI smoke |
+| Attachment semantics | Output identifies interface constraints and original-versus-current destination-port basis; it never infers a route or NAT mapping. Matched lookup scopes agree with remapped Docker packet probes, and downstream foreign denial is not mislabeled as perimeterd denial. | Existing private Docker gate extended with actual CLI queries |
+| Source explanation | Overlapping country/group/RIR/ASN/list/provider memberships, same-name list/provider identities, cross-category exclusions, global shadowing, and allowlist absence explain the deciding rule without inventing a single origin. Unreferenced and disabled feeds are never fetched; old committed snapshots retain exact attribution after refresh failure. | Local source fixtures; app and CLI scenarios |
+| Dynamic applied evidence | Pending additions/deletions, overlapping IDs, `/0`, unequal expiry, renewal without desired changes, failed/ambiguous writes, reconnect, endpoint replacement, and restart distinguish desired decisions from acknowledged leases. Origin/scenario metadata is not fabricated or fetched. | Fake-clock and writer fault cases; CrowdSec/native lifecycle with CLI queries |
+| Publication consistency | Accepted/rejected reload, per-family apply, safe/failed compensation, pre/postcommit failure, retirement, recovery, and query completion racing a new write cannot mix generations or return a definitive answer from invalidated evidence. | App race/fault cases; existing native recovery scenarios extended with CLI queries |
+| Private interface | Root-only socket, metrics-disabled operation, ownership-lock exclusion, safe stale-socket handling, reload reuse, shutdown cleanup, daemon absence, protocol mismatch, and JSON/human exit semantics preserve the contract. Requests make no source/credential/backend calls and do not alter counters, leases, readiness, or durable state. | Isolated socket/CLI tests; privileged lifecycle smoke |
+| Bounded failure | Oversized request/response, too many partitions/evidence records, concurrency saturation, cancellation, and slow clients fail explicitly without partial success, unbounded work, or writer starvation. Invalid/unknown results never imply allow. | Deterministic limit/deadline cases; concurrent query/write race coverage |
 
 ### Metrics
 

@@ -5,8 +5,8 @@ milestones summarize delivered behavior; pending milestones retain their
 acceptance criteria. Detailed contracts live in the linked reference documents.
 
 The first release includes both native backends, CrowdSec, Docker coexistence,
-custom HTTP(S) text IP lists, dynamic named-provider feeds, operational integration,
-and release gates.
+custom HTTP(S) text IP lists, dynamic named-provider feeds, IP/CIDR lookup with
+source explanations, operational integration, and release gates.
 Implemented does not mean production-ready; the remaining gates below still apply.
 
 ## Status at a glance
@@ -21,6 +21,7 @@ Implemented does not mean production-ready; the remaining gates below still appl
 | Coexistence | Implemented for custom attachments and Docker's iptables bridge backend | Maintain explicit interface constraints, ordering, and foreign-state preservation |
 | Custom HTTP(S) IP lists | Implemented for both backends | Maintain named include/exclude selectors, bounded fetching, exact cache identity, and per-list refresh/recovery |
 | Named provider feeds | Implemented for both backends | Maintain dynamic include/exclude IDs, jsDelivr `@main` resolution without a catalog, exact cache identity, and complete-snapshot publication |
+| IP/CIDR lookup and explanation | Implemented for both backends | Maintain coherent applied-state publication, complete CIDR/traffic partitions, source attribution, and private bounded transport |
 | Operations and delivery | Source-build CLI, logging, readiness, three HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
 
 ## 1. Foundation and offline configuration validation
@@ -190,7 +191,54 @@ a common upstream Git revision are not implied. Keep the
 [verification matrix](development.md#verification-matrix) and existing source,
 writer, CrowdSec, and Docker gates passing.
 
-## 8. Operational and release gates
+## 8. IP/CIDR lookup and source explanation
+
+**Status:** implemented.
+
+The CLI provides `lookup` alongside `run`, `validate`, `cleanup`, and `version`.
+The [operator contract](operations.md#ipcidr-lookup),
+[applied-state query boundary](architecture.md#read-only-lookup-and-explanation),
+and [provenance contract](data-sources.md#lookup-source-attribution) are delivered
+without new YAML fields or durable schemas:
+
+1. **Pure query evaluation.** `internal/lookup` evaluates backend-neutral
+   compiled rules for complete IPv4/IPv6 CIDRs, both directions, optional
+   protocol/port filters, and new flows. It preserves terminal pass,
+   global/CrowdSec precedence, classifier, allowlist absence, and explicit
+   attachment/interface/port-basis conditions without native inspection.
+2. **Coherent applied-state publication.** The existing writer publishes
+   immutable selected configuration/manifest references together with
+   acknowledged dynamic projection, decision identity, and conservative native
+   lease evidence. Mutation and uncertain recovery invalidate definitive
+   answers; a completion fence rejects queries racing a newer operation.
+   Rejected candidates and safe compensation preserve old authority.
+   Confirmed empty managed state remains queryable.
+3. **Source explanations.** Matching country/group/RIR/ASN/list/provider
+   membership, include/exclude roles, global entries, and the deciding rule
+   remain distinct. CrowdSec evidence retains every matching decision ID and
+   separates decision deadlines from acknowledged native leases. Queries do
+   not fetch sources, persist live decisions, or invent origin/scenario metadata.
+4. **Private interface and CLI.** A root-only fixed Unix socket serves strict,
+   versioned, bounded requests independently of metrics. `lookup` supplies
+   human/JSON output, stable verdicts and exit codes, cancellation, and explicit
+   unknown results for unavailable, inconsistent, or over-limit evidence.
+   The listener shares ownership/startup/reload/shutdown lifecycle without
+   acquiring the writer or lifecycle lock for queries.
+5. **Executable acceptance.** Actual CLI and IPv4/IPv6 probes cover nftables,
+   iptables-legacy, and iptables-nft. Docker probes verify original/current
+   destination-port semantics and foreign downstream denial. Source refresh,
+   rejected reload, CrowdSec deletion/expiry, empty state, and socket shutdown
+   scenarios are exercised alongside record-limit, malformed/partial-response,
+   cancellation, and uncertain-journal regressions.
+
+The [lookup verification matrix](development.md#lookup-and-explanation) owns
+the maintained behavioral requirements. Verification includes `make verify`,
+`make test-race`, the full privileged native gate, real-LAPI compatibility, and
+the pinned private Docker coexistence/security gate. No independent firewall
+reader/writer, query-time packet probe, general GeoIP enrichment, or offline
+fallback is part of this feature.
+
+## 9. Operational and release gates
 
 **Status:** partially implemented.
 
@@ -208,13 +256,13 @@ release scaffolding only with working artifacts and executable checks.
 
 ## Immediate next task
 
-Complete step 8: full metrics collection and export, installed service lifecycle,
-package lifecycle and architecture coverage, and signed release artifacts with
+Complete step 9: full metrics collection and export, installed service/package
+lifecycle and architecture coverage, and signed release artifacts with
 executable release CI.
 
 Static source-backed policy, custom HTTP(S) lists, dynamic named providers, both
-native backends, CrowdSec synchronization and decision lifecycle, and Docker
-iptables bridge coexistence are implemented. Keep their existing writer,
-recovery, packet-path, and compatibility gates passing while adding the remaining
-features. Track new work as issues using acceptance criteria from the owning
-documents rather than maintaining another implementation or test plan.
+native backends, CrowdSec synchronization and decision lifecycle, Docker
+iptables bridge coexistence, and daemon-backed lookup are implemented. Keep
+their writer, recovery, packet-path, query, and compatibility gates passing.
+Track new work as issues using acceptance criteria from the owning documents
+rather than maintaining another implementation or test plan.

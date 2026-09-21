@@ -133,6 +133,26 @@ func TestStoreProjectionIsImmutable(t *testing.T) {
 	}
 }
 
+func TestStoreDecisionsIsImmutableAndDeterministic(t *testing.T) {
+	now := time.Now()
+	store := NewStore("lapi", 1)
+	decisions := []Decision{
+		{ID: 9, Prefix: netip.MustParsePrefix("198.51.100.0/24"), Deadline: now.Add(2 * time.Hour)},
+		{ID: 3, Prefix: netip.MustParsePrefix("192.0.2.0/24"), Deadline: now.Add(time.Hour)},
+	}
+	if err := store.Apply(Batch{Startup: true, New: decisions}, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	got := store.Decisions()
+	if len(got) != 2 || got[0].ID != 3 || got[1].ID != 9 {
+		t.Fatalf("decisions = %#v, want IDs [3 9]", got)
+	}
+	got[0].Prefix = netip.MustParsePrefix("203.0.113.0/24")
+	if again := store.Decisions(); again[0].Prefix != decisions[1].Prefix {
+		t.Fatalf("decision mutation leaked into store: %#v", again)
+	}
+}
+
 func TestStoreFailsClosedWhenRevisionExhausted(t *testing.T) {
 	now := time.Now()
 	store := NewStore("lapi", 1)

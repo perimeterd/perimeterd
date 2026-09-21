@@ -2,10 +2,10 @@
 
 This document owns component boundaries, writer ownership, revision admission,
 and durable recovery for the native runtimes, including custom HTTP(S) IP lists
-and direct named-provider feeds through the static-source boundary.
-Service packaging and the
-[future deployment boundaries](#future-deployment-boundaries) are not implemented
-deployment options.
+and direct named-provider feeds through the static-source boundary. The
+[lookup boundary](#read-only-lookup-and-explanation) explains applied state
+without joining the writer or contacting sources. Service packaging and
+[future deployment boundaries](#future-deployment-boundaries) remain unimplemented.
 
 The [implementation plan](implementation-plan.md) owns milestone status.
 [Operations](operations.md#current-source-build-runtime) describes what can run
@@ -88,6 +88,7 @@ to the current files.
 | Durable store | Validate and publish revision/journal records with explicit durability barriers | Choosing which attempted revision should win |
 | Native backend | Preflight, apply, retire, and clean up exact owned targets; preserve native accounting objects | Fetching source data or selecting the durable active revision |
 | Runtime publication | Publish the selected source snapshot, logger, and listener; retain or discard staged resources according to the selected transaction | Treating an uncertain commit as success |
+| Lookup and explanation | Evaluate a coherent applied-state view and explain source membership through a private read-only daemon interface | Selecting candidates, contacting sources, native inspection, mutation, or claiming end-to-end reachability |
 
 The current configuration ingress is a local file, reloaded with `SIGHUP`;
 implemented static sources are RIPEstat, custom HTTP(S) lists, and dynamic
@@ -169,6 +170,143 @@ complete revision and its retrieval evidence. Reloaded timing/reference changes
 take effect only after durable selection, and rejected reloads retain old timers.
 Existing RIPEstat and custom-list recovery evidence must remain readable.
 
+## Read-only lookup and explanation
+
+**Status:** implemented by `internal/lookup` and the writer-owned publication
+boundary in `internal/app/lookup.go`.
+[Operations](operations.md#ipcidr-lookup) owns CLI input, output, and
+verdict semantics; [data sources](data-sources.md#lookup-source-attribution)
+owns attribution; [development](development.md#lookup-and-explanation)
+owns acceptance coverage. No YAML fields or durable schema changes are required.
+```mermaid
+flowchart LR
+    W[Serialized writer] --> V[Immutable applied-state view]
+    V --> E[Pure evaluator and source explanation]
+    CLI[lookup CLI] --> Q[Private Unix socket]
+    Q --> E
+    E --> Q
+    Q --> CLI
+```
+
+
+### Applied-state query view
+
+An IP/CIDR lookup evaluates perimeterd's applied policy for new flows, not a
+fresh compilation of the configuration file. Its inputs must be one immutable,
+coherent view of:
+
+- the selected revision, normalized configuration, compiled rules, family and
+  attachment scopes, and exact selected static source manifest;
+- the successfully applied CrowdSec projection, its client epoch and
+  acknowledged operation watermark, supporting decision identities, and
+  effective native lease evidence; and
+- enforcement availability and a captured evaluation time.
+
+A confirmed empty managed state is also queryable: identify absent revision or
+manifest references explicitly and report the corresponding scopes as not
+managed, rather than inventing an active target or treating emptiness as failure.
+
+The desired CrowdSec store can be ahead of native application. Its newest
+decisions are not evidence that a ban is enforced, nor does a desired deletion
+prove that an old ban has already disappeared. Retain query provenance with
+the acknowledged projection; discard it when that projection is superseded.
+Decision deadlines and kernel lease deadlines are different. Evaluate known
+lease coverage at the captured time, and report uncertainty if the available
+evidence cannot establish coverage. Renewals can change query-visible lease
+evidence without changing the durable revision or desired decision revision.
+Never persist live decisions or leases to make offline lookup possible.
+
+The writer owns publication and invalidation of this read model, using the
+existing mutation/acknowledgment boundaries:
+
+1. Candidate fetching/compilation leaves the current query view selected.
+2. Before native mutation, invalidate definitive responses for the affected
+   view. Queries must not label an in-flight iptables family switch, dynamic
+   update, or backend migration as one settled generation.
+3. Publish a replacement only after the required native acknowledgments,
+   durable static selection, and retirement complete. Safe compensation can
+   restore the previous view; uncertain commit, failed compensation, pending
+   recovery, or unresolved old targets remain unavailable.
+4. Capture immutable references under serialization, then evaluate outside the
+   writer's critical section. Before returning a definitive response, verify
+   that the captured publication token has not been invalidated; otherwise
+   return unavailable rather than combine generations or retry indefinitely.
+
+The response identifies its revision, source manifest, dynamic operation
+identity where applicable, and `observed_at` instant. It is an as-of result,
+not a promise that policy stays unchanged after the response. Missing source
+evidence must not be silently replaced with newer cache objects. Known stale
+static feeds remain explainable when their committed policy remains enforced;
+report retrieval age rather than interpreting staleness as an empty set.
+
+### Pure evaluator and provenance
+
+Promote/reuse the semantics exercised by the existing test-only packet
+evaluator as a production backend-neutral evaluator. Evaluate compiled rule
+order, not just prefix membership, and preserve the existing
+[evaluation contract](configuration.md#evaluation-semantics). Do not implement
+separate nftables and iptables policy engines or reverse-parse generated rules
+in the CLI.
+
+For a CIDR, partition at relevant prefix boundaries; for omitted traffic
+filters, partition at relevant protocol and port-scope boundaries. Evaluate
+each resulting scope and coalesce only equivalent outcomes, retaining distinct
+deciding reasons and attribution. Never enumerate IPv4 or IPv6 hosts, test only
+the network address, or infer full coverage from one matching prefix.
+Reuse immutable snapshots and existing prefix algebra; do not copy the entire
+compiled state or every source feed for each query.
+
+Attribution uses the selected configuration and exact source snapshot, plus
+acknowledged dynamic evidence. It is a side explanation of the rule result,
+not a second enforcement algorithm. Include/exclude matches and shadowed
+memberships must not be presented as independently deciding rules.
+
+### Private query transport and lifecycle
+
+Use a separate HTTP-over-Unix-domain-socket endpoint, `POST /v1/lookup`, at
+`/run/perimeterd/lookup.sock`. The request is a JSON object with required string
+`address` and optional `direction`, `protocol`, and integer `port`, using the
+operator contract's values and omission semantics. Reject unknown fields,
+duplicate keys, invalid types, trailing JSON, and unsupported API versions.
+`--json` controls CLI rendering, not query semantics. The endpoint returns the
+versioned result described in [operations](operations.md#lookup-results-and-errors).
+This is not exposed on the unauthenticated metrics listener or a TCP port.
+The socket is root-owned mode `0600` inside the existing root-owned `0700`
+runtime directory. Initial access is root-only; remote access, delegated group
+access, arbitrary socket paths, and administrative mutation methods are outside
+this feature.
+
+`run` acquires the existing lifecycle lock before managing the socket. Only
+that owner may remove a verified stale socket at the fixed path; a symlink,
+non-socket, or unexpected owner is an error, not permission to unlink arbitrary
+files. Bind before readiness, answer unavailable until a coherent view is
+published, and keep the listener across configuration reloads. Failure to bind
+prevents successful startup. On shutdown, stop admission and drain/cancel
+queries before releasing ownership; remove only the socket inode this process
+created. Never unlink or replace `owner.lock`.
+
+The CLI connects without taking the lifecycle lock or opening the durable store.
+Queries cannot fetch or refresh sources, read credentials, renew leases, enqueue
+reconciliation, invoke backend inspection/mutation, reset counters, or change
+readiness. A stopped daemon yields unavailable even if retained static rules
+still exist. There is no implicit offline or configuration-file fallback.
+
+Bound each request body to 4 KiB, each complete encoded response to 4 MiB, and
+each query to 4,096 combined outcome/evidence records. Admit at most four
+concurrent evaluations; excess requests fail busy rather than grow an unbounded
+queue. Apply a five-second end-to-end client deadline and bounded server
+read/evaluation/write deadlines, checking cancellation during partitioning and
+attribution. A limit failure returns an explicit error, never a truncated
+answer labeled complete. Encode within the response bound before sending a
+successful result. Do not hold the writer while evaluating or waiting for a
+slow client.
+
+This interface describes the daemon's applied-policy view for traffic reaching
+the reported managed attachment. It neither probes connectivity nor proves
+that another firewall manager, routing/NAT, or an out-of-band kernel edit has
+left that packet path intact. Detecting arbitrary external drift would require
+a separate writer-owned observation design, not ad hoc inspection by queries.
+
 ## Revision lifecycle
 
 ### Commands
@@ -179,6 +317,7 @@ Existing RIPEstat and custom-list recovery evidence must remain readable.
 | `version` | Report build metadata; no ownership or configuration requirement |
 | `run` | Acquire ownership, recover durable state before reading current YAML, initialize required sources, reconcile and commit, then report readiness |
 | `cleanup` | Acquire ownership and remove recorded owned targets using durable metadata, without consulting current YAML |
+| `lookup` | Query the running owner's applied policy and source evidence; no lifecycle lock, source requests, durable-store access, or native commands |
 
 `run` needs a complete static snapshot (fresh or acceptable committed cache) and
 authoritative CrowdSec synchronization when enabled. The
@@ -196,6 +335,9 @@ CrowdSec retains only the remaining kernel lease on
 shutdown: without a running owner, bans may expire before the source decision's
 deadline. This is not indefinite fail-closed ban retention. Only explicit
 `cleanup` removes all recorded owned artifacts.
+
+The private lookup listener follows the shutdown draining contract above;
+retained static rules do not imply offline query availability.
 
 ### Staged reload
 

@@ -19,6 +19,9 @@
 >
 > Named provider selectors reuse this static-source pipeline with dynamic
 > provider resolution through jsDelivr; no embedded provider catalog is required.
+>
+> [Lookup source attribution](#lookup-source-attribution) explains this committed
+> evidence without initiating source requests or using desired-but-unapplied decisions.
 
 ## Contents
 
@@ -56,6 +59,7 @@
   - [Renewable kernel leases](#renewable-kernel-leases)
 - [CrowdSec availability, endpoint changes, and secrets](#crowdsec-availability-endpoint-changes-and-secrets)
 - [Source failure matrix](#source-failure-matrix)
+- [Lookup source attribution](#lookup-source-attribution)
 
 Version 1 uses RIPEstat for static country/ASN prefixes, custom HTTP(S)
 text lists as another static selector type, and CrowdSec LAPI for dynamic
@@ -1047,3 +1051,65 @@ The following failure behavior is implemented for both static source kinds.
 | Credential/endpoint replacement or disable failure | Keep the old configuration committed, resume its synchronization, and compensate any partial apply. Failed compensation reports degraded enforcement. |
 | Later CrowdSec outage or reconnect snapshot failure | Mark the integration unhealthy, retain unexpired decisions until local expiry, and retry the full authoritative synchronization. |
 | CrowdSec backend delta failure | Recompute the current `P(D)` projection from the authoritative store, queue that reconciliation, and retry idempotently. |
+
+## Lookup source attribution
+
+The [lookup command](operations.md#ipcidr-lookup) explains
+the sources used by the running applied revision without fetching,
+refreshing, discovering, or enriching any feed. Source membership is not a
+verdict; the compiled rule order and the
+[applied-state query view](architecture.md#applied-state-query-view) determine
+which evidence actually contributes to a decision.
+
+### Static provenance
+
+Load/use only the exact manifest selected by that revision, not the newest file
+or any unreferenced historical cache object. Its selector records retain
+normalized country/ASN, `ip_list`, and `provider` identities, prefixes, retrieval
+times, and source-format identity. Their union in a compiled policy set does
+not replace this per-selector evidence. The distinct `ip_list` and `provider`
+namespaces remain distinct even when names or prefixes coincide.
+
+Use the selected policy's include/exclude references to connect leaf membership
+to a policy. Group and RIR attribution additionally identifies the configured
+group/region and matching expanded country; it is an expansion path, not a
+separate upstream geolocation result. Use the membership expansion associated
+with the selected view, never a separately updated catalog. Disabled or
+unreferenced sources are not queried, and missing evidence is not proof that
+an address belongs to no country or provider.
+
+Report all relevant overlapping memberships and their include/exclude roles,
+not an arbitrary first match. An exclusion can change the effective policy set
+without becoming a global allow. A global allow or earlier stage can shadow
+matching source-backed policies. An allowlist miss is explained as absence from
+the effective include-minus-exclude set, not as a fabricated blocking source.
+For globals, identify the effective global allow/block entry and known built-in
+membership; do not claim an entry was operator-supplied when normalization has
+erased that distinction.
+
+Attribution identifies retained normalized ranges, not original TXT line numbers
+or a byte-for-byte upstream record. Country evidence still means allocation or
+registration country, not physical location. Provider evidence still means
+membership in that feed, not proof of endpoint ownership. Display source
+kind/name and retrieval time without exposing potentially secret-bearing URLs.
+No cache schema change or raw-response retention is required for this feature;
+existing version-1 and version-2 recovery compatibility must remain intact.
+
+### CrowdSec provenance
+
+Retain in-memory decision evidence with the acknowledged applied projection:
+decision ID, normalized prefix, absolute decision expiry, client epoch, and
+effective native lease evidence. Identify all contributing overlapping IDs;
+neither maximum-expiry projection nor `/0` backend lowering may arbitrarily
+collapse attribution to one ID. Keep decision expiry distinct from the
+renewable kernel lease. When a desired deletion or update has not yet applied,
+explain the acknowledged state, not the newer desired store.
+
+CrowdSec attribution in this feature means the source kind and retained decision
+identity/deadlines. The client currently discards upstream `origin`, `scenario`,
+and similar descriptive fields; detailed scenario attribution is not promised
+and must not be inferred from an ID or prefix. Adding that metadata would
+require a separate retention contract, not a lookup-time LAPI request.
+Do not persist live decisions as recovery or offline-query authority. After a
+restart, lookup requires freshly synchronized, successfully applied dynamic
+evidence under the normal startup contract.

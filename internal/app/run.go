@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
@@ -119,6 +121,22 @@ func Run(ctx context.Context, options Options) error {
 	engine := NewEngine(store, opts.Backend, opts.Checkpoint)
 	engine.ConfigureCrowdSecTransport(opts.SourceClient)
 	defer engine.Close()
+	lookupPath := filepath.Join(filepath.Dir(opts.LockPath), "lookup.sock")
+	lookupServer, err := lookup.Listen(lookupPath, engine.Lookup)
+	if err != nil {
+		return errors.Join(fmt.Errorf("lookup listener: %w", err), stopNotifier())
+	}
+	defer func() { _ = lookupServer.Close(context.Background()) }()
+	lookupFailures := make(chan error, 1)
+	go func() {
+		for listenerErr := range lookupServer.Errors() {
+			if listenerErr != nil {
+				lookupFailures <- listenerErr
+				cancelRun()
+				return
+			}
+		}
+	}()
 
 	recovered, err := recoverUntilReady(startupCtx, engine, nil)
 	if err != nil {
@@ -235,6 +253,10 @@ func Run(ctx context.Context, options Options) error {
 			recoveryTimer.Stop()
 			recoveryTimer = nil
 		}
+		if err := lookupServer.Close(context.Background()); err != nil {
+			publication.logger.Error("closing lookup listener failed", "error", err)
+			return err
+		}
 		if err := publication.close(); err != nil {
 			publication.logger.Error("closing metrics listener failed", "error", err)
 			return err
@@ -248,7 +270,14 @@ func Run(ctx context.Context, options Options) error {
 		}
 		select {
 		case <-runCtx.Done():
-			return stopService()
+			select {
+			case lookupErr := <-lookupFailures:
+				return errors.Join(lookupErr, stopService())
+			default:
+				return stopService()
+			}
+		case lookupErr := <-lookupFailures:
+			return errors.Join(fmt.Errorf("lookup listener failed: %w", lookupErr), stopService())
 		case <-sources.events():
 			sources.stopTimer()
 			if recovering || sources.active == nil || sources.refreshCancel != nil {

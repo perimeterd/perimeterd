@@ -492,6 +492,10 @@ artifacts remain.
 The ordering below is the contract for static policy and the enabled CrowdSec
 stage on both native backends.
 
+The [IP/CIDR lookup](operations.md#ipcidr-lookup) explains these
+same semantics using the daemon's applied revision. It introduces no YAML fields
+and is not an offline evaluation of the file currently on disk.
+
 1. `ESTABLISHED,RELATED` traffic returns before all perimeterd denial rules.
 2. Traffic that is not a new conntrack flow returns.
 3. A remote address in the effective global allowlist returns before every

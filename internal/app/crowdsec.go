@@ -46,6 +46,14 @@ type crowdState struct {
 	renewAt      time.Time
 	backoff      time.Duration
 	successes    int
+
+	// These fields are immutable acknowledged native evidence until the next
+	// successful dynamic write. They are deliberately separate from store's
+	// desired decision set.
+	leasePrefixes   []policy.TimedPrefix
+	leaseDecisions  []crowd.Decision
+	leaseValidUntil time.Time
+	leaseOperation  uint64
 }
 
 type crowdRuntime struct {
@@ -63,6 +71,7 @@ type crowdRuntime struct {
 	staged      *crowdState
 	transaction string
 	grantAt     time.Time
+	grantDone   time.Time
 	dirty       bool
 	retryAt     time.Time
 	retryDelay  time.Duration
@@ -227,13 +236,14 @@ func (c *crowdRuntime) discardLocked() {
 func (c *crowdRuntime) finishApplyLocked(outcome Outcome, selected *crowdState) {
 	if outcome.Committed {
 		c.activateLocked(selected)
-		if selected != nil && !c.grantAt.IsZero() {
-			c.recordLeasesLocked(selected, selected.store.Projection(c.grantAt), c.grantAt)
-		}
 		c.watermark = c.operation
-		c.staged = nil
-		c.transaction = ""
-		return
+		if selected != nil && !c.grantAt.IsZero() && !c.grantDone.IsZero() {
+			var target *firewall.Target
+			if outcome.Active != nil {
+				target = outcome.Active.Target
+			}
+			c.recordLeasesLocked(selected, selected.store.Projection(c.grantAt), c.grantAt, c.grantDone, c.operation, target)
+		}
 	}
 	if c.transaction != "" {
 		view, err := c.engine.store.Read()
@@ -276,18 +286,71 @@ func (c *crowdRuntime) signalLocked(s *crowdState) {
 	}
 }
 
-func (c *crowdRuntime) recordLeasesLocked(s *crowdState, projection []policy.TimedPrefix, at time.Time) {
+func (c *crowdRuntime) recordLeasesLocked(s *crowdState, projection []policy.TimedPrefix, start, finish time.Time, operation uint64, target *firewall.Target) {
+	if start.IsZero() {
+		start = finish
+	}
+	if finish.IsZero() || finish.Before(start) {
+		finish = start
+	}
+	unit := time.Second
 	s.renewAt = time.Time{}
+	prefixes := make([]policy.TimedPrefix, 0, len(projection))
+	s.leaseValidUntil = time.Time{}
+	s.leaseOperation = operation
 	for _, value := range projection {
-		_, next := firewall.LeaseGrant(value.Deadline, at, time.Second)
+		if target != nil && !targetHasFamily(target, value) {
+			continue
+		}
+		_, next := firewall.LeaseGrant(value.Deadline, start, unit)
+		grant, _ := firewall.LeaseGrant(value.Deadline, finish, unit)
 		if !next.IsZero() && (s.renewAt.IsZero() || next.Before(s.renewAt)) {
 			s.renewAt = next
 		}
+		if grant <= 0 {
+			// A projection that crosses native lease granularity is not
+			// evidence of an absent ban: the backend omits it. Fence the
+			// whole publication at completion until a fresh write settles.
+			if s.leaseValidUntil.IsZero() || finish.Before(s.leaseValidUntil) {
+				s.leaseValidUntil = finish
+			}
+			continue
+		}
+		expiry := start.Add(grant)
+		if !expiry.After(finish) {
+			if s.leaseValidUntil.IsZero() || finish.Before(s.leaseValidUntil) {
+				s.leaseValidUntil = finish
+			}
+			continue
+		}
+		prefixes = append(prefixes, policy.TimedPrefix{Prefix: value.Prefix, Deadline: expiry})
+		if s.leaseValidUntil.IsZero() || expiry.Before(s.leaseValidUntil) {
+			s.leaseValidUntil = expiry
+		}
 	}
+	s.leasePrefixes = prefixes
+	s.leaseDecisions = s.store.Decisions()
 	c.signalLocked(s)
 }
 
+func targetHasFamily(target *firewall.Target, value policy.TimedPrefix) bool {
+	if target == nil {
+		return true
+	}
+	want := policy.IPv6
+	if value.Prefix.Addr().Is4() {
+		want = policy.IPv4
+	}
+	for _, family := range target.Families {
+		if family.Family == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *crowdRuntime) failedWriteLocked(now time.Time) {
+	c.engine.abortLookupLocked()
 	c.enforced.Store(false)
 	c.dirty = true
 	if c.retryDelay == 0 {
@@ -342,16 +405,20 @@ func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState, activ
 	if (!activation && (c.active == nil || epoch != c.active.epoch)) || revision != s.store.Revision() || op <= c.watermark {
 		return errStaleCandidate
 	}
+	writeStart := time.Now()
+	c.engine.invalidateLookupLocked()
 	if err := c.engine.backend.UpdateDynamic(ctx, target, projection); err != nil {
 		c.failedWriteLocked(time.Now())
 		return err
 	}
+	writeFinish := time.Now()
 	c.watermark = op
 	c.dirty = false
 	c.retryAt = time.Time{}
 	c.retryDelay = 0
 	c.enforced.Store(true)
-	c.recordLeasesLocked(s, projection, now)
+	c.recordLeasesLocked(s, projection, writeStart, writeFinish, op, target)
+	c.engine.publishDynamicLookupLocked(s, view.Active.ID, view.Active.Manifest)
 	return nil
 }
 

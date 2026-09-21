@@ -9,8 +9,8 @@ authoritative for delivery status.
 
 > **Status boundary.** The source-build instructions in this document describe
 > what runs today, including custom HTTP(S) text IP lists, direct named-provider
-> selectors, and Docker's iptables bridge integration. Installed packages,
-> systemd payloads, and release artifacts remain first-release work.
+> selectors, Docker's iptables bridge integration, and daemon-backed IP/CIDR
+> lookup. Installed packages, systemd payloads, and release artifacts remain planned.
 > A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
@@ -185,6 +185,124 @@ can delay newly published IDs and changed feeds; no purge or original-provider
 freshness guarantee is implied. Do not remove exclusions to work around a
 missing feed without considering the resulting policy expansion.
 
+## IP/CIDR lookup
+
+Lookup explains perimeterd's applied policy and contributing sources, not
+end-to-end reachability. It is read-only and requires the running daemon.
+The [architecture](architecture.md#read-only-lookup-and-explanation)
+owns coherent state publication, transport, security, and resource bounds.
+
+### Query input and scope
+
+The planned command shape is:
+
+```text
+perimeterd lookup IP_OR_CIDR
+    [--direction ingress|egress]
+    [--protocol tcp|udp|icmp|other]
+    [--port 0..65535]
+    [--json]
+```
+
+Examples, to be used only after implementation:
+
+```sh
+sudo perimeterd lookup 8.8.8.8
+sudo perimeterd lookup 8.8.8.8 --direction ingress --protocol tcp --port 443
+sudo perimeterd lookup 8.8.8.0/24 --direction ingress --protocol tcp --port 443
+sudo perimeterd lookup 2001:4860:4860::8888 --json
+```
+
+- Accept exactly one IPv4/IPv6 address or CIDR, never a hostname or URL.
+  Normalize addresses to host prefixes and mask CIDR host bits; display the
+  canonical queried prefix so its full scope is explicit. Reject malformed,
+  zone-qualified, and IPv4-mapped IPv6 input rather than guess its family.
+- Omitted direction summarizes both ingress and egress. Omitted protocol or
+  port summarizes all corresponding traffic scopes; supplying a port requires
+  an explicit `tcp` or `udp` protocol. `icmp` is family-appropriate ICMP;
+  `other` means protocols outside TCP, UDP, and ICMP.
+- Evaluate **new conntrack flows**. Existing established/related and other
+  non-new flows bypass denial under the existing
+  [evaluation semantics](configuration.md#evaluation-semantics); lookup does
+  not inspect conntrack or test an existing connection.
+- Ingress treats the supplied address as the remote source; egress treats it
+  as the remote destination. The port is the destination port as seen by each
+  reported attachment: original destination when configured, translated/current
+  destination otherwise. Always identify that basis and any interface
+  constraints. Do not infer routes, matching interfaces, or a DNAT mapping from
+  an address. Outcomes are conditional on traversal of the named managed path,
+  not proof that a specific host/container packet reaches it.
+- CIDR results cover the entire queried prefix. Split differing address ranges
+  and traffic/attachment scopes, including uncovered portions, rather than
+  treat any match as full coverage. Disabled families and directions without
+  owned enforcement are explicitly not managed, not missing output.
+
+No `--config`, offline mode, or source refresh is part of this command. Editing
+YAML without an accepted reload cannot change its answer. Lookup uses the
+running owner's socket at `/run/perimeterd/lookup.sock`, independently of
+whether metrics are enabled.
+
+### Lookup results and errors
+
+Use these verdicts in both human and JSON output:
+
+| Verdict | Meaning |
+| --- | --- |
+| `blocked` | Every requested address/traffic scope is denied by perimeterd on the reported managed paths; outcomes identify DROP or REJECT. |
+| `not_blocked` | No requested scope is denied by perimeterd; distinguish explicit global allow, policy pass, classifier bypass, no matching policy, and not-managed scope. |
+| `mixed` | Some requested addresses or traffic/attachment scopes are blocked and others are not; list the complete partition rather than choose a default port or direction. |
+| `unknown` | The daemon cannot provide a coherent, complete applied-state answer; this is never an allow or block assertion. |
+
+Different reasons or DROP/REJECT actions can share the same aggregate verdict,
+but remain separate outcomes. A first traffic-matching policy's pass is terminal
+within perimeterd: later policies do not get another opportunity to deny.
+Allowlist misses are denial by absence, not evidence of membership in a blocking
+feed. "Not blocked" deliberately does not mean ACCEPT: other firewall rules can
+still deny after perimeterd returns.
+
+The version-1 result envelope must contain:
+
+- `schema_version: 1`, canonical query and effective new-flow assumptions,
+  aggregate `verdict`, and an explicit error code/message when not complete;
+- `observed_at`, selected revision/configuration epoch, exact static manifest
+  identity when present, and acknowledged CrowdSec epoch/operation identity
+  when applicable; identifiers that are unavailable are not fabricated;
+- complete outcomes: covered CIDR, direction, traffic scope, managed attachment
+  and interface/port-basis conditions, verdict/action, deciding stage and policy
+  name/priority when applicable, and a reason for pass or denial;
+- source evidence separately identifying matching includes, exclusions, and
+  shadowed memberships, with relevant normalized ranges and static retrieval
+  timestamps or dynamic decision/lease deadlines. A matching source is marked
+  as contributing only in the context of the deciding rule, not as another
+  terminal decision. [Data sources](data-sources.md#lookup-source-attribution)
+  defines available provenance and its limits.
+
+Sort scopes, ranges, and source identities deterministically. Human output
+summarizes the same complete result as `--json`, without silently hiding mixed
+coverage or arbitrarily choosing one source. Do not expose credentials, raw
+upstream payloads, secret-bearing URLs, or HTTP query strings.
+
+Exit `0` means a complete lookup, including a `blocked` or `mixed` verdict;
+it is not an assertion of connectivity. Invalid input/usage exits `2`.
+Unavailable enforcement, missing/refused daemon connection, incompatible
+protocol version, busy/deadline failure, and response/work limits exit `1`
+with explicit diagnostics. With `--json`, report a structured error rather than
+a partial success. A failed or limited lookup cannot default to `not_blocked`.
+The [transport bounds](architecture.md#private-query-transport-and-lifecycle)
+apply equally to human and JSON output; narrow the prefix or traffic scope
+after a limit error.
+
+During an apply, uncertain commit, failed rollback, pending recovery, or
+unresolved target retirement, return `unknown`. A rejected candidate that
+never disturbed enforcement leaves the old applied view queryable. Source
+outages can still produce a valid answer from acknowledged last-known-good
+enforcement; show the old retrieval time and actual known lease coverage, not
+the latest attempted download or desired CrowdSec store.
+
+When the daemon is stopped, lookup is unavailable. Static rules can remain
+enforced and CrowdSec leases can expire during that downtime; neither fact
+permits a saved configuration or manifest to impersonate live authority.
+
 ## Operator sequence
 
 This is the current source-build runbook. It does not assume a package,
@@ -314,6 +432,8 @@ create a service. The eventual package contract is:
 - `/var/lib/perimeterd/`: `root:root`, mode `0700`, for state and cache;
 - `/run/perimeterd/`: `root:root`, mode `0700`, for runtime state;
 - `/run/perimeterd/owner.lock`: root-owned mode `0600` lifecycle lock;
+- `/run/perimeterd/lookup.sock`: daemon-created root-owned mode `0600` private
+  lookup socket, not a tmpfiles-created node;
 - `/run/xtables.lock`: root-owned mode `0600` shared by iptables and
   ip6tables; and
 - a packaged tmpfiles declaration and `perimeterd.service` in the distribution

@@ -3,6 +3,7 @@ package crowdsec
 import (
 	"fmt"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/policy"
@@ -71,6 +72,34 @@ func (s *Store) Revision() uint64 {
 		return 0
 	}
 	return s.revision
+}
+
+// Decisions returns a deterministic immutable snapshot of every retained
+// decision. The returned slice and its values are independent of the store;
+// callers may retain it as acknowledged provenance without observing later
+// desired-state changes.
+func (s *Store) Decisions() []Decision {
+	if s == nil || len(s.decisions) == 0 {
+		return nil
+	}
+	out := make([]Decision, 0, len(s.decisions))
+	for _, retained := range s.decisions {
+		out = append(out, retained.decision)
+	}
+	slices.SortFunc(out, func(a, b Decision) int {
+		return cmpInt64(a.ID, b.ID)
+	})
+	return out
+}
+
+func cmpInt64(a, b int64) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
 }
 
 // Apply validates and atomically admits one source batch. Sequence values must

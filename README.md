@@ -29,8 +29,9 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 ```
 
 Validation requires neither root nor network access. It checks local syntax and
-semantics, not source availability or kernel enforcement. Root-only `run` and
-`cleanup` are available for the [current runtime](docs/operations.md#current-source-build-runtime).
+semantics, not source availability or kernel enforcement. Root-only `run`,
+`cleanup`, and daemon-backed [lookup](docs/operations.md#ipcidr-lookup) are
+available for the [current runtime](docs/operations.md#current-source-build-runtime).
 Try enforcement only in a disposable VM or isolated network namespace. See
 [development](docs/development.md#local-commands) for verification commands.
 
@@ -40,8 +41,9 @@ Version 1 targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
 RIPEstat-derived geographic/ASN policy, custom HTTP(S) text IP lists in policy
 include/exclude selectors with per-list refresh intervals, direct provider IDs
 resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
-coexistence, complete observability, systemd packaging, and signed RPM/DEB
-releases are part of that target, not all currently available features.
+coexistence and IP/CIDR lookup with source explanations are implemented.
+Complete observability, systemd packaging, and signed RPM/DEB releases remain
+part of the target rather than currently available features.
 
 The documents below own the detailed contracts. The implementation plan records
 which parts are implemented; source-build commands do not imply installed
@@ -56,11 +58,11 @@ verify changes.
 | Document | Canonical scope |
 | --- | --- |
 | [Implementation plan](docs/implementation-plan.md) | Milestone status, remaining gates, and next work |
-| [Architecture](docs/architecture.md) | Component boundaries, writer ownership, revision admission, commit, and recovery |
+| [Architecture](docs/architecture.md) | Component boundaries, writer ownership, revision admission, commit, recovery, and applied-state lookup |
 | [Configuration](docs/configuration.md) | YAML schema, defaults, validation, policy semantics, and examples |
 | [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
 | [Firewall backends](docs/firewall-backends.md) | Packet paths, native ownership, commit/rollback guarantees, and attachments |
-| [Operations](docs/operations.md) | Source-build procedures, health/metrics, and planned service/package lifecycle |
+| [Operations](docs/operations.md) | Source-build procedures, health/metrics, lookup CLI contract, and service/package lifecycle |
 | [Development](docs/development.md) | Repository map, commands, verification matrix, measurements, CI, and release requirements |
 
 Each contract has one owner. Other documents summarize it and link to that owner

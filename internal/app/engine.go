@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
@@ -47,6 +48,16 @@ type Engine struct {
 	refreshSequence uint64
 	closing         atomic.Bool
 	healthy         atomic.Bool
+
+	// queryView is published only after a complete native/durable transition.
+	// Queries load it without taking mu or applyMu and evaluate its immutable
+	// contents outside the writer. queryVersion fences a view even when safe
+	// compensation restores the same pointer.
+	queryView     atomic.Pointer[lookupView]
+	queryVersion  atomic.Uint64
+	queryFallback *lookupView
+	queryBase     *lookupView
+	stagedQuery   *lookup.Static
 }
 
 // NewEngine constructs a fenced engine. Recovery must be called before normal
@@ -143,11 +154,20 @@ func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error
 	defer e.applyMu.Unlock()
 	selected, stageErr := e.crowd.stageForApply(ctx, candidate)
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	defer func() {
+		e.stagedQuery = nil
+		e.mu.Unlock()
+	}()
 	e.crowd.grantAt = time.Time{}
+	e.crowd.grantDone = time.Time{}
 	if stageErr != nil {
 		outcome := Outcome{Degraded: e.degraded()}
 		e.crowd.finishApplyLocked(outcome, selected)
+		if outcome.Degraded {
+			e.abortLookupLocked()
+		} else {
+			e.restoreLookupLocked()
+		}
 		return outcome, stageErr
 	}
 	if candidate.refresh != 0 {
@@ -159,6 +179,18 @@ func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error
 	e.crowd.finishApplyLocked(outcome, selected)
 	if outcome.Committed && outcome.Active != nil {
 		e.adoptActiveEpochLocked(outcome.Active)
+		if outcome.Degraded {
+			e.abortLookupLocked()
+		} else if publishErr := e.publishCandidateLookupLocked(candidate, outcome.Active); publishErr != nil {
+			e.abortLookupLocked()
+			e.healthy.Store(false)
+			outcome.Degraded = true
+			err = errors.Join(err, publishErr)
+		}
+	} else if outcome.Degraded {
+		e.abortLookupLocked()
+	} else {
+		e.restoreLookupLocked()
 	}
 	return outcome, err
 }
@@ -194,6 +226,11 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 	if err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
+	static, err := lookup.NewStatic(candidate.cfg, candidateTarget, candidate.snapshot)
+	if err != nil {
+		return Outcome{Active: previous, Degraded: e.degraded()}, fmt.Errorf("build lookup state: %w", err)
+	}
+	e.stagedQuery = static
 	var admission, activation *firewall.DynamicState
 	if candidate.cfg.CrowdSec.Enabled {
 		if selected == nil || selected.store == nil {
@@ -237,8 +274,12 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 	if activation != nil {
 		e.crowd.grantAt = time.Now()
 	}
+	e.invalidateLookupLocked()
 	if err := e.applyBackendLocked(ctx, previousTarget, candidateTarget, activation); err != nil {
 		return e.rollbackLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
+	}
+	if activation != nil {
+		e.crowd.grantDone = time.Now()
 	}
 	if err := e.check("after-switch"); err != nil {
 		return e.rollbackLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
@@ -347,6 +388,7 @@ func (e *Engine) committedFailureLocked(candidate *state.Revision, err error) (O
 }
 
 func (e *Engine) failLocked(err error) (Outcome, error) {
+	e.abortLookupLocked()
 	e.healthy.Store(false)
 	return Outcome{Degraded: true}, err
 }
@@ -365,13 +407,18 @@ func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
 	if err == nil {
 		err = e.crowd.recoverLocked(ctx, revision)
 	}
+	if err == nil {
+		err = e.publishRecoveredLookupLocked(revision)
+	}
 	if err != nil {
+		e.abortLookupLocked()
 		e.healthy.Store(false)
 	}
 	return revision, err
 }
 
 func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
+	e.invalidateLookupLocked()
 	if e.closing.Load() {
 		return nil, errEngineClosed
 	}
@@ -518,11 +565,20 @@ func (e *Engine) Cleanup(ctx context.Context) error {
 		return e.recoveryFailureLocked(err)
 	}
 	if view.Journal == nil && view.Active == nil {
+		e.abortLookupLocked()
+		e.crowd.activateLocked(nil)
 		e.healthy.Store(true)
+		if err := e.publishEmptyLookupLocked(); err != nil {
+			e.abortLookupLocked()
+			e.healthy.Store(false)
+			return err
+		}
 		return nil
 	}
+	e.invalidateLookupLocked()
 	id, err := transactionID()
 	if err != nil {
+		e.abortLookupLocked()
 		return err
 	}
 	if err := e.store.BeginCleanup(view, id); err != nil {
@@ -535,7 +591,13 @@ func (e *Engine) Cleanup(ctx context.Context) error {
 	if err := e.cleanupViewLocked(ctx, view); err != nil {
 		return e.recoveryFailureLocked(err)
 	}
+	e.crowd.activateLocked(nil)
 	e.healthy.Store(true)
+	if err := e.publishEmptyLookupLocked(); err != nil {
+		e.abortLookupLocked()
+		e.healthy.Store(false)
+		return err
+	}
 	return nil
 }
 
@@ -553,6 +615,7 @@ func (e *Engine) Close() {
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 	e.mu.Lock()
+	e.abortLookupLocked()
 	e.crowd.closeLocked()
 	e.healthy.Store(false)
 	e.mu.Unlock()
@@ -577,6 +640,7 @@ func (e *Engine) degraded() bool {
 }
 
 func (e *Engine) recoveryFailureLocked(err error) error {
+	e.abortLookupLocked()
 	e.healthy.Store(false)
 	return err
 }

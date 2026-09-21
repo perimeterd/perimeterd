@@ -92,6 +92,13 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	} {
 		probeDockerEgress(t, fixture, peer, listener.network, listener.address)
 	}
+	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
+		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(18080)), "blocked")
+		outcome, ok := lookupOutcome(response, "blocked", "policy")
+		if !ok || outcome.Attachment.PortBasis != "original_destination" {
+			t.Fatalf("Docker original-destination lookup for %s omitted managed policy/port basis: %+v", address, response.Outcomes)
+		}
+	}
 
 	// Put a foreign reject after the managed jump; the 18081 mapping must then
 	// fail, proving that perimeterd's RETURN cannot bypass downstream authority.
@@ -101,6 +108,12 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	}
 	fixture.peerProbe(t, "tcp4", fixtureIPv4Host+":18081", "reject")
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18081", "reject")
+	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
+		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(18081)), "not_blocked")
+		if len(response.Outcomes) != 1 || response.Outcomes[0].Attachment.PortBasis != "original_destination" {
+			t.Fatalf("foreign Docker denial was attributed to perimeterd for %s: %+v", address, response.Outcomes)
+		}
+	}
 	baseline := dockerForeignSnapshot(t)
 	before := activeIPTablesRevision()
 	writeDockerCoexistenceConfig(t, configPath, "reject", false, containerIPs, "DOCKER-USER")
@@ -110,6 +123,12 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	// so the 18080 policy does not match and the published mapping succeeds.
 	fixture.peerProbe(t, "tcp4", fixtureIPv4Host+":18080", "success")
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18080", "success")
+	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
+		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(8080)), "not_blocked")
+		if len(response.Outcomes) != 1 || response.Outcomes[0].Attachment.PortBasis != "current_destination" {
+			t.Fatalf("Docker current-destination lookup for %s retained original-port denial: %+v", address, response.Outcomes)
+		}
+	}
 	if got := dockerForeignSnapshot(t); !bytes.Equal(got, baseline) {
 		t.Fatalf("Docker/foreign rules changed across original-destination reload:\n%s", got)
 	}
@@ -122,6 +141,12 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	waitForIPTablesCommit(t, before)
 	fixture.peerProbe(t, "tcp4", fixtureIPv4Host+":18080", "reject")
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18080", "reject")
+	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
+		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(18080)), "blocked")
+		if outcome, ok := lookupOutcome(response, "blocked", "policy"); !ok || outcome.Attachment.PortBasis != "original_destination" {
+			t.Fatalf("rejected Docker reload changed lookup authority for %s: %+v", address, response.Outcomes)
+		}
+	}
 	if got := dockerForeignSnapshot(t); !bytes.Equal(got, baseline) {
 		t.Fatalf("Docker/foreign rules changed across policy reload:\n%s", got)
 	}
@@ -138,6 +163,9 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18080", "reject")
 
 	daemon.stop(t)
+	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
+		requireLookupUnknown(t, lookupCommand(t, address, "ingress", "tcp", new(uint16(18080))), address)
+	}
 	if got := dockerForeignSnapshot(t); !bytes.Equal(got, baseline) {
 		t.Fatalf("Docker/foreign rules changed across daemon stop:\n%s", got)
 	}
