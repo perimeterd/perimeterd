@@ -8,6 +8,23 @@ status; a requirement below does not imply that its integration or CI job exists
 The Go module pins Go 1.27.1; see the official
 [Go release history](https://go.dev/doc/devel/release).
 
+## Contents
+
+- [Current repository layout](#current-repository-layout)
+- [Pure compiler API](#pure-compiler-api)
+- [Local commands](#local-commands)
+  - [Native namespace gate](#native-namespace-gate)
+  - [Docker gate](#real-docker-coexistence-gate)
+  - [Real-LAPI gate](#real-lapi-compatibility-gate)
+  - [OpenZiti gate](#real-openziti-transport-gate)
+- [Opt-in scale measurements](#opt-in-scale-measurements)
+- [Version 1 verification and delivery requirements](#version-1-verification-and-delivery-requirements)
+- [Verification matrix](#verification-matrix)
+- [Privileged end-to-end suite](#privileged-end-to-end-suite)
+- [Pull-request and branch CI](#pull-request-and-branch-ci)
+- [Release workflow](#release-workflow)
+- [License discipline](#license-discipline)
+
 ## Current repository layout
 
 ```text
@@ -15,16 +32,16 @@ cmd/perimeterd/main.go
 internal/app/                 lifecycle, candidates, serialized writer, HTTP and notifications
 internal/cli/                 command dispatch, validation, lookup and version reporting
 internal/config/              YAML schema, defaults and strict validation
-internal/config/catalog/      checked-in selector catalogs
+internal/config/catalog/      checked-in country/group/RIR catalogs and ASN validation
 internal/crowdsec/            bounded LAPI adapter, authoritative store and timed projection
 internal/lookup/              pure applied-state evaluation, attribution and private query transport
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
-internal/source/              RIPEstat resolution, immutable cache and local HTTP fixtures
+internal/source/              RIPEstat, text-list/provider resolution and immutable cache
 internal/state/               revision store, record codec/validation and durable filesystem IO
 internal/upstream/            identity capture, bounded SDK admission and service-bound HTTP pools
-configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
+configs/perimeterd.yaml       annotated complete configuration example
 .github/workflows/ci.yml      quality, build, unit/race, native firewall, Docker, LAPI and Ziti gates
 .github/workflows/codeql.yml  Go security analysis
 tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
@@ -114,10 +131,10 @@ isolated packet interpreter is test-only.
 
 The `Makefile` is the source of truth for executable local gates and scale
 profiles. It provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`,
-`build`, `build-e2e`, `test-e2e`, `test-docker`, `test-crowdsec`, `verify`, and the four opt-in
-scale targets. Use Go 1.27.1, or enable automatic toolchain selection when the
-installed Go is older. The race target requires a native C compiler and
-enables CGO for that command.
+`build`, `build-e2e`, `test-e2e`, `test-crowdsec`, `test-openziti`, `test-docker`,
+`verify`, and the four opt-in scale targets. Use Go 1.27.1, or enable automatic
+toolchain selection when the installed Go is older. The race target requires a
+native C compiler and enables CGO for that command.
 
 ### Correctness and build gates
 
@@ -230,18 +247,20 @@ The fixture imports the statically linked E2E executable into a scratch image;
 no container image pull or live RIPEstat request is needed.
 
 Both iptables-nft and iptables-legacy run the same IPv4/IPv6 bridge scenarios.
-Published host ports `18080` and `18081` map to container port `8080`, proving
-original-destination selection and its translated-port contrast. A global
-block on globally classified container addresses makes the external-interface
-egress check meaningful; private/ULA addresses would bypass denial through the
-built-in allowlist. The gate also verifies downstream foreign denial, missing-parent
-reload rejection, retained enforcement on stop, owned cleanup, and preservation
-of Docker/foreign rules and default policies across all iptables tables.
+Published host ports `18080` and `18081` map to container port `8080`; the
+fixture checks original-destination matching, its translated-port contrast,
+external-interface scoping, unrelated container egress, downstream foreign
+denial, missing-parent reload rejection, retained enforcement on stop, owned
+cleanup, and preservation of Docker/foreign rules and default policies across
+all iptables tables. The address choice keeps the egress denial check meaningful:
+private/ULA container addresses would bypass denial through the built-in allowlist.
 
 Both targets run a security-isolation regression against a private stand-in
 for securityfs, including on hosts without AppArmor. It verifies that policy
 interfaces are hidden, the mask is read-only, and underlying policy files are
-unchanged; it never loads or replaces real host profiles.
+unchanged; it never loads or replaces real host profiles. See the
+[Docker attachment contract](firewall-backends.md#docker-docker-user-attachment)
+for packet-path ownership and attachment semantics.
 
 `test-e2e` skips the real-engine scenario unless `PERIMETERD_DOCKER_E2E=1`;
 use `test-docker` to supply the complete contract. Docker's native nftables
@@ -260,15 +279,52 @@ CROWDSEC_CONTAINER_RUNTIME=podman make test-crowdsec
 
 It runs a digest-pinned CrowdSec v1.8.1 container on an isolated network with
 an ephemeral loopback port, private SQLite data, and the normal chunked stream.
-It verifies duplicate-prefix IDs, incremental updates without retransmitting
-the active snapshot, deletion of the longer overlap, reconnect, and
-authoritative emptiness. The fixture is destroyed afterward.
+The compatibility cases cover duplicate-prefix IDs, incremental updates without
+retransmitting the active snapshot, deletion of the longer overlap, reconnect,
+and authoritative emptiness. The fixture is destroyed afterward.
 
 The known query-error behavior in
 [crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691)
 is an accepted temporary upstream risk, not a compatibility-test condition.
 Do not inject database faults or introduce full-list polling to work around it.
-See the [supported LAPI contract](data-sources.md#supported-lapi-contract).
+See the [supported LAPI contract](data-sources.md#supported-lapi-contract) for
+the wire and authority requirements.
+
+### Real OpenZiti transport gate
+
+The [architecture](architecture.md#optional-openziti-upstream-transport),
+[configuration](configuration.md#optional-openziti-configuration),
+and [transport contract](data-sources.md#openziti-upstream-transport)
+own the feature. The standard binary pins unmodified `sdk-golang v1.8.2`;
+the real fixture pins OpenZiti controller/router/CLI **2.0.4** and CrowdSec
+**1.8.1**. No build tag, SDK shared library, host tunneler, enrollment, or
+credential is required to run a direct-only deployment. Static `linux/amd64`
+and `linux/arm64` builds remain supported.
+
+With the [native prerequisites](#privileged-end-to-end-suite) installed, provide
+the pinned `ziti` executable and a directory containing the real `crowdsec` and
+`cscli` binaries (symlinks into the release archive are sufficient):
+
+```sh
+E2E_SUDO=sudo \
+ZITI_TEST_BINARY=/absolute/path/to/ziti \
+CROWDSEC_TEST_BINDIR=/absolute/path/to/crowdsec-bin \
+make test-openziti
+```
+
+The gate verifies versions, creates private user/network/mount/PID namespaces,
+and provisions disposable controller/router, enrolled identities, services,
+HTTP(S) list endpoints, and two real LAPIs. It runs nftables, iptables-legacy,
+and iptables-nft. CI verifies SHA-256 checksums before extracting fixture
+archives; update versions and checksums together. No production identity,
+controller, LAPI, or host tunneler is used.
+
+Native cases cover mixed direct/private feeds, unresolved application names,
+proxy and cross-origin escape rejection, HTTPS hostname validation, denied
+services, same-path identity rotation, IPv4/IPv6 enforcement and lookup,
+shared list/LAPI identity use, and a same-URL/same-key LAPI service replacement
+that requires a new full snapshot without retaining the old authority.
+Stopping the replacement LAPI proves finite IPv6 decision expiry during outage.
 
 ### Target inventory and pinned tools
 
@@ -286,6 +342,7 @@ The executable target inventory is:
 | `build-e2e` | Build the E2E binary and check native tool prerequisites |
 | `test-e2e` | Build and run the isolated Linux namespace/backend scenarios |
 | `test-crowdsec` | Run the digest-pinned real LAPI streaming compatibility scenarios |
+| `test-openziti` | Run the real pinned OpenZiti list/LAPI transport scenarios across all three native backend variants |
 | `test-docker` | Run real isolated Docker bridge coexistence with both iptables tool families |
 | `verify` | Run `go mod verify`, `fmt-check`, `lint`, `vuln`, `build`, and `test` |
 | `bench-scale-small` | Run baseline control-plane/serialization benchmarks with `-benchmem` |
@@ -531,40 +588,9 @@ own behavior; keep their checks in the existing verification gates.
 
 ### Optional OpenZiti transport
 
-The [architecture](architecture.md#optional-openziti-upstream-transport),
-[configuration](configuration.md#optional-openziti-configuration),
-and [transport contract](data-sources.md#openziti-upstream-transport)
-own the feature. The standard binary pins unmodified `sdk-golang v1.8.2`;
-the real fixture pins OpenZiti controller/router/CLI **2.0.4** and CrowdSec
-**1.8.1**. No build tag, SDK shared library, host tunneler, enrollment, or
-credential is required to run a direct-only deployment. Static `linux/amd64`
-and `linux/arm64` builds remain supported.
-
-With the [native prerequisites](#privileged-end-to-end-suite) installed, provide
-the pinned `ziti` executable and a directory containing the real `crowdsec` and
-`cscli` binaries (symlinks into the release archive are sufficient):
-
-```sh
-E2E_SUDO=sudo \
-ZITI_TEST_BINARY=/absolute/path/to/ziti \
-CROWDSEC_TEST_BINDIR=/absolute/path/to/crowdsec-bin \
-make test-openziti
-```
-
-The gate verifies versions, creates private user/network/mount/PID namespaces,
-and provisions disposable controller/router, enrolled identities, services,
-HTTP(S) list endpoints, and two real LAPIs. It runs nftables, iptables-legacy,
-and iptables-nft. CI verifies SHA-256 checksums before extracting fixture
-archives; update versions and checksums together. No production identity,
-controller, LAPI, or host tunneler is used.
-
-Native cases cover mixed direct/private feeds, unresolved application names,
-proxy and cross-origin escape rejection, HTTPS hostname validation, denied
-services, same-path identity rotation, IPv4/IPv6 enforcement and lookup,
-shared list/LAPI identity use, and a same-URL/same-key LAPI service replacement
-that requires a new full snapshot without retaining the old authority.
-Stopping the replacement LAPI proves finite IPv6 decision expiry during outage.
-Focused adapter/cache/lifecycle tests cover the remaining boundaries below.
+See the [real OpenZiti gate](#real-openziti-transport-gate) for pinned fixtures,
+commands, and native scenarios. Focused adapter/cache/lifecycle tests cover the
+remaining boundaries below.
 
 | Contract | Concrete behavior or boundary | Verification layer |
 | --- | --- | --- |
@@ -579,14 +605,15 @@ Focused adapter/cache/lifecycle tests cover the remaining boundaries below.
 | Secret and deployment boundary | Identity/config/key/token material never appears in logs, metrics, or durable evidence; SDK inclusion preserves supported static builds and introduces no extra direct-only installation/service requirements. | Error/log capture, saved-state inspection, cross-build and existing delivery gates |
 
 Use isolated disposable infrastructure, not an operator's Ziti network. A fake
-dialer cannot establish no-fallback, authorization, cancellation, or SDK lifecycle
-behavior. `TestControllerStallDoesNotBlockCallerOrManagerShutdown` exercises the
-real SDK against a stalled HTTPS controller. The adapter joins the SDK's public
-capability-discovery barrier before authentication to avoid its initial TLS
-configuration race; the wait remains admitted and does not block caller
-cancellation or manager shutdown. This ordering does not repair the documented
-SDK-internal cleanup limitation. Keep existing native, Docker, CrowdSec
-compatibility, lookup, lint, and race gates passing.
+dialer cannot establish no-fallback, authorization, cancellation, or SDK
+lifecycle behavior. `TestControllerStallDoesNotBlockCallerOrManagerShutdown`
+exercises the real SDK against a stalled HTTPS controller; the accepted
+[unmodified SDK cleanup limitation](data-sources.md#sdk-cancellation-limitation)
+still applies, so do not claim all SDK work drains. The capability-discovery
+ordering and the complete transport contract belong to the canonical
+[data-sources](data-sources.md#openziti-upstream-transport) reference. Keep
+existing native, Docker, CrowdSec compatibility, lookup, lint, and race gates
+passing.
 
 ### Metrics
 

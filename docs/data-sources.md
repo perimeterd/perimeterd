@@ -410,35 +410,37 @@ object. Different configured names remain distinct selectors even if they use
 the same URL.
 
 The same checksums, bounded decoding, durability barriers, exact-reference
-recovery, and garbage-collection rules apply. Recovery reads the object IDs
-recorded in the manifest rather than reconstructing IDs with the current schema.
+recovery, and garbage-collection rules apply; see
+[immutable selector objects and snapshot manifests](#immutable-selector-objects-and-snapshot-manifests)
+for the common manifest contract. Recovery reads the object IDs recorded in
+the manifest rather than reconstructing IDs with the current schema.
 
 ### Per-list refresh and complete snapshots
 
 Only lists referenced by enabled policies are fetched or scheduled. Each uses
 its own positive `refresh_interval` (default `24h`) and `request_timeout`
-(default `30s`), independent of `geo` timings. There is no additional custom-list
-jitter setting. Freshness is measured from successful retrieval, not manifest
-creation or firewall application.
+(default `30s`), independent of `geo` timings. There is no additional
+custom-list jitter setting. Freshness is measured from successful retrieval,
+not manifest creation or firewall application.
 
-One static scheduler selects the earliest required source deadline, fetching
-due/missing selectors and reusing fresh objects from the committed manifest.
-RIPEstat retains its existing jittered schedule; a list deadline must not force
-a still-fresh RIPEstat selector or another list to be downloaded. Each attempt
-stages one complete candidate for the active configuration, with the existing
-epoch and refresh-sequence admission fences. A later candidate must account
-for all currently due selectors, not overwrite a newer source result from an
-independent list worker.
+A single static scheduler applies the [common freshness and fallback
+rules](#fresh-reuse-and-stale-fallback): it selects due or missing sources and
+reuses fresh objects from the committed manifest. RIPEstat retains its
+jittered schedule; a list deadline must not force a still-fresh RIPEstat
+selector or another list to download. Each attempt stages one complete
+candidate for the active configuration under the existing epoch and
+refresh-sequence admission fences, and a later candidate accounts for all
+currently due selectors rather than overwriting a newer source result.
 
-A failed attempt retains the entire committed snapshot and its retrieval
-timestamps. Retry failed due selectors after their configured intervals, not in
-a tight loop caused by stale retrieval times; other sources keep their own
-deadlines. Do not publish successful partial fetches with stale replacements
-for failed selectors. Cache freshness and next retry time are separate concepts.
-Only selectors selected for fetching receive a retry deadline; a reused peer
-that expires during another request is not treated as failed. Because publication
-requires one complete snapshot, a stale selector's outstanding retry cooldown
-can defer the whole transaction, without moving other selectors' own deadlines.
+When a list attempt fails, retain the entire committed snapshot and its
+retrieval timestamps. Retry failed due selectors after their configured
+intervals, not in a tight loop caused by stale retrieval times; other sources
+keep their own deadlines. Do not publish successful partial fetches with stale
+replacements. Only selectors selected for fetching receive a retry deadline; a
+reused peer that expires during another request is not treated as failed.
+Because publication requires one complete snapshot, a stale selector's
+outstanding retry cooldown can defer the whole transaction without moving
+other selectors' own deadlines.
 
 First start needs every required selector to resolve. Restart and reload may
 use the complete committed fallback only when it covers every required
@@ -733,7 +735,7 @@ It must not delegate recovery to `StreamBouncer.Run`: the current
 [implementation](https://raw.githubusercontent.com/crowdsecurity/go-cs-bouncer/main/stream_bouncer.go)
 keeps `Startup=false` after post-start errors and does not implement this
 design's reconnect contract. The implementation pins `go-cs-bouncer v0.0.21`
-and the patched `crowdsec v1.8.1` SDK in `go.mod`; it does not run the SDK poller.
+and the `crowdsec v1.8.1` SDK in `go.mod`; it does not run the SDK poller.
 CrowdSec describes bouncers as
 [remediation components](https://docs.crowdsec.net/u/bouncers/intro/) that act
 on Security Engine decisions.
@@ -790,8 +792,8 @@ therefore replace CrowdSec authority with an incomplete or empty set; restoring
 all omitted decisions may require a later full synchronization. Static global
 and geo policy are not replaced by CrowdSec snapshots.
 
-As of 2026-09-17, this risk is deliberately accepted because CrowdSec is an
-additional protection layer. Perimeterd proceeds under the normal stream
+This risk is deliberately accepted because CrowdSec is an additional protection
+layer. Perimeterd proceeds under the normal stream
 contract while the issue is addressed upstream. Do not add a database-fault
 regression for this condition, block current-server support on it, downgrade
 the server, or substitute repeated full-list downloads. The compatibility

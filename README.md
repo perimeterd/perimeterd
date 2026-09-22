@@ -2,17 +2,13 @@
 
 # perimeterd
 
-`perimeterd` adds geographic/ASN policy, custom HTTP(S) IP lists, and IP/CIDR allow/block overrides to an
-existing Linux firewall. It filters unwanted ingress and egress traffic; the
-parent firewall remains responsible for permitting services and ports.
+`perimeterd` adds geographic/ASN policy, custom and provider IP lists, CrowdSec
+ingress bans, and IP/CIDR allow/block overrides to an existing Linux firewall.
+It filters unwanted ingress and egress traffic; the parent firewall remains
+responsible for permitting services and ports.
 
-> **Implemented:** offline validation, source-backed nftables and iptables/ipset
-> enforcement, custom HTTP(S) text IP lists, dynamic named-provider selectors,
-> CrowdSec ingress bans, and Docker bridge coexistence through
-> `DOCKER-USER` with Docker's iptables backend. The runtime includes durable
-> recovery, static caching, renewable leases, and isolated packet-path tests.
->
-> Installed service/package artifacts and production releases remain planned.
+> **Pre-release:** build and run from source. Installed service/package artifacts
+> and production releases remain planned.
 > **This is not yet a production-ready security control.**
 
 The [implementation plan](docs/implementation-plan.md) tracks completed

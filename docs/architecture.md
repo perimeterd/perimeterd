@@ -18,6 +18,19 @@ Related contracts live in [configuration](configuration.md),
 [operations](operations.md), and [development](development.md). The
 [documentation map](../README.md#documentation) identifies each owner.
 
+## Contents
+
+- [System context and data flow](#system-context-and-data-flow)
+- [Conceptual contracts](#conceptual-contracts)
+- [Read-only lookup and explanation](#read-only-lookup-and-explanation)
+- [Revision lifecycle](#revision-lifecycle)
+- [Candidate freshness](#candidate-freshness)
+- [Durable apply and crash recovery](#durable-apply-and-crash-recovery)
+- [Backend and target migration](#backend-and-target-migration)
+- [Failure safety](#failure-safety)
+- [Security and trust boundaries](#security-and-trust-boundaries)
+- [Future deployment boundaries](#future-deployment-boundaries)
+
 ## System context and data flow
 
 ```mermaid
@@ -343,18 +356,20 @@ report retrieval age rather than interpreting staleness as an empty set.
 
 ### Pure evaluator and provenance
 
-Promote/reuse the semantics exercised by the existing test-only packet
-evaluator as a production backend-neutral evaluator. Evaluate compiled rule
-order, not just prefix membership, and preserve the existing
-[evaluation contract](configuration.md#evaluation-semantics). Do not implement
-separate nftables and iptables policy engines or reverse-parse generated rules
-in the CLI.
+The production backend-neutral evaluator in `internal/lookup` evaluates compiled
+rule order, not just prefix membership, and preserves the existing
+[evaluation contract](configuration.md#evaluation-semantics). The daemon uses it
+for applied-state queries; the CLI remains a transport client. Neither path
+implements separate nftables and iptables policy engines or reverse-parses
+generated rules.
 
-For a CIDR, partition at relevant prefix boundaries; for omitted traffic
-filters, partition at relevant protocol and port-scope boundaries. Evaluate
-each resulting scope and coalesce only equivalent outcomes, retaining distinct
-deciding reasons and attribution. Never enumerate IPv4 or IPv6 hosts, test only
-the network address, or infer full coverage from one matching prefix.
+For a CIDR, the evaluator partitions at relevant prefix boundaries; for omitted
+traffic filters, it partitions at relevant protocol and port-scope boundaries.
+It evaluates each resulting scope and coalesces only equivalent outcomes,
+retaining distinct deciding reasons and attribution. Never enumerate IPv4 or
+IPv6 hosts, test only the network address, or infer full coverage from one
+matching prefix.
+
 Reuse immutable snapshots and existing prefix algebra; do not copy the entire
 compiled state or every source feed for each query.
 
@@ -365,27 +380,28 @@ memberships must not be presented as independently deciding rules.
 
 ### Private query transport and lifecycle
 
-Use a separate HTTP-over-Unix-domain-socket endpoint, `POST /v1/lookup`, at
-`/run/perimeterd/lookup.sock`. The request is a JSON object with required string
-`address` and optional `direction`, `protocol`, and integer `port`, using the
-operator contract's values and omission semantics. Reject unknown fields,
-duplicate keys, invalid types, trailing JSON, and unsupported API versions.
-`--json` controls CLI rendering, not query semantics. The endpoint returns the
-versioned result described in [operations](operations.md#lookup-results-and-errors).
-This is not exposed on the unauthenticated metrics listener or a TCP port.
+The running daemon exposes a separate HTTP-over-Unix-domain-socket endpoint,
+`POST /v1/lookup`, at `/run/perimeterd/lookup.sock`. The request is a JSON
+object with required string `address` and optional `direction`, `protocol`, and
+integer `port`, using the operator contract's values and omission semantics.
+The server rejects unknown fields, duplicate keys, invalid types, trailing JSON,
+and unsupported API versions. `--json` controls CLI rendering, not query
+semantics. The endpoint returns the versioned result described in
+[operations](operations.md#lookup-results-and-errors). It is not exposed on
+the unauthenticated metrics listener or a TCP port.
 The socket is root-owned mode `0600` inside the existing root-owned `0700`
 runtime directory. Initial access is root-only; remote access, delegated group
 access, arbitrary socket paths, and administrative mutation methods are outside
 this feature.
 
-`run` acquires the existing lifecycle lock before managing the socket. Only
-that owner may remove a verified stale socket at the fixed path; a symlink,
-non-socket, or unexpected owner is an error, not permission to unlink arbitrary
-files. Bind before readiness, answer unavailable until a coherent view is
-published, and keep the listener across configuration reloads. Failure to bind
-prevents successful startup. On shutdown, stop admission and drain/cancel
-queries before releasing ownership; remove only the socket inode this process
-created. Never unlink or replace `owner.lock`.
+At startup, `run` acquires the existing lifecycle lock before managing the
+socket. Only that owner may remove a verified stale socket at the fixed path; a
+symlink, non-socket, or unexpected owner is an error, not permission to unlink
+arbitrary files. The listener binds before readiness, answers unavailable until
+a coherent view is published, and remains across configuration reloads. Failure
+to bind prevents successful startup. Before releasing lifecycle ownership,
+shutdown stops admission, drains/cancels queries, and removes only the socket
+inode this process created. It never unlinks or replaces `owner.lock`.
 
 The CLI connects without taking the lifecycle lock or opening the durable store.
 Queries cannot fetch or refresh sources, read credentials, renew leases, enqueue
@@ -393,15 +409,15 @@ reconciliation, invoke backend inspection/mutation, reset counters, or change
 readiness. A stopped daemon yields unavailable even if retained static rules
 still exist. There is no implicit offline or configuration-file fallback.
 
-Bound each request body to 4 KiB, each complete encoded response to 4 MiB, and
-each query to 4,096 combined outcome/evidence records. Admit at most four
-concurrent evaluations; excess requests fail busy rather than grow an unbounded
-queue. Apply a five-second end-to-end client deadline and bounded server
-read/evaluation/write deadlines, checking cancellation during partitioning and
-attribution. A limit failure returns an explicit error, never a truncated
-answer labeled complete. Encode within the response bound before sending a
-successful result. Do not hold the writer while evaluating or waiting for a
-slow client.
+The implementation bounds each request body to 4 KiB, each complete encoded
+response to 4 MiB, and each query to 4,096 combined outcome/evidence records.
+It admits at most four concurrent evaluations; excess requests fail busy rather
+than grow an unbounded queue. The client deadline is five seconds, with bounded
+server read/evaluation/write deadlines and cancellation checks during
+partitioning and attribution. A limit failure returns an explicit error, never a
+truncated answer labeled complete. Responses are encoded within the size bound
+before a successful result is sent, and evaluation does not hold the writer or
+wait for a slow client.
 
 This interface describes the daemon's applied-policy view for traffic reaching
 the reported managed attachment. It neither probes connectivity nor proves

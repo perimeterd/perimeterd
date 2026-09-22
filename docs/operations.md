@@ -14,6 +14,23 @@ authoritative for delivery status.
 > payloads, and release artifacts remain planned.
 > A full-schema configuration is not a capability list.
 
+## Contents
+
+- [Current source-build runtime](#current-source-build-runtime)
+- [Custom IP list operations](#custom-ip-list-operations)
+- [Named provider operations](#named-provider-operations)
+- [OpenZiti operations](#openziti-operations)
+- [IP/CIDR lookup](#ipcidr-lookup)
+- [Operator sequence](#operator-sequence)
+- [Supported CrowdSec LAPI prerequisite](#supported-crowdsec-lapi-prerequisite)
+- [Lifecycle lock and recovery](#lifecycle-lock-and-recovery)
+- [Installed layout](#installed-layout)
+- [systemd service contract](#systemd-service-contract)
+- [Prometheus metrics](#prometheus-metrics)
+- [Logging](#logging)
+- [Packages](#packages)
+- [Package lifecycle](#package-lifecycle)
+
 ## Current source-build runtime
 
 The current binary implements:
@@ -274,7 +291,8 @@ owns coherent state publication, transport, security, and resource bounds.
 
 ### Query input and scope
 
-The planned command shape is:
+**Implemented source-build command.** `lookup` queries the running daemon; it
+does not compile the current YAML or contact sources itself.
 
 ```text
 perimeterd lookup IP_OR_CIDR
@@ -284,13 +302,13 @@ perimeterd lookup IP_OR_CIDR
     [--json]
 ```
 
-Examples, to be used only after implementation:
+Examples:
 
 ```sh
-sudo perimeterd lookup 8.8.8.8
-sudo perimeterd lookup 8.8.8.8 --direction ingress --protocol tcp --port 443
-sudo perimeterd lookup 8.8.8.0/24 --direction ingress --protocol tcp --port 443
-sudo perimeterd lookup 2001:4860:4860::8888 --json
+sudo bin/perimeterd lookup 8.8.8.8
+sudo bin/perimeterd lookup 8.8.8.8 --direction ingress --protocol tcp --port 443
+sudo bin/perimeterd lookup 8.8.8.0/24 --direction ingress --protocol tcp --port 443
+sudo bin/perimeterd lookup 2001:4860:4860::8888 --json
 ```
 
 - Accept exactly one IPv4/IPv6 address or CIDR, never a hostname or URL.
@@ -324,7 +342,7 @@ whether metrics are enabled.
 
 ### Lookup results and errors
 
-Use these verdicts in both human and JSON output:
+The implemented command uses these verdicts in both human and JSON output:
 
 | Verdict | Meaning |
 | --- | --- |
@@ -340,7 +358,7 @@ Allowlist misses are denial by absence, not evidence of membership in a blocking
 feed. "Not blocked" deliberately does not mean ACCEPT: other firewall rules can
 still deny after perimeterd returns.
 
-The version-1 result envelope must contain:
+The implemented version-1 result contract requires an envelope containing:
 
 - `schema_version: 1`, canonical query and effective new-flow assumptions,
   aggregate `verdict`, and an explicit error code/message when not complete;
@@ -406,14 +424,17 @@ capability auto-selection or fallback after an apply error. Use a complete
 configuration document, not one of the root-level fragments in
 [Configuration](configuration.md#document-and-fragment-forms).
 
-An explicit `firewall.iptables.attachments: []` clears the default attachment
-jumps and is accepted by local validation. When iptables is selected, a
-non-empty desired policy then fails runtime reconciliation before mutation
-because it has no managed packet path. nftables ignores this list. Only the
-canonical [empty desired state](configuration.md#empty-desired-state) may
-converge to no owned artifacts; do not infer active enforcement from
-administrator-managed jumps. See the
-[iptables attachment contract](firewall-backends.md#iptables-attachment-contract).
+The attachment schema, defaults, and offline normalization are owned by
+[Configuration](configuration.md#iptables-attachments). Offline validation
+accepts an explicit `firewall.iptables.attachments: []`; at runtime it means no
+managed attachment jumps. With iptables selected, a non-empty desired policy
+then fails reconciliation before mutation because it has no managed packet path;
+nftables ignores this list.
+See the [iptables attachment contract](firewall-backends.md#iptables-attachment-contract)
+for ownership and packet-path guarantees.
+Only the canonical [empty desired state](configuration.md#empty-desired-state)
+may converge to no owned artifacts; administrator-managed jumps do not count as
+active enforcement.
 
 ### Start and check health
 

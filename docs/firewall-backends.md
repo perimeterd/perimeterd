@@ -297,22 +297,16 @@ the source inputs are non-mapped. Both backends preserve those residuals as
 
 ## iptables attachment contract
 
-`firewall.iptables.attachments` is the managed integration boundary. Each
-normalized entry contains:
-
-| Field | Meaning |
-| --- | --- |
-| `chain` | Existing parent chain; perimeterd never creates or flushes it |
-| `direction` | `ingress` or `egress` remote-address interpretation |
-| `input_interfaces` | Optional allowed input-interface matches |
-| `output_interfaces` | Optional allowed output-interface matches |
-| `original_destination` | Optional pre-DNAT destination-port matching |
+`firewall.iptables.attachments` is the managed integration boundary.
+[Configuration](configuration.md#iptables-attachments) owns its schema,
+defaults, normalization, and offline validation. At runtime, each normalized
+attachment identifies an existing parent chain, a direction, optional
+interface constraints, and optional pre-DNAT destination-port matching.
 
 Runtime verifies every parent chain before reconciliation and inserts managed
-jumps matching each normalized attachment's interface constraints, with an exact
-perimeterd ownership comment. Only that comment-tagged jump may be replaced or
-deleted. A missing parent is an apply error and leaves the previous state
-selected.
+jumps matching the normalized interface constraints, with an exact perimeterd
+ownership comment. Only that comment-tagged jump may be replaced or deleted. A
+missing parent is an apply error and leaves the previous state selected.
 
 Omitting the list retains the default host attachments:
 

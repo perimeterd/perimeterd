@@ -10,6 +10,11 @@ source explanations, optional embedded OpenZiti transport for LAPI/custom lists,
 operational integration, and release gates.
 Implemented does not mean production-ready; the remaining gates below still apply.
 
+Use [Status at a glance](#status-at-a-glance) for delivered capabilities and
+[Operational and release gates](#10-operational-and-release-gates) for remaining
+work. Completed milestones below are delivery summaries, not separate schema,
+algorithm, or test specifications.
+
 ## Status at a glance
 
 | Area | Status | Next boundary |
@@ -89,208 +94,112 @@ the [source requirements](development.md#sources-and-compatibility).
 
 **Status:** implemented.
 
-| Milestone | Status | Delivered behavior or remaining acceptance |
+| Delivered capability | Canonical contract | Verification |
 | --- | --- | --- |
-| CrowdSec | Implemented | Authoritative startup synchronization, decision updates/removals, expiry, renewable leases, reload handover, and pinned real-LAPI compatibility |
-| iptables/ipset | Implemented | Packet-policy parity, family-by-family commit and compensation, ownership fencing, recovery, and backend migration |
-| Coexistence | Implemented | Real Docker-generated `DOCKER-USER` integration, pre-DNAT port matching, preserved container egress, and foreign-state preservation |
+| CrowdSec startup/reconnect authority, decision identity, finite leases, expiry, and reload handover | [CrowdSec source contract](data-sources.md#supported-lapi-contract) | [Source and compatibility matrix](development.md#sources-and-compatibility); `make test-crowdsec` |
+| iptables-legacy and iptables-nft parity, per-family compensation, ownership fencing, and backend migration | [iptables/ipset backend](firewall-backends.md#iptables-and-ipset) | [Kernel backend matrix](development.md#kernel-backend-and-coexistence); `make test-e2e` |
+| Docker `DOCKER-USER` integration, original-destination matching, interface scoping, and foreign-state preservation | [Docker attachment contract](firewall-backends.md#docker-docker-user-attachment) | [Real Docker gate](development.md#real-docker-coexistence-gate); `make test-docker` |
 
-**iptables/ipset:** both legacy and nf_tables tool families support direct and
-source-backed IPv4/IPv6 policy, `/0` lowering, interface-constrained custom
-attachments, original-destination ports, stable native accounting, and owned
-cleanup. Isolated tests cover second-family failures, compensation, crashes, and
-bidirectional backend migration.
-
-**CrowdSec:** bounded wire validation preserves decision identity and absolute
-expiry. The writer admits current authority separately from durable targets;
-renewal does not require a desired-state change, and decisions and credential
-contents are never persisted as recovery authority. Both backends use finite
-leases capped at 24 hours. Tests cover staged reload/reconnect, failed writes,
-credential rotation, uncertain commit, packet enforcement, expiry without the
-daemon, and cleanup. `make test-crowdsec` runs the digest-pinned v1.8.1 stream
-compatibility gate.
-
-**Docker:** `make test-docker` starts a private real Docker Engine in isolated
-namespaces and exercises both iptables-nft and iptables-legacy with IPv4 and IPv6.
-The gate verifies remapped published ports with and without original-destination
-matching, external-interface scoping, downstream foreign denial, rejected
-missing-parent reloads, retained enforcement on stop, and owned-only cleanup.
-Docker rules and default policies remain unchanged. A separate privileged CI job
-pins Docker 29.8.1. The verified scope is Docker's iptables bridge backend, not
-Docker's native nftables backend, rootless networking, or Swarm; see the
-[Docker attachment contract](firewall-backends.md#docker-docker-user-attachment).
-
-The known LAPI query-error behavior is an accepted temporary upstream risk tracked in
-[crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691).
-It is not fault-tested or worked around with full-list polling; see
-[data sources](data-sources.md#supported-lapi-contract).
+Docker support is limited to its iptables bridge backend, not its native nftables
+backend, rootless networking, or Swarm. The known LAPI query-error behavior remains
+an accepted upstream risk, not a local polling workaround or release-blocking
+fault-injection requirement; see the [supported LAPI contract](data-sources.md#supported-lapi-contract).
 
 ## 6. Custom HTTP(S) text IP lists
 
 **Status:** implemented for nftables and iptables/ipset.
 
-Named `ip_lists` definitions provide HTTP(S) URLs, per-list refresh intervals,
-and request timeouts. Both include and exclude selectors support list-only and
-mixed country/ASN/list policy through the existing union/subtraction compiler.
-Validation remains offline; unused lists are not fetched.
+Named `ip_lists` provide HTTP(S) URLs, independent refresh intervals and request
+timeouts, and include/exclude selectors that compose with country/ASN policy.
+Validation remains offline; only enabled references fetch.
 
-The resolver validates complete bounded text responses with exact list URL/parser
-identity. This milestone introduced version-2 immutable objects/manifests;
-step 9 extends new evidence to version 3. Legacy RIPEstat and direct-list
-recovery still loads, stabilizes, and retains its original object IDs.
-The shared scheduler preserves independent deadlines and applies retry
-cooldowns only to selectors chosen for fetching. URL changes cannot use old
-endpoint fallback; malformed or unavailable feeds never publish partial state.
+Bounded parsing, exact source identity, complete-snapshot publication, and
+committed fallback protect refresh and recovery. This milestone introduced
+version-2 cache evidence; [step 9](#9-optional-openziti-upstream-transport) extends
+new evidence to version 3 without rewriting legacy object identifiers.
 
-Verification includes local HTTP/TLS fixtures, decoded-size and redirect
-boundaries, mixed-source compilation, legacy-cache recovery, and native
-dual-stack list lifecycle scenarios on nftables and both iptables tool families.
-The runnable example defines an unreferenced Zoom feed without introducing
-network access into the default empty policy.
-
-The [configuration contract](configuration.md#custom-ip-lists),
-[static source boundary](architecture.md#custom-ip-list-integration), and
-[source contract](data-sources.md#custom-https-ip-lists) own the implementation
-invariants. Keep the [verification matrix](development.md#verification-matrix)
-and existing writer, CrowdSec, ownership, and Docker gates passing.
+The [configuration](configuration.md#custom-ip-lists),
+[architecture](architecture.md#custom-ip-list-integration), and
+[source contract](data-sources.md#custom-https-ip-lists) own the details.
+[Source verification](development.md#sources-and-compatibility) covers local
+HTTP/TLS boundaries, mixed-source failures, legacy recovery, independent timing,
+and native IPv4/IPv6 lifecycle on all three backend/tool-family variants.
 
 ## 7. Dynamic named-provider feeds
 
 **Status:** implemented for nftables and iptables/ipset.
 
-`include.providers` and `exclude.providers` accept safe provider IDs, including
-new IDs and underscores, without compiled-in membership or per-provider source
-definitions. Offline validation checks syntax and source-wide positive timing
-settings; runtime resolution determines existence by fetching:
+`include.providers` and `exclude.providers` resolve safe provider IDs through
+the jsDelivr `@main` merged-file template. There is no compiled-in catalog,
+per-provider definition, discovery request, or alternate-mirror fallback.
+Offline validation checks syntax; runtime fetching determines existence.
 
-```text
-https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/{id}/{id}_ips_merged.txt
-```
+Provider feeds share the bounded text pipeline and complete-snapshot cache.
+Missing new IDs prevent activation; later failures can retain exact committed
+fallback. Provider timing and freshness reporting remain separate from RIPEstat
+and custom lists. Whole-provider sets track mutable `main`; service/region
+filters and a common upstream Git revision are not implied.
 
-No catalog, metadata/discovery request, GitHub API, alternate mirror, or
-`go-cloudip` dependency is used. Only missing/due enabled references fetch,
-with `24h` refresh and `30s` request timeout defaults. Provider records use the
-shared bounded text pipeline and static manifests (version 2 at introduction,
-version 3 since step 9); existing RIPEstat and custom-list cache generations
-remain recoverable.
-
-The existing scheduler, exact attempted-selector retry evidence, and writer
-preserve complete-snapshot publication. New missing IDs prevent activation or
-reject reload; later 404/invalid responses retain exact committed fallback.
-Freshness is reported with the fixed `source="provider"` label, separately from
-RIPEstat and custom lists. Provider and custom-list names do not collide.
-
-Verification covers dynamic existence and later appearance, unsafe IDs,
-mixed-source compilation/failure retention, durable identity, independent timing,
-and new-flow IPv4/IPv6 lifecycle on nftables and both iptables tool families.
-The actual CLI is also exercised against an isolated HTTPS CDN fixture, including
-unknown-ID startup failure, rejected-reload timer preservation, restart fallback,
-and final-reference removal. Tests do not depend on live CDN data.
-
-The [configuration contract](configuration.md#named-providers),
-[static source boundary](architecture.md#named-provider-integration), and
-[source contract](data-sources.md#named-provider-feeds) own implementation
-invariants. Whole-provider sets follow mutable `main`; service/region filters and
-a common upstream Git revision are not implied. Keep the
-[verification matrix](development.md#verification-matrix) and existing source,
-writer, CrowdSec, and Docker gates passing.
+The [configuration](configuration.md#named-providers),
+[architecture](architecture.md#named-provider-integration), and
+[source contract](data-sources.md#named-provider-feeds) define the endpoint,
+defaults, identity, and scheduling rules. The
+[source verification matrix](development.md#sources-and-compatibility) covers
+dynamic existence, mixed-source publication, actual CLI use, and native lifecycle
+without depending on live CDN data.
 
 ## 8. IP/CIDR lookup and source explanation
 
 **Status:** implemented.
 
-The CLI provides `lookup` alongside `run`, `validate`, `cleanup`, and `version`.
+The `lookup` CLI queries the daemon's coherent applied state, not a fresh
+compilation or an independent native firewall reader. Delivered capabilities:
+
+- Backend-neutral evaluation of complete IPv4/IPv6 CIDRs, directions, and
+  optional protocol/port filters, including attachment/interface conditions.
+- Writer-owned publication and completion fencing across reload, dynamic updates,
+  compensation, uncertain recovery, and confirmed empty managed state.
+- Static source attribution and CrowdSec decision/lease evidence without
+  query-time source fetching or persistence of live decisions.
+- A private bounded Unix-socket API, human/JSON output, stable verdicts and exit
+  codes, cancellation, and explicit unknown results when evidence is unavailable.
+
 The [operator contract](operations.md#ipcidr-lookup),
-[applied-state query boundary](architecture.md#read-only-lookup-and-explanation),
-and [provenance contract](data-sources.md#lookup-source-attribution) are delivered
-without new YAML fields or durable schemas:
-
-1. **Pure query evaluation.** `internal/lookup` evaluates backend-neutral
-   compiled rules for complete IPv4/IPv6 CIDRs, both directions, optional
-   protocol/port filters, and new flows. It preserves terminal pass,
-   global/CrowdSec precedence, classifier, allowlist absence, and explicit
-   attachment/interface/port-basis conditions without native inspection.
-2. **Coherent applied-state publication.** The existing writer publishes
-   immutable selected configuration/manifest references together with
-   acknowledged dynamic projection, decision identity, and conservative native
-   lease evidence. Mutation and uncertain recovery invalidate definitive
-   answers; a completion fence rejects queries racing a newer operation.
-   Rejected candidates and safe compensation preserve old authority.
-   Confirmed empty managed state remains queryable.
-3. **Source explanations.** Matching country/group/RIR/ASN/list/provider
-   membership, include/exclude roles, global entries, and the deciding rule
-   remain distinct. CrowdSec evidence retains every matching decision ID and
-   separates decision deadlines from acknowledged native leases. Queries do
-   not fetch sources, persist live decisions, or invent origin/scenario metadata.
-4. **Private interface and CLI.** A root-only fixed Unix socket serves strict,
-   versioned, bounded requests independently of metrics. `lookup` supplies
-   human/JSON output, stable verdicts and exit codes, cancellation, and explicit
-   unknown results for unavailable, inconsistent, or over-limit evidence.
-   The listener shares ownership/startup/reload/shutdown lifecycle without
-   acquiring the writer or lifecycle lock for queries.
-5. **Executable acceptance.** Actual CLI and IPv4/IPv6 probes cover nftables,
-   iptables-legacy, and iptables-nft. Docker probes verify original/current
-   destination-port semantics and foreign downstream denial. Source refresh,
-   rejected reload, CrowdSec deletion/expiry, empty state, and socket shutdown
-   scenarios are exercised alongside record-limit, malformed/partial-response,
-   cancellation, and uncertain-journal regressions.
-
-The [lookup verification matrix](development.md#lookup-and-explanation) owns
-the maintained behavioral requirements. Verification includes `make verify`,
-`make test-race`, the full privileged native gate, real-LAPI compatibility, and
-the pinned private Docker coexistence/security gate. No independent firewall
-reader/writer, query-time packet probe, general GeoIP enrichment, or offline
-fallback is part of this feature.
+[query architecture](architecture.md#read-only-lookup-and-explanation), and
+[provenance contract](data-sources.md#lookup-source-attribution) own the behavior.
+The [lookup verification matrix](development.md#lookup-and-explanation) covers
+the actual CLI, native packets, Docker port/attachment semantics, and lifecycle
+races. This milestone adds no YAML fields or durable schemas.
 
 ## 9. Optional OpenZiti upstream transport
 
 **Status:** implemented with unmodified `sdk-golang v1.8.2` and the explicitly
 accepted [SDK cancellation limitation](data-sources.md#sdk-cancellation-limitation).
 
+Named enrolled identity profiles and per-list/LAPI bindings opt selected HTTP
+clients into exact private-service dialing. Direct-only installations remain
+unchanged; no host tunneler, automatic enrollment, global HTTP interception,
+RIPEstat/provider interception, or silent direct fallback is introduced.
+
+Immutable credential generations, independent session ownership, and
+transport-aware version-3 cache evidence follow publication and recovery.
+Legacy version-1/2 direct evidence remains recoverable under its original
+identifiers. Same-path rotation takes effect on reload; LAPI route/identity
+replacement requires fresh authority rather than merging the old stream.
+
 The [architecture](architecture.md#optional-openziti-upstream-transport),
 [schema](configuration.md#optional-openziti-configuration),
 [source contract](data-sources.md#openziti-upstream-transport), and
-[operator prerequisites](operations.md#openziti-operations) define the feature.
-Direct-only installations remain unchanged; this milestone requires no host
-tunneler and does not extend the SDK to RIPEstat/fixed provider downloads.
+[operator prerequisites](operations.md#openziti-operations) own the details.
+Application waits are bounded; that does not imply complete drainage of
+SDK-internal discovery/authentication work.
 
-Implemented boundaries:
-
-1. **Offline opt-in schema.** Named identity-file profiles and per-list/LAPI
-   `direct`/`openziti` bindings validate without credential reads or network I/O.
-   Omitted/explicit direct settings preserve legacy defaults and saved hashes;
-   disabled/unreferenced consumers do not activate profiles.
-2. **Identity-scoped HTTP transport.** Securely captured enrolled PEM identities
-   define immutable generations. Exact service dialing, isolated origin pools,
-   normal application TLS, redirect/proxy restrictions, and no direct fallback
-   preserve upstream authority. Application admission is limited to eight SDK
-   dial workers and one per generation, with bounded caller and shutdown waits.
-   SDK-internal discovery/authentication can outlive cancellation; no local SDK
-   patch or promise of complete worker drainage is included.
-3. **Transport-aware static evidence.** Version-3 selector objects/manifests
-   record explicit non-secret bindings. Version-1/2 direct evidence remains
-   recoverable under its original identifiers. Changed profile, generation,
-   service, or transport cannot borrow old-route fallback. Recovery/cleanup
-   remains local and independent of credentials or SDK connectivity.
-4. **Selected runtime and CrowdSec epochs.** Staged/active/pending references
-   follow existing publication and recovery decisions. Same-path rotation takes
-   effect through reload. Rejected candidates cannot close selected contexts.
-   LAPI replacement requires a new full snapshot even at the same URL/API key;
-   old authority is not merged and finite expiry continues during outage.
-5. **Executable acceptance.** `make test-openziti` provisions real pinned
-   OpenZiti 2.0.4 and CrowdSec 1.8.1 fixtures. It covers mixed sources, private
-   routing, authorization, redirects/proxies, application TLS, identity rotation,
-   shared identity use, LAPI authority replacement, outage expiry, lookup, and
-   IPv4/IPv6 packets on nftables and both iptables tool families. A dedicated CI
-   job verifies fixture checksums; standard static amd64/arm64 builds retain the
-   SDK without imposing runtime requirements on direct-only deployments.
-
-The [OpenZiti verification matrix](development.md#optional-openziti-transport)
-owns ongoing acceptance. Keep `make verify`, `make test-race`, full native,
-real-LAPI compatibility, Docker coexistence/security, and lookup/lifecycle
-gates passing. No global HTTP interception, automatic enrollment, interactive
-authentication, host DNS/routing changes, firewall bypass, secret persistence,
-or silent ordinary-network fallback is part of this feature.
+`make test-openziti` provisions pinned real OpenZiti/CrowdSec fixtures and
+exercises authorization, private routing, TLS, identity rotation, mixed sources,
+LAPI authority and expiry, lookup, and IPv4/IPv6 enforcement on all three
+backend/tool-family variants. The
+[OpenZiti verification matrix](development.md#optional-openziti-transport)
+owns acceptance and fixture requirements.
 
 ## 10. Operational and release gates
 
@@ -310,13 +219,9 @@ release scaffolding only with working artifacts and executable checks.
 
 ## Immediate next task
 
-Complete step 10's metrics, service/package lifecycle, remaining architecture
-coverage, and signed release gates.
-
-Static source-backed policy, custom HTTP(S) lists, dynamic named providers, both
-native backends, CrowdSec synchronization and decision lifecycle, Docker
-iptables bridge coexistence, daemon-backed lookup, and optional embedded
-OpenZiti list/LAPI transport are implemented. Keep their writer, recovery,
-packet-path, query, and compatibility gates passing.
+Complete [step 10](#10-operational-and-release-gates): metrics, service/package
+lifecycle, remaining architecture coverage, and signed release gates. Maintain
+the [verification matrix](development.md#verification-matrix) for delivered
+features while adding these operational artifacts.
 Track new work as issues using acceptance criteria from the owning documents
 rather than maintaining another implementation or test plan.

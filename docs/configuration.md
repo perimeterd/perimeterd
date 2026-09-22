@@ -20,9 +20,25 @@ The runtime defaults state and prefix caches to `/var/lib/perimeterd` and
 creates missing directories when invoked as root. Parsing accepts exactly one
 YAML document. Each schema-defined mapping rejects unknown and duplicate
 fields; `groups`, `ip_lists`, and `openziti.identities` intentionally use
-user-defined names as mapping keys. Scalar types are checked without coercion, and `version` must be
-exactly `1`. Explicit nulls, aliases, and merge keys are rejected rather than
-silently defaulted or expanded.
+user-defined names as mapping keys. Scalar types are checked without coercion,
+and `version` must be exactly `1`. Explicit nulls, aliases, and merge keys are
+rejected rather than silently defaulted or expanded.
+
+## Contents
+
+- [Document and fragment forms](#document-and-fragment-forms)
+- [Fully annotated configuration](#fully-annotated-configuration)
+- [Canonical field and default table](#canonical-field-and-default-table)
+- [Global address lists](#global-address-lists)
+- [Custom IP lists](#custom-ip-lists)
+- [Named providers](#named-providers)
+- [Optional OpenZiti configuration](#optional-openziti-configuration)
+- [Policy schema](#policy-schema)
+- [Evaluation semantics](#evaluation-semantics)
+- [Empty desired state](#empty-desired-state)
+- [Global list example](#global-list-example)
+- [Policy examples](#policy-examples)
+- [Validation phases](#validation-phases)
 
 ## Document and fragment forms
 
@@ -135,7 +151,7 @@ and are always validated; only the selected backend is applied.
 | `ip_lists.<name>.transport` | map | direct | Optional [transport binding](#optional-openziti-configuration) |
 | `providers.refresh_interval` | duration | `24h` | Positive interval shared by named-provider sources |
 | `providers.request_timeout` | duration | `30s` | Positive timeout for a complete provider fetch |
-| `policies` | list | `[]` | Explicit priority order |
+| `policies` | list | `[]` | Policy declarations, ordered by direction and priority |
 | `crowdsec.enabled` | bool | `false` | Enable the supported LAPI stream integration |
 | `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
 | `crowdsec.api_key_file` | path | none | Required by schema when enabled |
@@ -163,7 +179,7 @@ The `crowdsec` block is accepted by offline schema validation and runtime
 enforcement. Enabling it also requires the operator-verified
 [supported LAPI contract](data-sources.md#supported-lapi-contract).
 Neither local validation nor a successful API call can attest that remote
-deployment prerequisite.
+deployment meets that prerequisite.
 
 ### iptables attachments
 
@@ -329,11 +345,12 @@ their IDs are checked for existence when enabled.
 
 Resolution fetches the required provider's merged TXT file dynamically, using
 the [jsDelivr `@main` contract](data-sources.md#named-provider-feeds).
-A 404 or other unsuccessful/invalid response is an error, never an empty set or
+A failed or invalid response is a runtime source error, never an empty set or
 an ignored selector. A new unknown provider has no matching committed fallback:
 it prevents first-start readiness or rejects a reload before applying policy.
-An existing active revision is not discarded on resolution failure. The source
-contract defines exact-identity restart fallback and refresh failure behavior.
+An existing active revision is not discarded on resolution failure; exact
+identity and complete-snapshot fallback rules are owned by the
+[provider source contract](data-sources.md#provider-identity-refresh-and-fallback).
 
 Repeated IDs are deduplicated, and only providers referenced by enabled policies
 are resolved. `providers: [aws]` and `ip_lists: [aws]` are distinct selectors;
@@ -404,7 +421,9 @@ credential-file rotation by the daemon are outside this initial feature.
 
 URLs remain ordinary absolute HTTP(S) URLs under their existing validation.
 `service` selects the connection destination; URL host/port still define
-application authority and HTTPS verification. There is no `ziti://` URL,
+application authority and HTTPS verification. [Transport rules](data-sources.md#service-binding-and-http-safety)
+and [saved cache identity](data-sources.md#transport-identity-and-saved-evidence)
+define routing and persisted evidence. There is no `ziti://` URL,
 implicit hostname-to-service mapping, TLS verification bypass, or replacement
 for `crowdsec.api_key_file`. Existing request/refresh timeouts remain authoritative;
 there is no independent retry budget that can extend them.
@@ -415,7 +434,8 @@ This root-level fragment leaves one list direct while sharing one Ziti
 identity between a private list and LAPI. The service names are independently
 provisioned; the illustrative `.internal` names need not resolve on the host,
 but their HTTPS certificates must verify against the normal trust store.
-Only lists referenced by enabled policies activate their transport.
+An enabled policy activates its referenced lists' transports; an enabled
+CrowdSec client activates its own transport.
 
 ```yaml
 openziti:
@@ -960,8 +980,8 @@ of one document, defaulting, field/value checks, local group expansion, policy
 syntax checks, and uniqueness checks. It does not read credential files,
 resolve external selectors or source prefixes, contact services, bind metrics,
 verify parent chains, or mutate a firewall. Success therefore means that the
-document is accepted by offline schema validation; it does not mean that every
-field is supported by the current runtime.
+document is accepted by offline schema validation; remote source availability,
+credential usability, and runtime firewall prerequisites remain unverified.
 
 `run` acquires lifecycle ownership and recovers durable state before reading
 the current YAML, so invalid current YAML does not prevent recovery from being
