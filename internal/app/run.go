@@ -21,6 +21,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 const (
@@ -28,6 +29,7 @@ const (
 	defaultStateDir       = "/var/lib/perimeterd"
 	defaultLockPath       = "/run/perimeterd/owner.lock"
 	defaultStartupTimeout = 75 * time.Minute
+	upstreamCloseTimeout  = 5 * time.Second
 )
 
 // Options controls the daemon's process lifecycle. Backend, SourceClient,
@@ -113,6 +115,12 @@ func Run(ctx context.Context, options Options) error {
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
+	manager := upstream.NewManager()
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), upstreamCloseTimeout)
+		defer cancel()
+		_ = manager.Close(closeCtx)
+	}()
 
 	store, err := state.Open(opts.StateDir, opts.Checkpoint)
 	if err != nil {
@@ -164,22 +172,30 @@ func Run(ctx context.Context, options Options) error {
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
-	publication := newRuntimePublication(engine, sources, newLogger(cfg, opts.Stderr))
-	defer func() { _ = publication.close() }()
-
 	epoch, err := engine.Admit()
 	if err != nil {
 		return errors.Join(err, stopNotifier())
 	}
-	initial := stageSource(startupCtx, opts, sources.resolver, epoch, 0, cfg, sources.manifest())
+	session, err := manager.Load(startupCtx, cfg)
+	if err != nil {
+		return errors.Join(fmt.Errorf("load upstream identities: %w", err), stopNotifier())
+	}
+	resolver := sources.resolver.WithTransports(session)
+	publication := newRuntimePublication(engine, sources, newLogger(cfg, opts.Stderr))
+	defer func() { _ = publication.close() }()
+
+	initial := stageSource(startupCtx, opts, resolver, epoch, 0, cfg, sources.manifest(), session)
 	if initial.err != nil {
+		initial.candidate.releaseSession()
 		return errors.Join(initial.err, stopNotifier())
 	}
 	if err := publication.reserve(initial); err != nil {
+		initial.candidate.releaseSession()
 		return errors.Join(err, stopNotifier())
 	}
 	if err := startupCtx.Err(); err != nil {
 		_ = publication.discard()
+		initial.candidate.releaseSession()
 		return errors.Join(err, stopNotifier())
 	}
 	outcome, applyErr := engine.Apply(startupCtx, initial.candidate)
@@ -249,6 +265,15 @@ func Run(ctx context.Context, options Options) error {
 		cancelProducers()
 		sources.close()
 		producers.Wait()
+		for {
+			select {
+			case result := <-results:
+				result.candidate.releaseSession()
+			default:
+				goto drained
+			}
+		}
+	drained:
 		if recoveryTimer != nil {
 			recoveryTimer.Stop()
 			recoveryTimer = nil
@@ -294,15 +319,19 @@ func Run(ctx context.Context, options Options) error {
 				sources.timer = time.NewTimer(time.Second)
 				continue
 			}
+			refreshSession := sources.retainSession()
+			refreshResolver := sources.resolver.WithTransports(refreshSession)
 			refreshCtx, cancel := context.WithCancel(producerCtx)
 			sources.refreshCancel = cancel
+			sources.refreshSequence = sequence
 			producers.Add(1)
 			go func() {
 				defer producers.Done()
-				result := stageSource(refreshCtx, opts, sources.resolver, revision.Epoch, sequence, revision.Config, revision.Manifest)
+				result := stageSource(refreshCtx, opts, refreshResolver, revision.Epoch, sequence, revision.Config, revision.Manifest, refreshSession)
 				select {
 				case results <- result:
 				case <-producerCtx.Done():
+					result.candidate.releaseSession()
 				}
 			}()
 		case sig, ok := <-signalEvents:
@@ -323,14 +352,16 @@ func Run(ctx context.Context, options Options) error {
 				}
 				reloadCtx, cancel := context.WithCancel(producerCtx)
 				sources.reloadCancel = cancel
+				sources.reloadEpoch = requestEpoch
 				committed := sources.manifest()
 				producers.Add(1)
 				go func(epoch uint64) {
 					defer producers.Done()
-					result := stageCandidate(reloadCtx, opts, sources.resolver, epoch, committed)
+					result := stageCandidateWithManager(reloadCtx, opts, sources.resolver, manager, epoch, committed)
 					select {
 					case results <- result:
 					case <-producerCtx.Done():
+						result.candidate.releaseSession()
 					}
 				}(requestEpoch)
 			}
@@ -341,23 +372,37 @@ func Run(ctx context.Context, options Options) error {
 				return errors.Join(metricsErr, stopService())
 			}
 		case result := <-results:
-			if !engine.current(result.candidate) {
-				continue
+			if result.candidate.refresh == 0 &&
+				result.candidate.epoch == sources.reloadEpoch &&
+				sources.reloadCancel != nil {
+				sources.reloadCancel()
+				sources.reloadCancel = nil
+				sources.reloadEpoch = 0
 			}
-			if result.candidate.refresh != 0 && sources.refreshCancel != nil {
+			if result.candidate.refresh != 0 &&
+				result.candidate.refresh == sources.refreshSequence &&
+				sources.refreshCancel != nil {
 				sources.refreshCancel()
 				sources.refreshCancel = nil
+				sources.refreshSequence = 0
 				sources.attempted(result.attempted, time.Now())
 				sources.schedule()
 			}
+			if !engine.current(result.candidate) {
+				result.candidate.releaseSession()
+				continue
+			}
 			if result.err != nil {
+				result.candidate.releaseSession()
 				publication.logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
 				continue
 			}
 			if recovering || publication.pending() {
+				result.candidate.releaseSession()
 				continue
 			}
 			if err := publication.reserve(result); err != nil {
+				result.candidate.releaseSession()
 				publication.logger.Warn("reload failed", "error", err)
 				continue
 			}
@@ -449,6 +494,10 @@ type stageResult struct {
 }
 
 func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver, epoch uint64, committed string) stageResult {
+	return stageCandidateWithManager(ctx, opts, resolver, nil, epoch, committed)
+}
+
+func stageCandidateWithManager(ctx context.Context, opts Options, resolver *source.Resolver, manager *upstream.Manager, epoch uint64, committed string) stageResult {
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
 		return stageResult{candidate: Candidate{epoch: epoch}, err: fmt.Errorf("load configuration: %w", err)}
@@ -456,7 +505,15 @@ func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver
 	if err := firewall.ValidateConfig(cfg); err != nil {
 		return stageResult{candidate: Candidate{epoch: epoch}, err: fmt.Errorf("runtime configuration: %w", err)}
 	}
-	return stageSource(ctx, opts, resolver, epoch, 0, cfg, committed)
+	var session *upstream.Session
+	if manager != nil {
+		session, err = manager.Load(ctx, cfg)
+		if err != nil {
+			return stageResult{candidate: Candidate{epoch: epoch}, cfg: cfg, err: fmt.Errorf("load upstream identities: %w", err)}
+		}
+		resolver = resolver.WithTransports(session)
+	}
+	return stageSource(ctx, opts, resolver, epoch, 0, cfg, committed, session)
 }
 
 func recoverUntilReady(ctx context.Context, engine *Engine, failed func(error)) (*state.Revision, error) {

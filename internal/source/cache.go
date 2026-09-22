@@ -25,10 +25,11 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/prefix"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 const (
-	cacheSchemaVersion   = 2
+	cacheSchemaVersion   = 3
 	cacheIDLength        = sha256.Size * 2
 	maxCacheObjectBytes  = 32 << 20
 	maxCacheManifestSize = 16 << 20
@@ -36,7 +37,12 @@ const (
 	cacheFileMode        = 0o600
 )
 
-const legacyCacheSchemaVersion = 1
+const (
+	legacyCacheSchemaVersionV1 = 1
+	legacyCacheSchemaVersionV2 = 2
+)
+
+const legacyCacheSchemaVersion = legacyCacheSchemaVersionV1
 
 // Cache is an immutable content-addressed store of selector objects and
 // complete manifests. It never selects an object by scanning the cache.
@@ -171,6 +177,9 @@ func (c *Cache) Load(id string) (Snapshot, error) {
 	if digestID(data) != id {
 		return Snapshot{}, fmt.Errorf("manifest %s: content hash mismatch", id)
 	}
+	if err := validateManifestBindingFields(data); err != nil {
+		return Snapshot{}, fmt.Errorf("manifest %s: %w", id, err)
+	}
 	var manifest manifestFile
 	if err := decodeCanonical(data, &manifest, maxCacheManifestSize); err != nil {
 		return Snapshot{}, fmt.Errorf("manifest %s: %w", id, err)
@@ -277,6 +286,9 @@ func (c *Cache) manifestObjectIDs(id string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateManifestBindingFields(data); err != nil {
+		return nil, err
+	}
 	var manifest manifestFile
 	if err := decodeCanonical(data, &manifest, maxCacheManifestSize); err != nil {
 		return nil, err
@@ -310,7 +322,14 @@ type objectFile struct {
 	ContentID     string            `json:"content_id"`
 	IPv4          []string          `json:"ipv4"`
 	IPv6          []string          `json:"ipv6"`
+	Transport     upstream.Binding  `json:"transport"`
 }
+type manifestFile struct {
+	SchemaVersion int             `json:"schema_version"`
+	Entries       []manifestEntry `json:"selectors"`
+	Source        string          `json:"source"`
+}
+
 type manifestEntry struct {
 	Selector    selectorWire      `json:"selector"`
 	Object      string            `json:"object"`
@@ -322,12 +341,7 @@ type manifestEntry struct {
 	QueryStart  string            `json:"query_start"`
 	QueryEnd    string            `json:"query_end"`
 	RetrievedAt string            `json:"retrieved_at"`
-}
-
-type manifestFile struct {
-	SchemaVersion int             `json:"schema_version"`
-	Source        string          `json:"source"`
-	Entries       []manifestEntry `json:"selectors"`
+	Transport   upstream.Binding  `json:"transport"`
 }
 
 func objectFromRecord(record Record) objectFile {
@@ -342,6 +356,7 @@ func objectFromRecord(record Record) objectFile {
 		QueryStart:    storedTime(record.QueryStart), QueryEnd: storedTime(record.QueryEnd), RetrievedAt: canonicalTime(record.RetrievedAt),
 		ContentID: prefixContentID(record.IPv4, record.IPv6),
 		IPv4:      prefixStrings(record.IPv4), IPv6: prefixStrings(record.IPv6),
+		Transport: persistedBinding(record.Transport),
 	}
 }
 
@@ -353,7 +368,15 @@ func manifestEntryFromRecord(record Record, object string) manifestEntry {
 		Parameters: cloneParameters(record.Parameters),
 		QueryStart: storedTime(record.QueryStart), QueryEnd: storedTime(record.QueryEnd),
 		RetrievedAt: canonicalTime(record.RetrievedAt),
+		Transport:   persistedBinding(record.Transport),
 	}
+}
+
+func persistedBinding(binding upstream.Binding) upstream.Binding {
+	if binding.Type == "" {
+		return upstream.Binding{Type: upstream.TypeDirect}
+	}
+	return binding
 }
 
 func (c *Cache) loadObject(entry manifestEntry, schemaVersion int) (Record, error) {
@@ -363,6 +386,9 @@ func (c *Cache) loadObject(entry manifestEntry, schemaVersion int) (Record, erro
 	}
 	if digestID(data) != entry.Object {
 		return Record{}, fmt.Errorf("object %s: content hash mismatch", entry.Object)
+	}
+	if err := validateBindingFields(data, schemaVersion, "object"); err != nil {
+		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
 	var object objectFile
 	if err := decodeCanonical(data, &object, maxCacheObjectBytes); err != nil {
@@ -375,7 +401,7 @@ func (c *Cache) loadObject(entry manifestEntry, schemaVersion int) (Record, erro
 	if err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
-	if object.Selector != entry.Selector || object.SourceKind != entry.SourceKind || object.SourceName != entry.SourceName || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt {
+	if object.Selector != entry.Selector || object.SourceKind != entry.SourceKind || object.SourceName != entry.SourceName || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt || object.Transport != entry.Transport {
 		return Record{}, errors.New("manifest metadata does not match selector object")
 	}
 	return record, nil
@@ -391,15 +417,7 @@ func recordFromObject(object objectFile) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return Record{Selector: selector, SourceKind: object.SourceKind, SourceName: object.SourceName, Endpoint: object.Endpoint, APIVersion: object.APIVersion, Parameters: cloneParameters(object.Parameters), QueryStart: parseStoredTime(object.QueryStart), QueryEnd: parseStoredTime(object.QueryEnd), RetrievedAt: parseCanonicalTime(object.RetrievedAt), IPv4: ipv4, IPv6: ipv6}, nil
-}
-
-func (c *Cache) objectForRecord(record Record) (string, error) {
-	objectBytes, err := canonicalJSON(objectFromRecord(record))
-	if err != nil {
-		return "", err
-	}
-	return digestID(objectBytes), nil
+	return Record{Selector: selector, SourceKind: object.SourceKind, SourceName: object.SourceName, Endpoint: object.Endpoint, APIVersion: object.APIVersion, Parameters: cloneParameters(object.Parameters), QueryStart: parseStoredTime(object.QueryStart), QueryEnd: parseStoredTime(object.QueryEnd), RetrievedAt: parseCanonicalTime(object.RetrievedAt), IPv4: ipv4, IPv6: ipv6, Transport: object.Transport}, nil
 }
 
 func makeSnapshot(id string, compiled policy.Snapshot, records []Record) Snapshot {
@@ -436,6 +454,10 @@ func canonicalRecord(record Record) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	transport, err := canonicalBinding(record.Transport)
+	if err != nil {
+		return Record{}, err
+	}
 	sourceKind := record.SourceKind
 	if sourceKind == "" {
 		sourceKind = ripeSourceKind
@@ -444,6 +466,9 @@ func canonicalRecord(record Record) (Record, error) {
 		expectedKind, label := policy.IPList, "custom list"
 		if sourceKind == providerSourceKind {
 			expectedKind, label = policy.Provider, "provider"
+			if transport.Type != "" {
+				return Record{}, errors.New("provider transport must be direct")
+			}
 		}
 		if selector.Kind != expectedKind || record.SourceName != selector.Value {
 			return Record{}, fmt.Errorf("%s identity does not match selector", label)
@@ -483,11 +508,14 @@ func canonicalRecord(record Record) (Record, error) {
 			Selector: selector, SourceKind: sourceKind, SourceName: record.SourceName,
 			Endpoint: endpoint, APIVersion: record.APIVersion,
 			Parameters: map[string]string{}, RetrievedAt: retrievedAt,
-			IPv4: v4, IPv6: v6,
+			IPv4: v4, IPv6: v6, Transport: transport,
 		}, nil
 	}
 	if sourceKind != ripeSourceKind || record.SourceName != "" {
 		return Record{}, errors.New("unsupported source identity")
+	}
+	if transport.Type != "" {
+		return Record{}, errors.New("RIPEstat transport must be direct")
 	}
 	expectedEndpoint := countryEndpoint
 	expectedParams := map[string]string{"resource": selector.Value, "sourceapp": "perimeterd", "v4_format": "prefix"}
@@ -533,7 +561,29 @@ func canonicalRecord(record Record) (Record, error) {
 	if err != nil {
 		return Record{}, fmt.Errorf("IPv6: %w", err)
 	}
-	return Record{Selector: selector, Endpoint: record.Endpoint, APIVersion: record.APIVersion, Parameters: parameters, QueryStart: queryStart, QueryEnd: queryEnd, RetrievedAt: retrievedAt, IPv4: v4, IPv6: v6}, nil
+	return Record{Selector: selector, Endpoint: record.Endpoint, APIVersion: record.APIVersion, Parameters: parameters, QueryStart: queryStart, QueryEnd: queryEnd, RetrievedAt: retrievedAt, IPv4: v4, IPv6: v6, Transport: transport}, nil
+}
+
+func canonicalBinding(binding upstream.Binding) (upstream.Binding, error) {
+	if binding.Type == "" {
+		if binding.Identity != "" || binding.IdentityGeneration != "" || binding.Service != "" {
+			return upstream.Binding{}, errors.New("direct transport binding contains identity fields")
+		}
+		return upstream.Binding{}, nil
+	}
+	if binding.Type == upstream.TypeDirect {
+		if binding.Identity != "" || binding.IdentityGeneration != "" || binding.Service != "" {
+			return upstream.Binding{}, errors.New("direct transport binding contains identity fields")
+		}
+		return upstream.Binding{}, nil
+	}
+	if binding.Type != upstream.TypeOpenZiti {
+		return upstream.Binding{}, fmt.Errorf("unsupported transport binding type %q", binding.Type)
+	}
+	if err := binding.Validate(); err != nil {
+		return upstream.Binding{}, fmt.Errorf("invalid transport binding: %w", err)
+	}
+	return binding, nil
 }
 
 func normalizeFamily(values []netip.Prefix, ipv4 bool) ([]netip.Prefix, error) {
@@ -548,11 +598,78 @@ func normalizeFamily(values []netip.Prefix, ipv4 bool) ([]netip.Prefix, error) {
 	return prefix.Normalize(values)
 }
 
+func validateManifestBindingFields(data []byte) error {
+	var envelope struct {
+		SchemaVersion int               `json:"schema_version"`
+		Entries       []json.RawMessage `json:"selectors"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return fmt.Errorf("manifest binding metadata is malformed: %w", err)
+	}
+	for index, entry := range envelope.Entries {
+		if err := validateBindingFields(entry, envelope.SchemaVersion, fmt.Sprintf("selector %d", index)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateBindingFields(data []byte, schemaVersion int, label string) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("%s binding metadata is malformed: %w", label, err)
+	}
+	raw, present := fields["transport"]
+	if schemaVersion <= legacyCacheSchemaVersionV2 {
+		if present {
+			return fmt.Errorf("%s contains transport metadata from a newer schema", label)
+		}
+		return nil
+	}
+	if !present || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return fmt.Errorf("%s transport binding is missing", label)
+	}
+	var bindingFields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &bindingFields); err != nil {
+		return fmt.Errorf("%s transport binding is malformed: %w", label, err)
+	}
+	for name, value := range bindingFields {
+		switch name {
+		case "type", "identity", "identity_generation", "service":
+		default:
+			return fmt.Errorf("%s transport binding contains unknown field %q", label, name)
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%s transport binding field %q is null", label, name)
+		}
+	}
+	var binding upstream.Binding
+	if err := json.Unmarshal(raw, &binding); err != nil {
+		return fmt.Errorf("%s transport binding is malformed: %w", label, err)
+	}
+	if err := binding.Validate(); err != nil {
+		return fmt.Errorf("%s transport binding is invalid: %w", label, err)
+	}
+	switch binding.Type {
+	case upstream.TypeDirect:
+		if len(bindingFields) != 1 {
+			return fmt.Errorf("%s direct transport binding has non-canonical fields", label)
+		}
+	case upstream.TypeOpenZiti:
+		if len(bindingFields) != 4 {
+			return fmt.Errorf("%s openziti transport binding has non-canonical fields", label)
+		}
+	default:
+		return fmt.Errorf("%s transport binding has unsupported type %q", label, binding.Type)
+	}
+	return nil
+}
+
 func validateManifest(manifest manifestFile) error {
-	if manifest.SchemaVersion != legacyCacheSchemaVersion && manifest.SchemaVersion != cacheSchemaVersion {
+	if manifest.SchemaVersion < legacyCacheSchemaVersionV1 || manifest.SchemaVersion > cacheSchemaVersion {
 		return fmt.Errorf("unsupported schema version %d", manifest.SchemaVersion)
 	}
-	if manifest.SchemaVersion == legacyCacheSchemaVersion && manifest.Source != ripeSourceKind {
+	if manifest.SchemaVersion <= legacyCacheSchemaVersionV2 && manifest.Source != ripeSourceKind && (manifest.SchemaVersion != legacyCacheSchemaVersionV2 || manifest.Source != "static") {
 		return fmt.Errorf("unsupported source %q", manifest.Source)
 	}
 	if manifest.SchemaVersion == cacheSchemaVersion && manifest.Source != ripeSourceKind && manifest.Source != "static" {
@@ -562,10 +679,13 @@ func validateManifest(manifest manifestFile) error {
 		return errors.New("manifest selector count is invalid")
 	}
 	for i, entry := range manifest.Entries {
-		if manifest.SchemaVersion == legacyCacheSchemaVersion && (entry.SourceKind != "" || entry.SourceName != "") {
+		if manifest.SchemaVersion == legacyCacheSchemaVersionV1 && (entry.SourceKind != "" || entry.SourceName != "") {
 			return errors.New("legacy manifest contains custom source metadata")
 		}
-		if err := validateManifestEntry(entry, i); err != nil {
+		if manifest.SchemaVersion == cacheSchemaVersion && entry.Transport.Type == "" {
+			return fmt.Errorf("selector %d transport binding is missing", i)
+		}
+		if err := validateManifestEntry(entry, manifest.SchemaVersion, i); err != nil {
 			return err
 		}
 		selector := manifestSelector(entry)
@@ -576,7 +696,7 @@ func validateManifest(manifest manifestFile) error {
 	return nil
 }
 
-func validateManifestEntry(entry manifestEntry, index int) error {
+func validateManifestEntry(entry manifestEntry, schemaVersion, index int) error {
 	selector, err := policy.CanonicalSelector(policy.SelectorKind(entry.Selector.Kind), entry.Selector.Value)
 	if err != nil {
 		return fmt.Errorf("selector %d: %w", index, err)
@@ -590,10 +710,17 @@ func validateManifestEntry(entry manifestEntry, index int) error {
 	if entry.Parameters == nil {
 		return fmt.Errorf("selector %d metadata parameters are null", index)
 	}
+	transport := entry.Transport
+	if schemaVersion <= legacyCacheSchemaVersionV2 {
+		if transport.Type != "" || transport.Identity != "" || transport.IdentityGeneration != "" || transport.Service != "" {
+			return fmt.Errorf("legacy selector contains transport binding")
+		}
+		transport = upstream.Binding{}
+	}
 	start := parseStoredTime(entry.QueryStart)
 	end := parseStoredTime(entry.QueryEnd)
 	retrieved := parseCanonicalTime(entry.RetrievedAt)
-	record := Record{Selector: selector, SourceKind: entry.SourceKind, SourceName: entry.SourceName, Endpoint: entry.Endpoint, APIVersion: entry.APIVersion, Parameters: entry.Parameters, QueryStart: start, QueryEnd: end, RetrievedAt: retrieved}
+	record := Record{Selector: selector, SourceKind: entry.SourceKind, SourceName: entry.SourceName, Endpoint: entry.Endpoint, APIVersion: entry.APIVersion, Parameters: entry.Parameters, QueryStart: start, QueryEnd: end, RetrievedAt: retrieved, Transport: transport}
 	if _, err := canonicalRecord(record); err != nil {
 		return fmt.Errorf("selector %d metadata: %w", index, err)
 	}
@@ -604,14 +731,23 @@ func validateManifestEntry(entry manifestEntry, index int) error {
 }
 
 func validateObject(object objectFile) (Record, error) {
-	if object.SchemaVersion != legacyCacheSchemaVersion && object.SchemaVersion != cacheSchemaVersion {
+	if object.SchemaVersion < legacyCacheSchemaVersionV1 || object.SchemaVersion > cacheSchemaVersion {
 		return Record{}, fmt.Errorf("unsupported schema version %d", object.SchemaVersion)
 	}
-	if object.SchemaVersion == legacyCacheSchemaVersion && (object.SourceKind != "" || object.SourceName != "") {
+	if object.SchemaVersion == legacyCacheSchemaVersionV1 && (object.SourceKind != "" || object.SourceName != "") {
 		return Record{}, errors.New("legacy object contains custom source metadata")
+	}
+	if object.SchemaVersion == cacheSchemaVersion && object.Transport.Type == "" {
+		return Record{}, errors.New("object transport binding is missing")
 	}
 	if object.Parameters == nil || object.IPv4 == nil || object.IPv6 == nil {
 		return Record{}, errors.New("object contains null parameters or family array")
+	}
+	if object.SchemaVersion <= legacyCacheSchemaVersionV2 {
+		if object.Transport.Type != "" || object.Transport.Identity != "" || object.Transport.IdentityGeneration != "" || object.Transport.Service != "" {
+			return Record{}, errors.New("legacy object contains transport binding")
+		}
+		object.Transport = upstream.Binding{}
 	}
 	record, err := recordFromObject(object)
 	if err != nil {

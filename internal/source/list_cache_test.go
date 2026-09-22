@@ -1,15 +1,23 @@
 package source
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 func TestLegacyRIPEstatCacheRemainsRecoverable(t *testing.T) {
@@ -135,5 +143,302 @@ func TestProviderSnapshotBindsDerivedEndpointAndIdentity(t *testing.T) {
 				t.Fatalf("cache accepted corrupted provider %s identity", name)
 			}
 		})
+	}
+}
+
+func TestLegacyV2StaticCacheRemainsRecoverable(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	selector := policy.Selector{Kind: policy.IPList, Value: "feed"}
+	retrieved := "2026-09-20T00:00:00Z"
+	prefixes := []string{"198.51.100.0/24"}
+	contentID := prefixContentID([]netip.Prefix{netip.MustParsePrefix(prefixes[0])}, nil)
+	objectValue := map[string]any{
+		"api_version":    "1",
+		"content_id":     contentID,
+		"endpoint":       "https://example.com/feed",
+		"ipv4":           prefixes,
+		"ipv6":           []string{},
+		"parameters":     map[string]string{},
+		"query_end":      "",
+		"query_start":    "",
+		"retrieved_at":   retrieved,
+		"schema_version": 2,
+		"selector":       map[string]string{"kind": string(selector.Kind), "value": selector.Value},
+		"source_kind":    listSourceKind,
+		"source_name":    selector.Value,
+	}
+	object, err := canonicalJSON(objectValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID := digestID(object)
+	entryValue := map[string]any{
+		"api_version":  "1",
+		"endpoint":     "https://example.com/feed",
+		"object":       objectID,
+		"parameters":   map[string]string{},
+		"query_end":    "",
+		"query_start":  "",
+		"retrieved_at": retrieved,
+		"selector":     map[string]string{"kind": string(selector.Kind), "value": selector.Value},
+		"source_kind":  listSourceKind,
+		"source_name":  selector.Value,
+	}
+	manifestValue := map[string]any{
+		"schema_version": 2,
+		"selectors":      []any{entryValue},
+		"source":         "static",
+	}
+	manifest, err := canonicalJSON(manifestValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestID := digestID(manifest)
+	if err := os.WriteFile(cache.objectPath(objectID), object, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache.manifestPath(manifestID), manifest, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := cache.Load(manifestID)
+	if err != nil {
+		t.Fatalf("legacy v2 evidence cannot load: %v", err)
+	}
+	cfg := config.Config{
+		IPLists: map[string]config.IPListConfig{
+			"feed": {URL: "https://example.com/feed", RefreshInterval: time.Hour, RequestTimeout: time.Second},
+		},
+		Policies: []config.Policy{{Mode: "blocklist", Include: config.Selector{IPLists: []string{"feed"}}}},
+	}
+	if err := snapshot.ValidateConfig(cfg); err != nil {
+		t.Fatalf("legacy v2 evidence does not match declarative config: %v", err)
+	}
+	if err := cache.Collect([]string{manifestID}); err != nil {
+		t.Fatalf("legacy v2 evidence cannot survive collection: %v", err)
+	}
+	beforeObject, err := os.ReadFile(cache.objectPath(objectID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeManifest, err := os.ReadFile(cache.manifestPath(manifestID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Stabilize(manifestID); err != nil {
+		t.Fatalf("legacy v2 evidence cannot stabilize: %v", err)
+	}
+	afterObject, err := os.ReadFile(cache.objectPath(objectID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterManifest, err := os.ReadFile(cache.manifestPath(manifestID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(beforeObject, afterObject) || !reflect.DeepEqual(beforeManifest, afterManifest) {
+		t.Fatal("legacy v2 recovery rewrote immutable evidence")
+	}
+}
+
+func TestV3TransportMetadataIsStrictAndMutuallyBound(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	selector := policy.Selector{Kind: policy.IPList, Value: "feed"}
+	record, err := parseList([]byte("198.51.100.1\n"), "https://example.com/feed", selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Transport = upstream.Binding{
+		Type:               upstream.TypeOpenZiti,
+		Identity:           "private",
+		IdentityGeneration: strings.Repeat("a", 64),
+		Service:            "feed-service",
+	}
+	snapshot, err := cache.Stage([]Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifestData, err := os.ReadFile(cache.manifestPath(snapshot.ManifestID()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest manifestFile
+	if err := decodeCanonical(manifestData, &manifest, maxCacheManifestSize); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries[0].Transport.Service = "other-service"
+	mutatedManifest, err := canonicalJSON(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedManifestID := digestID(mutatedManifest)
+	if err := os.WriteFile(cache.manifestPath(mutatedManifestID), mutatedManifest, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Load(mutatedManifestID); err == nil {
+		t.Fatal("cache accepted a manifest binding that differed from its object")
+	}
+
+	objectIDs, err := cache.manifestObjectIDs(snapshot.ManifestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectData, err := os.ReadFile(cache.objectPath(objectIDs[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var objectValue map[string]any
+	if err := json.Unmarshal(objectData, &objectValue); err != nil {
+		t.Fatal(err)
+	}
+	transportValue, ok := objectValue["transport"].(map[string]any)
+	if !ok {
+		t.Fatal("v3 object transport metadata was not an object")
+	}
+	transportValue["secret"] = "credential-material"
+	objectValue["transport"] = transportValue
+	mutatedObject, err := canonicalJSON(objectValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutatedObjectID := digestID(mutatedObject)
+	if err := os.WriteFile(cache.objectPath(mutatedObjectID), mutatedObject, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries[0].Transport = record.Transport
+	manifest.Entries[0].Object = mutatedObjectID
+	manifestWithExtraObject, err := canonicalJSON(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestWithExtraObjectID := digestID(manifestWithExtraObject)
+	if err := os.WriteFile(cache.manifestPath(manifestWithExtraObjectID), manifestWithExtraObject, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Load(manifestWithExtraObjectID); err == nil {
+		t.Fatal("cache accepted an object with an extra secret field")
+	}
+}
+
+func TestListSameOriginRedirectPreservesIPv6Zone(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/feed" {
+			http.Redirect(w, req, "/next", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	// Route the scoped application authority to a real local HTTP endpoint,
+	// as a service-bound transport does, without requiring an IPv6 interface.
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+	}}
+	defer transport.CloseIdleConnections()
+	resolver := NewResolver(nil, &http.Client{Transport: transport})
+	req, err := http.NewRequest(http.MethodGet, "http://[fe80::1%25FeedNIC]/feed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = req.WithContext(markListOrigin(markListRequest(req.Context()), req.URL))
+	response, err := resolver.client.Do(req)
+	if err != nil {
+		t.Fatalf("same-origin relative redirect failed: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("redirect response status = %d", response.StatusCode)
+	}
+}
+
+func TestResolvedBindingRequiresExactLoadedGenerationAndService(t *testing.T) {
+	selector := policy.Selector{Kind: policy.IPList, Value: "feed"}
+	cfg := config.Config{
+		IPLists: map[string]config.IPListConfig{
+			"feed": {
+				URL:             "https://example.com/feed",
+				RefreshInterval: time.Hour,
+				RequestTimeout:  time.Second,
+				Transport:       config.TransportConfig{Type: upstream.TypeOpenZiti, Identity: "private", Service: "feed-service"},
+			},
+		},
+		Policies: []config.Policy{{Mode: "blocklist", Include: config.Selector{IPLists: []string{"feed"}}}},
+	}
+	record, err := parseList([]byte("198.51.100.1\n"), "https://example.com/feed", selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Transport = upstream.Binding{
+		Type:               upstream.TypeOpenZiti,
+		Identity:           "private",
+		IdentityGeneration: strings.Repeat("a", 64),
+		Service:            "feed-service",
+	}
+	expected := map[policy.Selector]upstream.Binding{selector: record.Transport}
+	if !recordMatchesResolved(record, cfg, expected) {
+		t.Fatal("matching loaded transport binding was rejected")
+	}
+	for name, binding := range map[string]upstream.Binding{
+		"generation": {
+			Type: upstream.TypeOpenZiti, Identity: "private",
+			IdentityGeneration: strings.Repeat("b", 64), Service: "feed-service",
+		},
+		"service": {
+			Type: upstream.TypeOpenZiti, Identity: "private",
+			IdentityGeneration: strings.Repeat("a", 64), Service: "other-service",
+		},
+		"direct": {Type: upstream.TypeDirect},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if recordMatchesResolved(record, cfg, map[policy.Selector]upstream.Binding{selector: binding}) {
+				t.Fatalf("transport crossing accepted for %s", name)
+			}
+		})
+	}
+	if !recordMatchesConfig(record, cfg) {
+		t.Fatal("offline declarative validation rejected matching route")
+	}
+	cfg.IPLists["feed"] = config.IPListConfig{
+		URL:             "https://example.com/feed",
+		RefreshInterval: time.Hour,
+		RequestTimeout:  time.Second,
+		Transport:       config.TransportConfig{Type: upstream.TypeOpenZiti, Identity: "private", Service: "other-service"},
+	}
+	if recordMatchesConfig(record, cfg) {
+		t.Fatal("offline declarative validation accepted a changed service")
+	}
+}
+
+func TestResolveChangedTransportCannotFallbackCommittedList(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	selector := policy.Selector{Kind: policy.IPList, Value: "feed"}
+	record, err := parseList([]byte("198.51.100.1\n"), "https://example.com/feed", selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := cache.Stage([]Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		Geo: config.GeoConfig{RefreshInterval: time.Hour, RequestTimeout: time.Second},
+		IPLists: map[string]config.IPListConfig{
+			"feed": {
+				URL:             "https://example.com/feed",
+				RefreshInterval: time.Hour,
+				RequestTimeout:  time.Second,
+				Transport: config.TransportConfig{
+					Type: upstream.TypeOpenZiti, Identity: "private", Service: "feed-service",
+				},
+			},
+		},
+		Policies: []config.Policy{{Mode: "blocklist", Include: config.Selector{IPLists: []string{"feed"}}}},
+	}
+	resolution, err := NewResolver(cache, nil).Resolve(context.Background(), cfg, committed.ManifestID(), true)
+	if err == nil {
+		t.Fatal("changed transport unexpectedly used a direct committed fallback")
+	}
+	if resolution.Snapshot.ManifestID() == committed.ManifestID() {
+		t.Fatal("changed transport revived the old committed list snapshot")
 	}
 }

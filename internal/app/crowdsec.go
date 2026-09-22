@@ -14,11 +14,13 @@ import (
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 const (
-	crowdRetryMin = time.Second
-	crowdRetryMax = time.Minute
+	crowdRetryMin        = time.Second
+	crowdRetryMax        = time.Minute
+	crowdShutdownTimeout = 5 * time.Second
 )
 
 func crowdRetryWait(delay time.Duration) time.Duration {
@@ -62,6 +64,7 @@ type crowdRuntime struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	workers     sync.WaitGroup
+	retiring    sync.WaitGroup
 	nextEpoch   uint64
 	operation   uint64
 	watermark   uint64
@@ -145,8 +148,23 @@ func (c *crowdRuntime) stageForApply(ctx context.Context, candidate Candidate) (
 	if !candidate.cfg.CrowdSec.Enabled {
 		return nil, nil
 	}
+	if candidate.cfg.CrowdSec.Transport.Type == upstream.TypeOpenZiti {
+		if candidate.session == nil {
+			return nil, errors.New("CrowdSec OpenZiti transport requires a loaded session")
+		}
+		var err error
+		transport, err = candidate.session.Transport(candidate.cfg.CrowdSec.Transport, candidate.cfg.CrowdSec.LAPIURL)
+		if err != nil {
+			return nil, err
+		}
+	}
 	client, err := crowd.NewClient(candidate.cfg.CrowdSec, transport)
 	if err != nil {
+		if candidate.cfg.CrowdSec.Transport.Type == upstream.TypeOpenZiti {
+			if closer, ok := transport.(interface{ CloseIdleConnections() }); ok {
+				closer.CloseIdleConnections()
+			}
+		}
 		return nil, err
 	}
 	pollCtx, cancel := context.WithCancel(ctx)
@@ -161,12 +179,12 @@ func (c *crowdRuntime) stageForApply(ctx context.Context, candidate Candidate) (
 	defer e.mu.Unlock()
 	epoch, err := c.nextEpochLocked()
 	if err != nil {
-		client.Close()
+		c.retireClient(client)
 		return nil, err
 	}
 	staged, err := synchronizedCrowd(client, candidate.cfg.CrowdSec, epoch, batch)
 	if err != nil {
-		client.Close()
+		c.retireClient(client)
 		return nil, err
 	}
 	c.staged = staged
@@ -197,8 +215,19 @@ func (c *crowdRuntime) stopStateLocked(s *crowdState, closeClient bool) {
 		s.expiryCancel = nil
 	}
 	if closeClient {
-		s.client.Close()
+		c.retireClient(s.client)
 	}
+}
+
+func (c *crowdRuntime) retireClient(client *crowd.Client) {
+	if client == nil {
+		return
+	}
+	c.retiring.Add(1)
+	go func() {
+		defer c.retiring.Done()
+		client.Close()
+	}()
 }
 
 func (c *crowdRuntime) activateLocked(s *crowdState) {
@@ -221,7 +250,7 @@ func (c *crowdRuntime) activateLocked(s *crowdState) {
 
 func (c *crowdRuntime) discardLocked() {
 	if c.staged != nil && c.staged != c.active {
-		c.staged.client.Close()
+		c.retireClient(c.staged.client)
 	}
 	c.staged = nil
 	c.transaction = ""
@@ -592,7 +621,21 @@ func (c *crowdRuntime) closeLocked() {
 	c.connected.Store(false)
 	c.stopStateLocked(c.active, true)
 	if c.staged != nil && c.staged != c.active {
-		c.staged.client.Close()
+		c.retireClient(c.staged.client)
 	}
 	c.active, c.staged = nil, nil
+}
+
+func waitGroupBounded(group *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		group.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }

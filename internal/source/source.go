@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 const (
@@ -49,6 +51,9 @@ type Record struct {
 	RetrievedAt time.Time
 	IPv4        []netip.Prefix
 	IPv6        []netip.Prefix
+	// Transport is the captured declarative and (for OpenZiti) generation
+	// identity used to retrieve this record. The zero value is direct.
+	Transport upstream.Binding
 }
 
 // Resolution is the result of one complete source transaction. RefreshError is
@@ -65,9 +70,22 @@ type Resolution struct {
 // Resolver fetches RIPEstat, provider, and custom-list data and stages complete
 // immutable cache manifests.
 type Resolver struct {
-	cache  *Cache
-	client *http.Client
-	slots  chan struct{}
+	cache   *Cache
+	client  *http.Client
+	slots   chan struct{}
+	session *upstream.Session
+}
+
+// WithTransports returns an immutable resolver view using the captured
+// transport session. Existing cache, direct HTTP client, and concurrency
+// limits remain shared with the original resolver.
+func (r *Resolver) WithTransports(session *upstream.Session) *Resolver {
+	if r == nil {
+		return nil
+	}
+	view := *r
+	view.session = session
+	return &view
 }
 
 // NewResolver constructs a resolver. A nil client uses the standard HTTPS
@@ -90,6 +108,12 @@ func NewResolver(cache *Cache, client *http.Client) *Resolver {
 		}
 		if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme == "http" {
 			return errors.New("redirect downgrade rejected")
+		}
+		if origin, _ := req.Context().Value(listOriginMarker{}).(string); origin != "" {
+			parsed, err := url.Parse(origin)
+			if err != nil || !sameURLOrigin(parsed, req.URL) {
+				return errors.New("redirect origin changed")
+			}
 		}
 		return nil
 	}
@@ -124,6 +148,23 @@ func (s Snapshot) ValidateConfig(cfg config.Config) error {
 		}
 	}
 	return nil
+}
+
+func (r *Resolver) bindingForRoute(route config.TransportConfig) (upstream.Binding, error) {
+	if r == nil || r.session == nil {
+		if route.Type == "" || route.Type == upstream.TypeDirect {
+			return upstream.Binding{}, nil
+		}
+		return upstream.Binding{}, errors.New("source: OpenZiti transport session is required")
+	}
+	binding, err := r.session.Binding(route)
+	if err != nil {
+		return upstream.Binding{}, err
+	}
+	if binding.Type == upstream.TypeDirect {
+		return upstream.Binding{}, nil
+	}
+	return binding, nil
 }
 
 const (

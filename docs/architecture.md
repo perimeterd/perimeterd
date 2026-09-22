@@ -4,8 +4,10 @@ This document owns component boundaries, writer ownership, revision admission,
 and durable recovery for the native runtimes, including custom HTTP(S) IP lists
 and direct named-provider feeds through the static-source boundary. The
 [lookup boundary](#read-only-lookup-and-explanation) explains applied state
-without joining the writer or contacting sources. Service packaging and
-[future deployment boundaries](#future-deployment-boundaries) remain unimplemented.
+without joining the writer or contacting sources.
+[Optional OpenZiti upstream transport](#optional-openziti-upstream-transport)
+connects selected LAPI/custom-list clients to private services. Service packaging
+and [future deployment boundaries](#future-deployment-boundaries) remain unimplemented.
 
 The [implementation plan](implementation-plan.md) owns milestone status.
 [Operations](operations.md#current-source-build-runtime) describes what can run
@@ -83,6 +85,7 @@ to the current files.
 | --- | --- | --- |
 | Configuration | Read local YAML, validate and normalize it; admit reload requests through the app | Kernel mutation or remote-source resolution |
 | Source resolution | Resolve required selectors into one immutable, validated snapshot and cache manifest | Partial policy publication or backend syntax |
+| Upstream transport | Supply explicitly selected direct or identity/service-bound connections; bound application waits and own SDK contexts/HTTP pools subject to the documented SDK cleanup limitation | Source parsing, policy decisions, host-wide interception, automatic direct fallback, or firewall exceptions |
 | Policy compilation | Purely compile normalized configuration and snapshots into immutable, backend-neutral rules, sets, and accounting roles | Network, filesystem, or kernel I/O |
 | Application engine | Serialize admission, freshness checks, mutation, and transaction decisions | Native packet-filter syntax |
 | Durable store | Validate and publish revision/journal records with explicit durability barriers | Choosing which attempted revision should win |
@@ -169,6 +172,94 @@ committed fallback prevent activation; failed refreshes retain the previous
 complete revision and its retrieval evidence. Reloaded timing/reference changes
 take effect only after durable selection, and rejected reloads retain old timers.
 Existing RIPEstat and custom-list recovery evidence must remain readable.
+
+### Optional OpenZiti upstream transport
+
+The standard binary embeds
+[OpenZiti Go SDK v1.8.2](https://github.com/openziti/sdk-golang/tree/v1.8.2)
+as an optional runtime transport for `crowdsec.lapi_url` and individual custom
+`ip_lists` sources. This is not a new policy selector, firewall backend,
+listener, or source parser.
+[Configuration](configuration.md#optional-openziti-configuration)
+owns the fields; [data sources](data-sources.md#openziti-upstream-transport)
+owns routing, HTTP/TLS, cache identity, and failure semantics;
+[operations](operations.md#openziti-operations) owns provisioning.
+
+```mermaid
+flowchart LR
+    LAPI[CrowdSec HTTP client] --> SELECT[Explicit per-upstream transport]
+    LIST[Custom-list HTTP client] --> SELECT
+    SELECT -->|direct default| TCP[Existing ordinary HTTP/S transport]
+    SELECT -->|openziti opt-in| SDK[Identity-scoped Go SDK context]
+    SDK --> EDGE[Reachable Ziti edge router]
+    EDGE --> HOST[Authorized hosted Ziti service]
+    HOST --> SERVER[LAPI or list server]
+    TCP --> SERVER
+```
+
+The standard binary includes the pinned SDK, but omitted transport settings
+preserve today's behavior. A direct-only deployment does not load identity
+files, initialize SDK contexts, contact Ziti, or acquire another runtime
+prerequisite. Unused identity profiles likewise remain inactive. Do not mutate
+process-global HTTP transports, DNS, host routes, or network interfaces.
+RIPEstat and fixed jsDelivr provider downloads retain their existing transport;
+a private provider mirror can be configured as a custom list.
+
+Each opted-in upstream names an identity profile and one exact Ziti service.
+The application URL still supplies HTTP authority, path/query, and HTTPS
+certificate verification; it is not the service name. Dial the service
+explicitly, without application-host DNS, intercept discovery, or direct
+fallback. An unavailable or unauthorized service fails that source attempt.
+The host needs ordinary reachability to Ziti control/edge endpoints, but no
+host tunneler, VPN interface, or route to the private application.
+
+SDK contexts and HTTP pools are application-owned resources, outside the
+serialized writer. Share a context only among users of the same loaded identity
+generation; service-bound HTTP pools must not mix identities or destinations.
+Only reference/selection swaps belong under writer ownership; SDK authentication,
+network I/O, and potentially blocking close/drain work do not.
+Required source work remains within existing caller request, startup, and
+shutdown budgets. Admission precedes SDK worker creation; at most eight SDK
+dials may remain in flight, with one per identity generation. Caller cancellation
+does not imply SDK authentication has stopped: see the explicitly accepted
+[SDK cancellation limitation](data-sources.md#sdk-cancellation-limitation).
+SDK reconnect/service refresh does not become another source scheduler, LAPI
+cursor consumer, or writer.
+
+On startup or admitted reload, read only referenced identity profiles and
+capture validated credential material as an immutable generation. Construct
+replacement contexts/pools outside the apply critical section. Ordinary
+refreshes use the selected generation, not whatever bytes later appear at its
+file path. Replacement at the same path takes effect through `SIGHUP`, never
+through an untracked file watch or SDK credential-file rewrite.
+Loading credentials is a local check, not a requirement for successful network
+authentication before reusing valid same-route committed static fallback.
+Fresh fetches and CrowdSec synchronization still require live connectivity.
+
+Stage affected static-source resolution and any replacement CrowdSec full
+snapshot with the candidate. Even when its URL/API key is unchanged, a changed
+CrowdSec transport or identity generation requires a new source epoch; preserve
+the existing poller pause/resynchronization rules. Old clients, decision expiry,
+and unaffected direct sources retain their existing authority until selection.
+Rejected/stale candidates release only their own references and leave selected
+contexts usable. Committed, rolled-back, and uncertain outcomes select or retain
+transport resources through the existing runtime-publication/recovery boundary,
+not a second commit mechanism. Retire pools and close a context only after its
+last active, staged, pending-recovery, and in-flight reference is released.
+Shutdown cancels application work and bounds context-close waits before lifecycle
+ownership is released; it cannot guarantee drainage of SDK-internal workers.
+
+Static evidence records the effective transport identity as well as URL/parser
+identity. Recovery of already selected firewall state remains local: it must
+not authenticate to Ziti or need a currently readable private key merely to
+verify saved prefix evidence or perform `cleanup`. Source activation and new
+CrowdSec synchronization still require their normal runtime prerequisites.
+Never persist SDK sessions or credentials as recovery authority. Lookup remains
+read-only and neither opens a context nor fetches a source.
+
+This feature grants no policy exemption to perimeterd itself. Operators must
+keep underlay control/edge connectivity available under egress policy; the SDK
+must not add allow rules or bypass either native backend.
 
 ## Read-only lookup and explanation
 

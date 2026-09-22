@@ -12,19 +12,23 @@ import (
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 // sourceRuntime belongs to the event loop. Only timestamps are read by HTTP
 // handlers; workers receive immutable configuration and manifest identities.
 type sourceRuntime struct {
-	cache         *source.Cache
-	resolver      *source.Resolver
-	active        *state.Revision
-	timestamps    atomic.Pointer[sourceTimestamps]
-	deadlines     map[policy.Selector]sourceDeadline
-	timer         *time.Timer
-	reloadCancel  context.CancelFunc
-	refreshCancel context.CancelFunc
+	cache           *source.Cache
+	resolver        *source.Resolver
+	active          *state.Revision
+	session         *upstream.Session
+	timestamps      atomic.Pointer[sourceTimestamps]
+	deadlines       map[policy.Selector]sourceDeadline
+	timer           *time.Timer
+	reloadCancel    context.CancelFunc
+	reloadEpoch     uint64
+	refreshCancel   context.CancelFunc
+	refreshSequence uint64
 }
 
 type sourceTimestamps struct {
@@ -35,6 +39,7 @@ type sourceTimestamps struct {
 
 type sourceDeadline struct {
 	endpoint  string
+	transport upstream.Binding
 	retrieved time.Time
 	interval  time.Duration
 	jitter    time.Duration
@@ -46,7 +51,7 @@ func newSourceRuntime(cache *source.Cache, client *http.Client) *sourceRuntime {
 	return &sourceRuntime{cache: cache, resolver: source.NewResolver(cache, client)}
 }
 
-func (s *sourceRuntime) selectRevision(revision *state.Revision) error {
+func (s *sourceRuntime) selectRevision(revision *state.Revision, selected ...*upstream.Session) error {
 	var snapshot source.Snapshot
 	if revision != nil && revision.Manifest != "" {
 		var err error
@@ -59,7 +64,20 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision) error {
 		if s.refreshCancel != nil {
 			s.refreshCancel()
 			s.refreshCancel = nil
+			s.refreshSequence = 0
 		}
+	}
+	oldSession := s.session
+	var nextSession *upstream.Session
+	if len(selected) > 0 {
+		nextSession = selected[0]
+	}
+	if nextSession == nil && s.active != nil && revision != nil &&
+		(s.active == revision || (s.active.ID != "" && s.active.ID == revision.ID)) {
+		// Recovery of the same committed revision keeps its captured route
+		// generation. A nil selection means "preserve" at this boundary, not
+		// "drop" the session that is still owned by the active source.
+		nextSession = oldSession
 	}
 	deadlines := make(map[policy.Selector]sourceDeadline)
 	timestamps := &sourceTimestamps{}
@@ -79,9 +97,9 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision) error {
 				*stamp = unix
 			}
 			deadline, exists := s.deadlines[record.Selector]
-			if !exists || deadline.endpoint != record.Endpoint || !deadline.retrieved.Equal(record.RetrievedAt) || deadline.interval != interval || deadline.jitter != jitter {
+			if !exists || deadline.endpoint != record.Endpoint || deadline.transport != record.Transport || !deadline.retrieved.Equal(record.RetrievedAt) || deadline.interval != interval || deadline.jitter != jitter {
 				deadline = sourceDeadline{
-					endpoint: record.Endpoint, retrieved: record.RetrievedAt,
+					endpoint: record.Endpoint, transport: record.Transport, retrieved: record.RetrievedAt,
 					interval: interval, jitter: jitter,
 					due: record.RetrievedAt.Add(refreshDelay(interval, jitter)),
 				}
@@ -90,10 +108,21 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision) error {
 		}
 	}
 	s.active = revision
+	s.session = nextSession
 	s.deadlines = deadlines
 	s.timestamps.Store(timestamps)
 	s.schedule()
+	if oldSession != nil && oldSession != nextSession {
+		oldSession.Close()
+	}
 	return nil
+}
+
+func (s *sourceRuntime) retainSession() *upstream.Session {
+	if s == nil || s.session == nil {
+		return nil
+	}
+	return s.session.Retain()
 }
 
 func (s *sourceRuntime) schedule() {
@@ -197,9 +226,18 @@ func (s *sourceRuntime) close() {
 	s.stopTimer()
 	if s.reloadCancel != nil {
 		s.reloadCancel()
+		s.reloadCancel = nil
+		s.reloadEpoch = 0
 	}
 	if s.refreshCancel != nil {
 		s.refreshCancel()
+		s.refreshCancel = nil
+		s.refreshSequence = 0
+	}
+	if s.session != nil {
+		session := s.session
+		s.session = nil
+		session.Close()
 	}
 }
 
@@ -219,15 +257,19 @@ func collectPrefixes(store *state.Store) error {
 	return store.Prefixes().Collect(manifests)
 }
 
-func stageSource(ctx context.Context, opts Options, resolver *source.Resolver, epoch, refresh uint64, cfg config.Config, committed string) stageResult {
-	result := stageResult{candidate: Candidate{epoch: epoch, refresh: refresh}, cfg: cfg}
+func stageSource(ctx context.Context, opts Options, resolver *source.Resolver, epoch, refresh uint64, cfg config.Config, committed string, sessions ...*upstream.Session) stageResult {
+	var session *upstream.Session
+	if len(sessions) > 0 {
+		session = sessions[0]
+	}
+	result := stageResult{candidate: Candidate{epoch: epoch, refresh: refresh, session: session}, cfg: cfg}
 	resolved, err := resolver.Resolve(ctx, cfg, committed, refresh == 0)
 	result.attempted = resolved.Attempted
 	if err != nil {
 		result.err = fmt.Errorf("resolve source snapshot: %w", err)
 		return result
 	}
-	candidate, err := NewCandidate(epoch, opts.ConfigPath, cfg, resolved.Snapshot)
+	candidate, err := newCandidate(epoch, opts.ConfigPath, cfg, resolved.Snapshot, session)
 	if err != nil {
 		result.err = fmt.Errorf("compile configuration: %w", err)
 		return result

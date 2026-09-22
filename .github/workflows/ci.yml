@@ -115,6 +115,47 @@ jobs:
       - name: Run pinned real-LAPI gate
         run: make test-crowdsec
 
+  openziti:
+    name: real OpenZiti list and LAPI transports
+    runs-on: ubuntu-26.04
+    env:
+      ZITI_VERSION: "2.0.4"
+      ZITI_SHA256: 87b8410888c40cc040fd4cbe3262f489c0b36c40b0b07eca879c5199c58826a9
+      CROWDSEC_VERSION: "1.8.1"
+      CROWDSEC_SHA256: ae64cdab8ee49534d6c36eab4ce40b5478842a4b4abfe83f7796aace569821eb
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: false
+      - name: Install native firewall tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes nftables iproute2 iptables ipset
+          sudo modprobe ip_set_hash_net
+          sudo modprobe ip_set_hash_ip
+          sudo modprobe xt_set
+          sudo modprobe iptable_filter
+          sudo modprobe ip6table_filter
+      - name: Install checksum-verified OpenZiti and CrowdSec fixtures
+        run: |
+          mkdir -p "$RUNNER_TEMP/openziti" "$RUNNER_TEMP/crowdsec" "$RUNNER_TEMP/crowdsec-bin"
+          curl --fail --location --retry 3 "https://github.com/openziti/ziti/releases/download/v${ZITI_VERSION}/ziti-linux-amd64-${ZITI_VERSION}.tar.gz" --output "$RUNNER_TEMP/ziti.tgz"
+          printf '%s  %s\n' "$ZITI_SHA256" "$RUNNER_TEMP/ziti.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/ziti.tgz" -C "$RUNNER_TEMP/openziti"
+          curl --fail --location --retry 3 "https://github.com/crowdsecurity/crowdsec/releases/download/v${CROWDSEC_VERSION}/crowdsec-release.tgz" --output "$RUNNER_TEMP/crowdsec.tgz"
+          printf '%s  %s\n' "$CROWDSEC_SHA256" "$RUNNER_TEMP/crowdsec.tgz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/crowdsec.tgz" -C "$RUNNER_TEMP/crowdsec"
+          ln -s "$RUNNER_TEMP/crowdsec/crowdsec-v${CROWDSEC_VERSION}/cmd/crowdsec/crowdsec" "$RUNNER_TEMP/crowdsec-bin/crowdsec"
+          ln -s "$RUNNER_TEMP/crowdsec/crowdsec-v${CROWDSEC_VERSION}/cmd/crowdsec-cli/cscli" "$RUNNER_TEMP/crowdsec-bin/cscli"
+      - name: Run real private-service acceptance gate
+        run: E2E_SUDO=sudo ZITI_TEST_BINARY="$RUNNER_TEMP/openziti/ziti" CROWDSEC_TEST_BINDIR="$RUNNER_TEMP/crowdsec-bin" make test-openziti
+
   docker:
     name: isolated Docker coexistence
     runs-on: ubuntu-26.04

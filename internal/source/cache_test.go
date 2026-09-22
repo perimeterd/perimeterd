@@ -1,6 +1,7 @@
 package source
 
 import (
+	"encoding/json"
 	"errors"
 	"net/netip"
 	"os"
@@ -94,6 +95,47 @@ func TestCacheStageLoadProvidesOneImmutableSnapshot(t *testing.T) {
 	}
 	if got := cacheJSONFiles(t, cache.objects); len(got) != 1 {
 		t.Fatalf("object files = %v", got)
+	}
+}
+
+func TestCacheLoadRejectsInvalidManifest(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	snapshot, err := cache.Stage([]Record{cacheTestRecord(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(cache.manifestPath(snapshot.ManifestID()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*manifestFile)
+	}{
+		{"unsupported source", func(manifest *manifestFile) { manifest.Source = "unsupported" }},
+		{"unsupported empty schema", func(manifest *manifestFile) {
+			manifest.SchemaVersion = 999
+			manifest.Entries = nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var manifest manifestFile
+			if err := json.Unmarshal(original, &manifest); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(&manifest)
+			data, err := canonicalJSON(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := digestID(data)
+			if err := os.WriteFile(cache.manifestPath(id), data, cacheFileMode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cache.Load(id); err == nil {
+				t.Fatal("cache accepted an invalid content-addressed manifest")
+			}
+		})
 	}
 }
 

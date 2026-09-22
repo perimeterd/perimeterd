@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 func geoEngineConfig(t *testing.T) config.Config {
@@ -123,5 +126,58 @@ func TestSourceManifestFollowsFirewallCommit(t *testing.T) {
 	active, err := recovered.Recover(context.Background())
 	if err != nil || active == nil || active.Manifest != newSnapshot.ManifestID() {
 		t.Fatalf("recover committed source generation: %+v, %v", active, err)
+	}
+}
+
+func TestSourceRefreshDeadlineResetsTransportRetryFence(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	selector := policy.Selector{Kind: policy.IPList, Value: "private"}
+	bindingOne := upstream.Binding{
+		Type:               upstream.TypeOpenZiti,
+		Identity:           "profile",
+		IdentityGeneration: strings.Repeat("a", 64),
+		Service:            "list",
+	}
+	bindingTwo := bindingOne
+	bindingTwo.IdentityGeneration = strings.Repeat("b", 64)
+	record := func(binding upstream.Binding) source.Record {
+		return source.Record{
+			Selector: selector, SourceKind: "ip_list", SourceName: "private",
+			Endpoint: "https://example.invalid/list", APIVersion: "1",
+			Parameters: map[string]string{}, RetrievedAt: now,
+			IPv4: []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")},
+			IPv6: []netip.Prefix{}, Transport: binding,
+		}
+	}
+	first, err := store.Prefixes().Stage([]source.Record{record(bindingOne)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Prefixes().Stage([]source.Record{record(bindingTwo)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		IPLists: map[string]config.IPListConfig{
+			"private": {URL: "https://example.invalid/list", RefreshInterval: time.Hour, RequestTimeout: time.Second},
+		},
+	}
+	runtime := newSourceRuntime(store.Prefixes(), nil)
+	defer runtime.close()
+	if err := runtime.selectRevision(&state.Revision{Epoch: 1, Manifest: first.ManifestID(), Config: cfg}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := runtime.deadlines[selector]
+	deadline.retry = now.Add(time.Hour)
+	runtime.deadlines[selector] = deadline
+	if err := runtime.selectRevision(&state.Revision{Epoch: 2, Manifest: second.ManifestID(), Config: cfg}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.deadlines[selector].retry; !got.IsZero() {
+		t.Fatalf("transport generation change retained retry fence until %s", got)
 	}
 }

@@ -10,7 +10,8 @@ authoritative for delivery status.
 > **Status boundary.** The source-build instructions in this document describe
 > what runs today, including custom HTTP(S) text IP lists, direct named-provider
 > selectors, Docker's iptables bridge integration, and daemon-backed IP/CIDR
-> lookup. Installed packages, systemd payloads, and release artifacts remain planned.
+> lookup, plus optional OpenZiti upstream transport. Installed packages, systemd
+> payloads, and release artifacts remain planned.
 > A full-schema configuration is not a capability list.
 
 ## Current source-build runtime
@@ -184,6 +185,85 @@ errors and committed retrieval age, not just enforcement health. CDN caching
 can delay newly published IDs and changed feeds; no purge or original-provider
 freshness guarantee is implied. Do not remove exclusions to work around a
 missing feed without considering the resulting policy expansion.
+
+## OpenZiti operations
+
+The [transport fields](configuration.md#optional-openziti-configuration) opt in
+per upstream. Direct-only deployments remain unchanged: no Ziti installation,
+identity, controller, or additional daemon is required. There is no host-wide opt-in.
+
+For each opted-in LAPI or custom list:
+
+1. Provision a Ziti network and host the application as a service, using an
+   SDK-enabled server or a hosting tunneler/proxy/router that can reach it.
+   Perimeterd is the client, not that hosting component.
+2. Enroll a dedicated noninteractive machine identity externally and authorize
+   it to dial only the required services. Configure suitable identity/router and
+   service/router policies. Required posture checks must be satisfiable without
+   an operator prompt; interactive MFA/login is not part of daemon startup.
+3. Install the enrolled identity JSON and any referenced PEM files locally.
+   Identity JSON and private keys must be root-owned regular files with no
+   group/other permissions (`0600` or `0400`); protect their directories from
+   non-root writes. Every path component must be free of symlinks. Public
+   certificate/CA files may be readable by others, but must not be executable or
+   group/other-writable. Enrollment JWTs are not runtime identities.
+4. Keep ordinary outbound connectivity to advertised controller and edge-router
+   endpoints, including their DNS dependencies, available from the host.
+   No client-side Ziti tunneler, TUN interface, or private-application route is
+   required. Perimeterd's own egress policy can still break authentication,
+   reconnect, or later router selection; there is no automatic allow-rule bypass.
+5. Configure each upstream's identity profile and exact service name, separately
+   from its HTTP(S) URL. Service hosting must deliver the corresponding application
+   protocol/port. Keep HTTPS hostname validation and normal OS trust; install
+   an application CA in that trust store when needed. The identity's controller
+   CA does not automatically authenticate an HTTPS list server or LAPI.
+6. Keep the normal CrowdSec API key and
+   [supported LAPI deployment contract](data-sources.md#supported-lapi-contract).
+   Overlay access grants connectivity, not application authentication.
+
+`validate` remains offline and cannot verify identity files, authorization,
+posture, controller/router reachability, service hosting, or application TLS.
+At runtime those checks apply only to active Ziti references. Unreferenced
+profiles/lists and disabled CrowdSec must not cause identity-file reads or
+connections. No automatic enrollment, direct fallback, interactive sign-in,
+or SDK installation step is allowed.
+
+Rotate identities by provisioning and validating replacements externally,
+then replacing their files safely and sending `SIGHUP`. Capture one complete
+credential bundle, including referenced files; avoid replacing only half of a
+certificate/key pair. Prefer a new directory/profile when coordinating multiple
+files. A same-path replacement is still a new loaded generation when certificate,
+trust, or network identity changes. It requires new-route static evidence and,
+for CrowdSec, a new authoritative snapshot before selection. A failed reload
+keeps the previous loaded generation; file replacement alone does not hot-swap
+it. Plan an overlap window before revoking/expiring the old identity.
+
+Later network/service failures use the existing source contracts: static
+snapshots remain enforced and age visibly, while CrowdSec decisions and kernel
+leases expire normally. A complete exact-identity static cache may support
+offline fallback, but does not authorize borrowing data from a different
+transport/identity. Referenced local credentials must still be loadable for
+activation. Recovery of saved firewall state and explicit `cleanup` remain local.
+Check source errors/freshness and CrowdSec connectivity separately from
+enforcement health; SDK connectivity is not proof of current enforcement.
+
+Treat SDK logs and diagnostics as secret-bearing input. Do not log enrolled
+JSON, private keys, tokens, or unrestricted SDK debug dumps. The integration
+sanitizes errors and excludes credential material from durable source evidence.
+Active OpenZiti profiles reject `DEBUG` or `SWAGGER_DEBUG` values other than
+unset, `false`, or `0`: OpenAPI wire dumps bypass SDK logrus controls and can
+contain authentication responses. Use perimeterd's `logging.level` instead.
+Metrics-disabled operation and `lookup` remain independent of SDK availability.
+
+The pinned, unmodified SDK has a
+[cancellation/cleanup limitation](data-sources.md#sdk-cancellation-limitation):
+perimeterd's caller deadlines and shutdown remain bounded, but some SDK discovery
+or authentication work may continue after cancellation or context closure.
+Eight outstanding SDK dials exhaust application admission until a call returns;
+subsequent Ziti requests then time out without direct fallback. Repeated failed
+activations can also leave SDK-internal discovery workers. Restore underlay
+connectivity and, if necessary, perform a controlled daemon restart; do not
+discard durable enforcement or credentials to bypass recovery.
 
 ## IP/CIDR lookup
 

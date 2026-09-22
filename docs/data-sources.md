@@ -22,6 +22,9 @@
 >
 > [Lookup source attribution](#lookup-source-attribution) explains this committed
 > evidence without initiating source requests or using desired-but-unapplied decisions.
+>
+> [OpenZiti upstream transport](#openziti-upstream-transport) optionally connects
+> LAPI and custom-list clients to private services without host-wide tunneling.
 
 ## Contents
 
@@ -47,6 +50,7 @@
   - [Provider identity, refresh, and fallback](#provider-identity-refresh-and-fallback)
   - [Upstream meaning and freshness limits](#upstream-meaning-and-freshness-limits)
   - [Why not go-cloudip](#why-not-go-cloudip)
+- [OpenZiti upstream transport](#openziti-upstream-transport)
 - [CrowdSec stream](#crowdsec-stream)
   - [Supported LAPI contract](#supported-lapi-contract)
   - [Compatibility rationale and primary-source evidence](#compatibility-rationale-and-primary-source-evidence)
@@ -222,9 +226,10 @@ credentials or other secrets.
 The prefix cache is a content-addressed object store, not a directory whose
 current files are assembled on restart. Source objects and manifests are
 immutable; publication selects one complete manifest.
-New objects and manifests use schema version 2; committed version-1 RIPEstat
-objects and manifests remain readable, stabilizable, and protected from
-collection by their original exact references. The fields below describe
+New objects and manifests use schema version 3 with explicit
+[transport identity](#transport-identity-and-saved-evidence). Committed
+version-1/2 objects and manifests remain readable, stabilizable, and protected
+from collection by their original exact references. The fields below describe
 RIPEstat records; [list identity](#list-identity-and-immutable-cache) adds
 source-specific metadata within the same cache.
 
@@ -235,6 +240,7 @@ A selector object is canonical UTF-8 JSON containing:
 - its schema version;
 - normalized selector identity;
 - endpoint and API version;
+- effective transport identity;
 - request parameters and query times;
 - separate sorted IPv4 and IPv6 arrays; and
 - the normalized-result content identifier.
@@ -504,16 +510,17 @@ source failures; never dump response bodies.
 ### Provider identity, refresh, and fallback
 
 The separate `provider` selector/source kind is keyed by the exact provider ID,
-not a synthetic entry in the user-defined `ip_lists` namespace. Its version-2
+not a synthetic entry in the user-defined `ip_lists` namespace. Its
 objects and manifest entries store `source_kind: "provider"`, `source_name`
 equal to that ID, `endpoint` equal to the derived CDN URL, and `api_version: "1"`
 for the shared text parser. Retrieval time, normalized family arrays, and
-content identifiers follow the existing static-source format.
+content identifiers follow the existing static-source format. New version-3
+records explicitly bind providers to direct transport.
 The derived URL and parser identity must match the candidate's source mapping;
 an old object for another provider, endpoint, or format is not fallback.
 Changing only refresh/timeout settings does not change source identity.
 
-Provider-containing manifests retain the version-2 `source: "static"` root and
+Provider-containing manifests retain the `source: "static"` root introduced in version 2 and
 bind every required selector to an exact immutable object. There is no parallel
 cache. Existing version-1 RIPEstat and version-2 custom-list evidence remains
 readable and stabilizable by its exact stored object references. Provider
@@ -573,6 +580,147 @@ its separate `cloudip-db` pipeline currently covers a smaller provider set.
 Its own cache, embedded fallback, and update lifecycle are not perimeterd's
 committed-source authority. Reuse the existing text transport/parser and static
 transaction path instead.
+
+## OpenZiti upstream transport
+
+The [configuration](configuration.md#optional-openziti-configuration)
+selects a transport independently for each custom list and for the CrowdSec
+client. Omission means the existing direct transport. RIPEstat and named-provider
+feeds remain direct; custom lists can represent privately hosted equivalents.
+The selected source kind, text/JSON parsing, include/exclude algebra, and dynamic
+decision semantics do not change.
+
+### Service binding and HTTP safety
+
+Bind an opted-in HTTP client to one loaded identity generation and exact service
+name using the SDK's service-dial API, not a dialer that can fall back to the
+ordinary network when interception or discovery fails. Apply this to every
+connection, including reconnects and pool replacements. Never share an HTTP
+connection across identities, service bindings, or application origins.
+An HTTP proxy environment variable must not redirect an opted-in application
+request onto the ordinary network. SDK control/edge connections still require
+ordinary underlay DNS/connectivity; application hostnames do not.
+
+The URL supplies HTTP Host, path/query, and HTTPS server-name/certificate
+verification. TLS runs over the Ziti connection for an HTTPS URL, using the
+normal OS trust store. A Ziti identity's controller CA is not automatically a
+trusted CA for the application endpoint. Do not add `insecure_skip_verify`,
+rewrite the URL to the Ziti service name, or weaken LAPI API-key authentication.
+Plain HTTP remains permitted under the existing source rules, but Ziti
+encryption may end at a hosting proxy/router rather than at the HTTP server.
+
+For a Ziti custom list, follow at most ten redirects and only within the
+configured origin (same scheme, hostname, and effective port). Relative and
+same-origin redirects use the same identity/service. Reject cross-origin,
+scheme-changing, and downgrade redirects rather than discovering another
+service or falling back to direct HTTP. For a Ziti LAPI, reject redirects.
+Existing direct-source redirect behavior is unchanged.
+
+The caller's wait for authentication, service discovery, router selection,
+dialing, application TLS, redirects, and body reading must fit its existing
+end-to-end deadline. Cancellation releases the caller; late-arriving connections
+are closed rather than handed to an abandoned request. Admit at most eight
+perimeterd SDK dial workers process-wide and one per loaded identity generation,
+before creating goroutines; waiting for admission is itself cancellable.
+Preserve existing decoded-body limits, static request concurrency, selector
+limits, CrowdSec retry/backoff, and the process startup deadline. SDK connection
+maintenance must not issue extra source GETs or create an independent LAPI stream
+consumer.
+
+### SDK cancellation limitation
+
+The integration uses unmodified `sdk-golang v1.8.2`, not a local SDK fork.
+That release's controller-version discovery retries without observing context
+closure, and parts of authentication do not honor the dial caller's context.
+Consequently, SDK background work can survive request cancellation or SDK
+`Close`; perimeterd must not claim to have drained it. This limitation was
+explicitly accepted rather than patched locally.
+
+Perimeterd bounds its own caller waits, admission, and shutdown, closes its HTTP
+pools, and invokes SDK context closure outside the writer. A stuck SDK dial holds
+one of the eight admission slots until it returns; if all slots remain occupied,
+further Ziti dials time out waiting for admission. Direct sources and read-only
+lookup are independent of those slots. SDK-internal discovery workers are not
+covered by this application worker limit and may remain after retired contexts,
+especially during repeated failed activations or identity changes. Process exit
+terminates that residual work; operators may need a controlled restart after
+connectivity is restored. These failures never authorize direct fallback or
+extend CrowdSec decisions.
+
+The limitation is reproducible with a controller returning HTTP 503: a 100 ms
+dial context expires while the SDK call remains blocked, and version requests
+continue after SDK `Close`. See the pinned
+[discovery loop](https://github.com/openziti/sdk-golang/blob/v1.8.2/edge-apis/client_edge_client.go#L272-L286).
+
+### Transport identity and saved evidence
+
+New selector objects/manifests use a version-3 extension
+that binds every entry to its transport as well as its existing selector,
+URL/parameters, and parser identity. Direct entries record `type: "direct"`.
+Ziti list entries additionally record the selected identity profile name,
+exact service name, and a non-secret `identity_generation` fingerprint.
+No raw identity JSON, private key, authentication token, or SDK session is
+stored in source objects, manifests, revisions, or journals.
+Use a `transport` mapping on the object and corresponding manifest entry:
+`type` is always present; `identity`, `identity_generation`, and `service` are
+required only for `openziti` and forbidden for `direct`. The generation is
+64 lowercase hexadecimal SHA-256 digits. Entry/object identities must agree;
+reject unknown fields, unsupported combinations, and malformed fingerprints.
+
+Compute the generation once as SHA-256 over the loaded identity's canonical
+controller endpoint/trust configuration and public client certificate chain/key.
+Validate that private keys match their certificates, but do not persist or
+log private-key material. Changing controller/trust configuration or client
+certificate changes the generation even if the file path is unchanged.
+This deliberately treats certificate renewal conservatively as a new generation
+requiring a fresh fetch before data can be selected under that identity.
+Ordinary refresh uses the committed loaded generation; it must not re-read
+credentials at the same path and silently change routing authority.
+
+Changing direct/Ziti mode, identity profile/generation, or service requires a
+new source identity, just as changing a URL does. Old-route data is not fallback
+for the new route, even if list name and URL are identical. Timing-only changes
+do not invalidate data. Reuse/fallback requires a complete committed snapshot
+matching every effective identity; an outage never resets retrieval timestamps.
+
+Version-1 RIPEstat and version-2 direct list/provider evidence remains readable
+and is interpreted only as direct transport. Recover legacy objects by their
+saved identifiers without rewriting them or inventing Ziti identity evidence.
+Recovery, integrity checks, and garbage collection use saved routing metadata
+without loading credentials or contacting Ziti. Fresh activation of a selected
+Ziti configuration still validates its referenced local identity material.
+Lookup continues to explain committed source membership without using an SDK
+context or treating current Ziti availability as firewall authority.
+
+### Failure and dynamic-authority boundaries
+
+| Condition | Required behavior |
+| --- | --- |
+| Direct-only or no active Ziti references | No identity-file access, SDK contexts, enrollment, or Ziti traffic; preserve existing behavior and prerequisites |
+| Referenced identity cannot be loaded/validated | Fail startup activation or reject the reload; no direct fallback, and do not replace the active generation |
+| Ziti list unavailable or unauthorized | Fail that fetch; retain selected static enforcement and normal retry scheduling; use only exact-identity complete committed fallback where already permitted |
+| Changed route/identity cannot fetch its list | Reject activation of the changed identity; never reinterpret the old route's cache as new evidence |
+| Initial Ziti LAPI synchronization fails | Withhold readiness or reject replacement, under the existing LAPI startup/reload contract |
+| Active Ziti LAPI disconnects or access is revoked | Mark disconnected, retain only normally unexpired decisions/finite leases, and retry full authoritative synchronization; never renew expired decisions because Ziti is unavailable |
+| One SDK context serves both a list and LAPI | Share connections, not source authority: preserve independent list deadlines, LAPI expiry/cursor handling, and existing health semantics |
+
+Changes to LAPI transport, identity generation, or service are endpoint/credential
+replacements even when the application URL and API key stay the same. Stage a
+separate full snapshot and promote it only through the enclosing configuration
+transaction; never union decisions from old and new routes. SDK reconnect alone
+does not make a CrowdSec cursor authoritative. On failure, resume the selected
+client using existing full-resynchronization rules.
+
+Logs use configured source/profile names and bounded failure classes, not raw
+SDK configuration, URLs, keys, session tokens, or unredacted SDK errors.
+Existing source-kind timestamps and connection/enforcement health retain their
+meaning; identity IDs and service names do not become metric labels.
+
+Upstream references: the [Go SDK](https://github.com/openziti/sdk-golang),
+[HTTP client example](https://github.com/openziti/sdk-golang/blob/main/example/http-client/README.md),
+and [service termination model](https://netfoundry.io/docs/openziti/learn/core-concepts/services/overview/#service-termination).
+Examples are integration guidance, not permission to copy disabled TLS
+verification or substitute mutable SDK `main` for a pinned tested release.
 
 ## CrowdSec stream
 
@@ -1092,8 +1240,8 @@ or a byte-for-byte upstream record. Country evidence still means allocation or
 registration country, not physical location. Provider evidence still means
 membership in that feed, not proof of endpoint ownership. Display source
 kind/name and retrieval time without exposing potentially secret-bearing URLs.
-No cache schema change or raw-response retention is required for this feature;
-existing version-1 and version-2 recovery compatibility must remain intact.
+Lookup requires no additional cache schema change or raw-response retention;
+version-1/2/3 recovery compatibility remains intact.
 
 ### CrowdSec provenance
 

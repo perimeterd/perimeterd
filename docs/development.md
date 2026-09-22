@@ -23,8 +23,9 @@ internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
 internal/source/              RIPEstat resolution, immutable cache and local HTTP fixtures
 internal/state/               revision store, record codec/validation and durable filesystem IO
+internal/upstream/            identity capture, bounded SDK admission and service-bound HTTP pools
 configs/perimeterd.yaml       full-schema annotated example; not a runtime capability list
-.github/workflows/ci.yml      quality, build, unit/race, native firewall, Docker and real-LAPI gates
+.github/workflows/ci.yml      quality, build, unit/race, native firewall, Docker, LAPI and Ziti gates
 .github/workflows/codeql.yml  Go security analysis
 tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
 tests/crowdsec/              pinned real-LAPI streaming compatibility gate
@@ -510,6 +511,65 @@ own behavior; keep their checks in the existing verification gates.
 | Private interface | Root-only socket, metrics-disabled operation, ownership-lock exclusion, safe stale-socket handling, reload reuse, shutdown cleanup, daemon absence, protocol mismatch, and JSON/human exit semantics preserve the contract. Requests make no source/credential/backend calls and do not alter counters, leases, readiness, or durable state. | Isolated socket/CLI tests; privileged lifecycle smoke |
 | Bounded failure | Oversized request/response, too many partitions/evidence records, concurrency saturation, cancellation, and slow clients fail explicitly without partial success, unbounded work, or writer starvation. Invalid/unknown results never imply allow. | Deterministic limit/deadline cases; concurrent query/write race coverage |
 
+### Optional OpenZiti transport
+
+The [architecture](architecture.md#optional-openziti-upstream-transport),
+[configuration](configuration.md#optional-openziti-configuration),
+and [transport contract](data-sources.md#openziti-upstream-transport)
+own the feature. The standard binary pins unmodified `sdk-golang v1.8.2`;
+the real fixture pins OpenZiti controller/router/CLI **2.0.4** and CrowdSec
+**1.8.1**. No build tag, SDK shared library, host tunneler, enrollment, or
+credential is required to run a direct-only deployment. Static `linux/amd64`
+and `linux/arm64` builds remain supported.
+
+With the [native prerequisites](#privileged-end-to-end-suite) installed, provide
+the pinned `ziti` executable and a directory containing the real `crowdsec` and
+`cscli` binaries (symlinks into the release archive are sufficient):
+
+```sh
+E2E_SUDO=sudo \
+ZITI_TEST_BINARY=/absolute/path/to/ziti \
+CROWDSEC_TEST_BINDIR=/absolute/path/to/crowdsec-bin \
+make test-openziti
+```
+
+The gate verifies versions, creates private user/network/mount/PID namespaces,
+and provisions disposable controller/router, enrolled identities, services,
+HTTP(S) list endpoints, and two real LAPIs. It runs nftables, iptables-legacy,
+and iptables-nft. CI verifies SHA-256 checksums before extracting fixture
+archives; update versions and checksums together. No production identity,
+controller, LAPI, or host tunneler is used.
+
+Native cases cover mixed direct/private feeds, unresolved application names,
+proxy and cross-origin escape rejection, HTTPS hostname validation, denied
+services, same-path identity rotation, IPv4/IPv6 enforcement and lookup,
+shared list/LAPI identity use, and a same-URL/same-key LAPI service replacement
+that requires a new full snapshot without retaining the old authority.
+Stopping the replacement LAPI proves finite IPv6 decision expiry during outage.
+Focused adapter/cache/lifecycle tests cover the remaining boundaries below.
+
+| Contract | Concrete behavior or boundary | Verification layer |
+| --- | --- | --- |
+| True opt-in | Legacy/explicit-direct configs, empty or unused profiles, unreferenced lists, and disabled CrowdSec never read identity files or initialize/contact Ziti; existing direct transport behavior stays unchanged. | Offline schema cases plus actual daemon smoke with inaccessible identity paths and forbidden Ziti endpoints |
+| Exact routing | Explicit identity/service selection works with a non-resolving application hostname and no host tunneler. Unmatched services, denied access, revoked identity, and proxy environment variables never produce direct application connections. | Pinned private Ziti network; direct-listener/DNS tripwires |
+| HTTP/TLS isolation | Valid HTTPS works; wrong application hostname/CA fails. Ziti controller trust does not replace application trust. List same-origin redirects work within limits; cross-origin/scheme redirects and all LAPI redirects fail without leaking API keys. | Real HTTPS endpoints through Ziti plus negative routing probes |
+| Deadlines and bounds | Slow auth/discovery/dial/TLS/body, cancellation and router outage honor caller fetch/startup limits, static concurrency, response-size caps, bounded application dial admission, and bounded shutdown. Explicitly verify the [unmodified SDK cleanup limitation](data-sources.md#sdk-cancellation-limitation); do not claim all SDK work drains. | Focused cancellation/resource regressions and supervised daemon scenarios |
+| Credential generations | Same-path replacement, referenced-file changes, rejected/superseded reloads, last-reference removal, shared identity users, and uncertain commit/recovery cannot close the selected context or reuse a stale connection under new identity authority. | App race/fault cases plus actual identity rotation and reconnect |
+| Source identity | Direct/Ziti, profile, generation, service, and URL changes cannot borrow old-route fallback. Version-1/2 direct evidence remains recoverable; version-3 objects are checked without credentials/network access. | Cache compatibility/corruption/recovery fixtures and offline restart/cleanup |
+| Static policy | Mixed direct/Ziti lists preserve complete-snapshot publication, causal include/exclude attribution, and refresh failure retention. SDK outages do not affect read-only lookup of healthy retained enforcement. | Actual CLI and IPv4/IPv6 packet probes on nftables and both iptables families |
+| CrowdSec authority | API-key authentication, duplicate IDs, full resynchronization, finite leases/expiry, and same-URL identity/service replacement keep the existing LAPI contract. List and LAPI sharing a context do not share cursors, source state, or deadlines. | Supported real LAPI exposed through Ziti; native expiry/reload/failure scenarios |
+| Secret and deployment boundary | Identity/config/key/token material never appears in logs, metrics, or durable evidence; SDK inclusion preserves supported static builds and introduces no extra direct-only installation/service requirements. | Error/log capture, saved-state inspection, cross-build and existing delivery gates |
+
+Use isolated disposable infrastructure, not an operator's Ziti network. A fake
+dialer cannot establish no-fallback, authorization, cancellation, or SDK lifecycle
+behavior. `TestControllerStallDoesNotBlockCallerOrManagerShutdown` exercises the
+real SDK against a stalled HTTPS controller. The adapter joins the SDK's public
+capability-discovery barrier before authentication to avoid its initial TLS
+configuration race; the wait remains admitted and does not block caller
+cancellation or manager shutdown. This ordering does not repair the documented
+SDK-internal cleanup limitation. Keep existing native, Docker, CrowdSec
+compatibility, lookup, lint, and race gates passing.
+
 ### Metrics
 
 | Contract | Concrete behavior or boundary | Verification layer |
@@ -572,7 +632,7 @@ and packaging matrix](#service-and-packaging).
 ## Pull-request and branch CI
 
 The existing `.github/workflows/ci.yml` triggers for pull requests targeting
-`main` and pushes to `main`. It has five current jobs:
+`main` and pushes to `main`. It has six current jobs:
 
 - `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
   `coverage.out`.
@@ -585,6 +645,9 @@ The existing `.github/workflows/ci.yml` triggers for pull requests targeting
 - `isolated Docker coexistence` provisions the checksum-pinned Docker 29.8.1
   Engine toolset and runs `E2E_SUDO=sudo make test-docker`, covering IPv4/IPv6
   bridge packet paths on both iptables tool families.
+- `real OpenZiti list and LAPI transports` provisions checksum-pinned OpenZiti
+  2.0.4 and CrowdSec 1.8.1 binaries and runs `E2E_SUDO=sudo make test-openziti`
+  with explicit fixture paths, covering all three native backend variants.
 
 The separate `.github/workflows/codeql.yml` scans Go for the same pull-request
 and `main` push events plus its weekly schedule. Renovate tracks Go modules

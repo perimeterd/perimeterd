@@ -20,6 +20,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedManifest string, allowStale bool) (resolution Resolution, resolveErr error) {
@@ -61,11 +62,26 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 			return Resolution{}, fmt.Errorf("source: committed manifest: %w", err)
 		}
 	}
+	expectedBindings := make(map[policy.Selector]upstream.Binding)
+	for _, selector := range required {
+		if selector.Kind != policy.IPList {
+			continue
+		}
+		list, ok := cfg.IPLists[selector.Value]
+		if !ok {
+			return Resolution{}, fmt.Errorf("source: custom list %q is not configured", selector.Value)
+		}
+		binding, bindingErr := r.bindingForRoute(list.Transport)
+		if bindingErr != nil {
+			return Resolution{}, fmt.Errorf("source: custom list %q transport: %w", selector.Value, bindingErr)
+		}
+		expectedBindings[selector] = binding
+	}
 	committedBySelector := recordsBySelector(committed.Records())
 	committedCovers := true
 	for _, selector := range required {
 		record, ok := committedBySelector[selector]
-		if !ok || !recordMatchesConfig(record, cfg) {
+		if !ok || !recordMatchesResolved(record, cfg, expectedBindings) {
 			committedCovers = false
 			break
 		}
@@ -75,7 +91,7 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 	stale := make([]policy.Selector, 0, len(required))
 	for _, selector := range required {
 		record, ok := committedBySelector[selector]
-		if !ok || !recordMatchesConfig(record, cfg) {
+		if !ok || !recordMatchesResolved(record, cfg, expectedBindings) {
 			stale = append(stale, selector)
 			continue
 		}
@@ -220,14 +236,16 @@ func recordMatchesConfig(record Record, cfg config.Config) bool {
 			record.SourceKind == listSourceKind &&
 			record.SourceName == record.Selector.Value &&
 			record.Endpoint == endpoint &&
-			record.APIVersion == listFormatVersion
+			record.APIVersion == listFormatVersion &&
+			bindingMatchesConfig(record.Transport, list.Transport)
 	case policy.Provider:
 		expected, err := providerEndpoint(record.Selector.Value)
 		return err == nil &&
 			record.SourceKind == providerSourceKind &&
 			record.SourceName == record.Selector.Value &&
 			record.Endpoint == expected &&
-			record.APIVersion == listFormatVersion
+			record.APIVersion == listFormatVersion &&
+			isDirectBinding(record.Transport)
 	case policy.Country, policy.ASN:
 		if record.SourceKind != "" && record.SourceKind != ripeSourceKind {
 			return false
@@ -238,13 +256,39 @@ func recordMatchesConfig(record Record, cfg config.Config) bool {
 			expected = asnEndpoint
 			version = endpointVersions[asnEndpoint]
 		}
-		return record.Endpoint == expected && record.APIVersion == version
+		return record.Endpoint == expected && record.APIVersion == version && isDirectBinding(record.Transport)
 	default:
 		return false
 	}
 }
 
-type listRequestMarker struct{}
+func recordMatchesResolved(record Record, cfg config.Config, expected map[policy.Selector]upstream.Binding) bool {
+	if !recordMatchesConfig(record, cfg) {
+		return false
+	}
+	if record.Selector.Kind != policy.IPList {
+		return true
+	}
+	binding, ok := expected[record.Selector]
+	return ok && record.Transport == binding
+}
+
+func isDirectBinding(binding upstream.Binding) bool {
+	return binding.Type == "" || binding.Type == upstream.TypeDirect
+}
+
+func bindingMatchesConfig(binding upstream.Binding, route config.TransportConfig) bool {
+	if route.Type == "" || route.Type == upstream.TypeDirect {
+		direct := upstream.Binding{Type: upstream.TypeDirect}
+		return isDirectBinding(binding) && direct.MatchesConfig(route)
+	}
+	return binding.MatchesConfig(route)
+}
+
+type (
+	listOriginMarker  struct{}
+	listRequestMarker struct{}
+)
 
 func markListRequest(ctx context.Context) context.Context {
 	return context.WithValue(ctx, listRequestMarker{}, true)
@@ -266,6 +310,42 @@ func validateListURL(value *url.URL) error {
 	return err
 }
 
+func markListOrigin(ctx context.Context, value *url.URL) context.Context {
+	if value == nil {
+		return ctx
+	}
+	origin := url.URL{Scheme: value.Scheme, Host: value.Host}
+	return context.WithValue(ctx, listOriginMarker{}, origin.String())
+}
+
+func sameURLOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	hostA, hostB := strings.ToLower(a.Hostname()), strings.ToLower(b.Hostname())
+	if hostA != hostB {
+		return false
+	}
+	portA, portB := a.Port(), b.Port()
+	if portA == "" {
+		portA = defaultOriginPort(a.Scheme)
+	}
+	if portB == "" {
+		portB = defaultOriginPort(b.Scheme)
+	}
+	return portA == portB
+}
+
+func defaultOriginPort(scheme string) string {
+	if strings.EqualFold(scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
 func normalizeListURL(raw string) (string, error) {
 	return config.NormalizeIPListURL(raw)
 }
@@ -285,12 +365,24 @@ func classifyListRequestError(err error) error {
 	switch {
 	case strings.Contains(message, "downgrade"):
 		return errors.New("redirect downgrade rejected")
+	case strings.Contains(message, "origin changed"):
+		return errors.New("redirect origin changed")
 	case strings.Contains(message, "too many redirects"):
 		return errors.New("too many redirects")
 	case strings.Contains(message, "certificate"), strings.Contains(message, "tls"):
 		return errors.New("TLS verification failed")
 	default:
 		return errors.New("request failed")
+	}
+}
+
+type idleConnectionCloser interface {
+	CloseIdleConnections()
+}
+
+func closeIdleConnections(transport http.RoundTripper) {
+	if closer, ok := transport.(idleConnectionCloser); ok {
+		closer.CloseIdleConnections()
 	}
 }
 
@@ -391,12 +483,19 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	endpoint := countryEndpoint
 	sourceLabel := ""
 	values := url.Values{"sourceapp": {"perimeterd"}}
+	var route config.TransportConfig
+	var binding upstream.Binding
 	switch selector.Kind {
 	case policy.IPList:
 		sourceLabel = fmt.Sprintf("custom list %q", selector.Value)
 		configured, ok := cfg.IPLists[selector.Value]
 		if !ok {
 			return Record{}, fmt.Errorf("custom list %q is not configured", selector.Value)
+		}
+		route = configured.Transport
+		binding, err = r.bindingForRoute(route)
+		if err != nil {
+			return Record{}, fmt.Errorf("custom list %q transport: %w", selector.Value, err)
 		}
 		endpoint, err = normalizeListURL(configured.URL)
 		if err != nil {
@@ -424,8 +523,20 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		}
 		return Record{}, err
 	}
+	client := r.client
 	if text {
 		ctx = markListRequest(ctx)
+		if selector.Kind == policy.IPList && route.Type == upstream.TypeOpenZiti {
+			ctx = markListOrigin(ctx, u)
+			transport, transportErr := r.session.Transport(route, endpoint)
+			if transportErr != nil {
+				return Record{}, fmt.Errorf("%s transport: %w", sourceLabel, transportErr)
+			}
+			defer closeIdleConnections(transport)
+			owned := *r.client
+			owned.Transport = transport
+			client = &owned
+		}
 	} else {
 		u.RawQuery = values.Encode()
 	}
@@ -441,7 +552,7 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	resp, err := r.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		if text {
 			requestErr := classifyListRequestError(err)
@@ -482,20 +593,28 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	if len(body) > maxBodyBytes {
 		return Record{}, fmt.Errorf("response exceeds %d-byte limit", maxBodyBytes)
 	}
+	var record Record
 	if text {
-		return parseTextList(body, endpoint, selector)
-	}
-	params := make(map[string]string, len(values))
-	for key, list := range values {
-		if len(list) != 1 {
-			return Record{}, fmt.Errorf("request parameter %q has unexpected multiplicity", key)
+		record, err = parseTextList(body, endpoint, selector)
+	} else {
+		params := make(map[string]string, len(values))
+		for key, list := range values {
+			if len(list) != 1 {
+				return Record{}, fmt.Errorf("request parameter %q has unexpected multiplicity", key)
+			}
+			params[key] = list[0]
 		}
-		params[key] = list[0]
+		if selector.Kind == policy.Country {
+			record, err = parseCountry(body, endpoint, params, selector)
+		} else {
+			record, err = parseASN(body, endpoint, params, selector)
+		}
 	}
-	if selector.Kind == policy.Country {
-		return parseCountry(body, endpoint, params, selector)
+	if err != nil {
+		return Record{}, err
 	}
-	return parseASN(body, endpoint, params, selector)
+	record.Transport = binding
+	return record, nil
 }
 
 func parseList(body []byte, endpoint string, selector policy.Selector) (Record, error) {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -347,6 +348,99 @@ func TestParseRejectsUnsafeProviderIDsAndSettings(t *testing.T) {
 	} {
 		if _, err := Parse([]byte(input)); err == nil {
 			t.Errorf("invalid provider configuration was accepted:\n%s", input)
+		}
+	}
+}
+
+func TestParseOpenZitiTransportsAndCanonicalDirectDefaults(t *testing.T) {
+	input := []byte(`version: 1
+openziti:
+  identities:
+    private-sources:
+      identity_file: /does/not/exist/openziti.json
+ip_lists:
+  public-feed:
+    url: https://example.org/public.txt
+    transport:
+      type: direct
+  private-feed:
+    url: https://feeds.internal/private.txt
+    transport:
+      type: openziti
+      identity: private-sources
+      service: Perimeterd-Private-Feeds
+crowdsec:
+  transport:
+    type: openziti
+    identity: private-sources
+    service: perimeterd-lapi
+firewall:
+  backend: nftables
+`)
+	cfg, err := Parse(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.OpenZiti.Identities["private-sources"].IdentityFile; got != "/does/not/exist/openziti.json" {
+		t.Fatalf("identity file changed: %q", got)
+	}
+	if got := cfg.IPLists["public-feed"].Transport; !got.IsZero() {
+		t.Fatalf("explicit direct transport was not canonicalized: %#v", got)
+	}
+	private := cfg.IPLists["private-feed"].Transport
+	if private.Type != "openziti" || private.Identity != "private-sources" || private.Service != "Perimeterd-Private-Feeds" {
+		t.Fatalf("OpenZiti list transport was not retained: %#v", private)
+	}
+	if got := cfg.CrowdSec.Transport; got != (TransportConfig{Type: "openziti", Identity: "private-sources", Service: "perimeterd-lapi"}) {
+		t.Fatalf("CrowdSec transport was not retained: %#v", got)
+	}
+
+	legacy, err := Parse([]byte("version: 1\nfirewall:\n  backend: nftables\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitDirect, err := Parse([]byte(`version: 1
+firewall:
+  backend: nftables
+ip_lists:
+  feed:
+    url: https://example.org/feed
+    transport: {}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyWire, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	explicitWire, err := json.Marshal(explicitDirect)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(legacyWire) == "" || string(explicitWire) == "" {
+		t.Fatal("empty normalized config wire")
+	}
+	if strings.Contains(string(legacyWire), "OpenZiti") || strings.Contains(string(explicitWire), "Transport") {
+		t.Fatalf("canonical direct defaults leaked into legacy wire: legacy=%s explicit=%s", legacyWire, explicitWire)
+	}
+}
+
+func TestParseOpenZitiRejectsInvalidDefinitionsOffline(t *testing.T) {
+	base := "version: 1\nfirewall: {backend: nftables}\n"
+	cases := []string{
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: relative.json\n",
+		base + "openziti:\n  identities:\n    profile: null\n",
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: /tmp/profile.json\nip_lists:\n  feed:\n    url: https://example.org/feed\n    transport:\n      type: openziti\n      identity: missing\n      service: service\n",
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: /tmp/profile.json\nip_lists:\n  feed:\n    url: https://example.org/feed\n    transport:\n      identity: profile\n      service: service\n",
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: /tmp/profile.json\nip_lists:\n  feed:\n    url: https://example.org/feed\n    transport:\n      type: openziti\n      identity: profile\n      service: '   '\n",
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: /tmp/profile.json\nip_lists:\n  feed:\n    url: https://example.org/feed\n    transport:\n      type: unsupported\n      identity: profile\n      service: service\n",
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: /tmp/profile.json\ncrowdsec:\n  transport:\n    type: openziti\n    identity: missing\n    service: service\n",
+		base + "openziti:\n  identities:\n    profile:\n      identity_file: /tmp/profile.json\nip_lists:\n  feed:\n    url: https://example.org/feed\n    transport:\n      type: direct\n      identity: profile\n",
+	}
+	for _, input := range cases {
+		if _, err := Parse([]byte(input)); err == nil {
+			t.Errorf("invalid OpenZiti configuration was accepted:\n%s", input)
 		}
 	}
 }

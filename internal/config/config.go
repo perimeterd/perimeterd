@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -33,17 +34,50 @@ type Config struct {
 	Firewall  FirewallConfig          `yaml:"firewall"`
 	Geo       GeoConfig               `yaml:"geo"`
 	Providers ProvidersConfig         `yaml:"providers"`
+	OpenZiti  OpenZitiConfig          `yaml:"openziti,omitempty" json:"OpenZiti,omitzero"`
 	IPLists   map[string]IPListConfig `yaml:"ip_lists"`
 	Groups    map[string][]string     `yaml:"groups"`
 	Policies  []Policy                `yaml:"policies"`
 	CrowdSec  CrowdSecConfig          `yaml:"crowdsec"`
 }
 
-// IPListConfig describes one named HTTP(S) text source.
+// OpenZitiConfig contains reusable, pre-enrolled OpenZiti identity profiles.
+// Profiles are validated offline but are not loaded until an active transport
+// needs one.
+type OpenZitiConfig struct {
+	Identities map[string]OpenZitiIdentityConfig `yaml:"identities,omitempty" json:"Identities,omitzero"`
+}
+
+// OpenZitiIdentityConfig describes one externally enrolled SDK identity.
+type OpenZitiIdentityConfig struct {
+	IdentityFile string `yaml:"identity_file,omitempty" json:"IdentityFile,omitzero"`
+}
+
+// TransportConfig selects the source transport. An empty Type is the
+// canonical direct transport; openziti requires a named identity and service.
+type TransportConfig struct {
+	Type     string `yaml:"type,omitempty" json:"Type,omitzero"`
+	Identity string `yaml:"identity,omitempty" json:"Identity,omitzero"`
+	Service  string `yaml:"service,omitempty" json:"Service,omitzero"`
+}
+
+// IsZero reports whether the transport is the canonical direct default.
+func (t TransportConfig) IsZero() bool {
+	return t.Type == "" && t.Identity == "" && t.Service == ""
+}
+
+// IsZero reports whether no OpenZiti identity profiles are configured.
+func (c OpenZitiConfig) IsZero() bool {
+	return len(c.Identities) == 0
+}
+
+// IPListConfig describes one named HTTP(S) text source and its optional
+// per-source transport.
 type IPListConfig struct {
-	URL             string        `yaml:"url"`
-	RefreshInterval time.Duration `yaml:"refresh_interval"`
-	RequestTimeout  time.Duration `yaml:"request_timeout"`
+	URL             string          `yaml:"url"`
+	RefreshInterval time.Duration   `yaml:"refresh_interval"`
+	RequestTimeout  time.Duration   `yaml:"request_timeout"`
+	Transport       TransportConfig `yaml:"transport,omitempty" json:"Transport,omitzero"`
 }
 
 // LoggingConfig controls structured log verbosity and encoding.
@@ -110,10 +144,11 @@ type ProvidersConfig struct {
 
 // CrowdSecConfig controls the optional CrowdSec LAPI stream.
 type CrowdSecConfig struct {
-	Enabled         bool          `yaml:"enabled"`
-	LAPIURL         string        `yaml:"lapi_url"`
-	APIKeyFile      string        `yaml:"api_key_file"`
-	UpdateFrequency time.Duration `yaml:"update_frequency"`
+	Enabled         bool            `yaml:"enabled"`
+	LAPIURL         string          `yaml:"lapi_url"`
+	APIKeyFile      string          `yaml:"api_key_file"`
+	UpdateFrequency time.Duration   `yaml:"update_frequency"`
+	Transport       TransportConfig `yaml:"transport,omitempty" json:"Transport,omitzero"`
 }
 
 // Policy describes one normalized, backend-neutral policy declaration.
@@ -214,16 +249,32 @@ type rawConfig struct {
 	Firewall  *rawFirewall          `yaml:"firewall"`
 	Geo       *rawGeo               `yaml:"geo"`
 	Providers *rawProviders         `yaml:"providers"`
+	OpenZiti  *rawOpenZiti          `yaml:"openziti"`
 	IPLists   map[string]*rawIPList `yaml:"ip_lists"`
 	Groups    map[string][]string   `yaml:"groups"`
 	Policies  []rawPolicy           `yaml:"policies"`
 	CrowdSec  *rawCrowdSec          `yaml:"crowdsec"`
 }
 
+type rawOpenZiti struct {
+	Identities map[string]*rawOpenZitiIdentity `yaml:"identities"`
+}
+
+type rawOpenZitiIdentity struct {
+	IdentityFile *string `yaml:"identity_file"`
+}
+
+type rawTransport struct {
+	Type     *string `yaml:"type"`
+	Identity *string `yaml:"identity"`
+	Service  *string `yaml:"service"`
+}
+
 type rawIPList struct {
-	URL             *string `yaml:"url"`
-	RefreshInterval *string `yaml:"refresh_interval"`
-	RequestTimeout  *string `yaml:"request_timeout"`
+	URL             *string       `yaml:"url"`
+	RefreshInterval *string       `yaml:"refresh_interval"`
+	RequestTimeout  *string       `yaml:"request_timeout"`
+	Transport       *rawTransport `yaml:"transport"`
 }
 
 type rawLogging struct {
@@ -278,10 +329,11 @@ type rawProviders struct {
 }
 
 type rawCrowdSec struct {
-	Enabled         *bool   `yaml:"enabled"`
-	LAPIURL         *string `yaml:"lapi_url"`
-	APIKeyFile      *string `yaml:"api_key_file"`
-	UpdateFrequency *string `yaml:"update_frequency"`
+	Enabled         *bool         `yaml:"enabled"`
+	LAPIURL         *string       `yaml:"lapi_url"`
+	APIKeyFile      *string       `yaml:"api_key_file"`
+	UpdateFrequency *string       `yaml:"update_frequency"`
+	Transport       *rawTransport `yaml:"transport"`
 }
 
 type rawPolicy struct {
@@ -335,6 +387,7 @@ func normalize(raw rawConfig) (Config, error) {
 		Groups:    make(map[string][]string),
 		Policies:  []Policy{},
 		CrowdSec:  CrowdSecConfig{Enabled: false, LAPIURL: "http://127.0.0.1:8080", UpdateFrequency: 10 * time.Second},
+		OpenZiti:  OpenZitiConfig{Identities: make(map[string]OpenZitiIdentityConfig)},
 	}
 
 	if raw.Logging != nil {
@@ -368,6 +421,9 @@ func normalize(raw rawConfig) (Config, error) {
 		}
 	}
 	var err error
+	if cfg.OpenZiti.Identities, err = normalizeOpenZiti(raw.OpenZiti); err != nil {
+		return Config{}, err
+	}
 	if cfg.Global.Allowlist, err = normalizePrefixes(allow, "global.allowlist"); err != nil {
 		return Config{}, err
 	}
@@ -486,7 +542,14 @@ func normalize(raw rawConfig) (Config, error) {
 				return Config{}, err
 			}
 		}
+		if raw.CrowdSec.Transport != nil {
+			cfg.CrowdSec.Transport, err = normalizeTransport(*raw.CrowdSec.Transport, cfg.OpenZiti.Identities, "crowdsec.transport")
+			if err != nil {
+				return Config{}, err
+			}
+		}
 	}
+
 	if err := validateURL(cfg.CrowdSec.LAPIURL, "crowdsec.lapi_url"); err != nil {
 		return Config{}, err
 	}
@@ -497,7 +560,7 @@ func normalize(raw rawConfig) (Config, error) {
 		return Config{}, errors.New("crowdsec.update_frequency: must be positive")
 	}
 
-	ipLists, err := normalizeIPLists(raw.IPLists)
+	ipLists, err := normalizeIPLists(raw.IPLists, cfg.OpenZiti.Identities)
 	if err != nil {
 		return Config{}, err
 	}
@@ -641,7 +704,71 @@ func sliceKey(values []string) string {
 	return b.String()
 }
 
-func normalizeIPLists(raw map[string]*rawIPList) (map[string]IPListConfig, error) {
+func normalizeOpenZiti(raw *rawOpenZiti) (map[string]OpenZitiIdentityConfig, error) {
+	out := make(map[string]OpenZitiIdentityConfig)
+	if raw == nil {
+		return out, nil
+	}
+	out = make(map[string]OpenZitiIdentityConfig, len(raw.Identities))
+	for name, value := range raw.Identities {
+		field := "openziti.identities." + name
+		if err := validateName(name, field); err != nil {
+			return nil, err
+		}
+		if value == nil {
+			return nil, fmt.Errorf("%s: required mapping", field)
+		}
+		if value.IdentityFile == nil || *value.IdentityFile == "" {
+			return nil, fmt.Errorf("%s.identity_file: required non-empty value", field)
+		}
+		if !filepath.IsAbs(*value.IdentityFile) {
+			return nil, fmt.Errorf("%s.identity_file: must be an absolute path", field)
+		}
+		out[name] = OpenZitiIdentityConfig{IdentityFile: *value.IdentityFile}
+	}
+	return out, nil
+}
+
+func normalizeTransport(raw rawTransport, identities map[string]OpenZitiIdentityConfig, field string) (TransportConfig, error) {
+	transport := TransportConfig{}
+	if raw.Type != nil {
+		switch *raw.Type {
+		case "", "direct":
+			// The empty type is the canonical direct default.
+		case "openziti":
+			transport.Type = "openziti"
+		default:
+			return TransportConfig{}, fmt.Errorf("%s.type: unsupported value %q", field, *raw.Type)
+		}
+	}
+	if raw.Identity != nil {
+		transport.Identity = *raw.Identity
+	}
+	if raw.Service != nil {
+		transport.Service = *raw.Service
+	}
+	if transport.Type == "" {
+		if raw.Identity != nil || raw.Service != nil {
+			return TransportConfig{}, fmt.Errorf("%s: identity and service are forbidden for direct transport", field)
+		}
+		return TransportConfig{}, nil
+	}
+	if transport.Identity == "" {
+		return TransportConfig{}, fmt.Errorf("%s.identity: required for openziti transport", field)
+	}
+	if err := validateName(transport.Identity, field+".identity"); err != nil {
+		return TransportConfig{}, err
+	}
+	if _, ok := identities[transport.Identity]; !ok {
+		return TransportConfig{}, fmt.Errorf("%s.identity: unknown OpenZiti identity %q", field, transport.Identity)
+	}
+	if strings.TrimSpace(transport.Service) == "" {
+		return TransportConfig{}, fmt.Errorf("%s.service: required non-blank value for openziti transport", field)
+	}
+	return transport, nil
+}
+
+func normalizeIPLists(raw map[string]*rawIPList, identities map[string]OpenZitiIdentityConfig) (map[string]IPListConfig, error) {
 	out := make(map[string]IPListConfig, len(raw))
 	for name, value := range raw {
 		field := "ip_lists." + name
@@ -671,6 +798,12 @@ func normalizeIPLists(raw map[string]*rawIPList) (map[string]IPListConfig, error
 		}
 		if value.RequestTimeout != nil {
 			entry.RequestTimeout, err = positiveDuration(*value.RequestTimeout, field+".request_timeout")
+			if err != nil {
+				return nil, err
+			}
+		}
+		if value.Transport != nil {
+			entry.Transport, err = normalizeTransport(*value.Transport, identities, field+".transport")
 			if err != nil {
 				return nil, err
 			}
@@ -1172,10 +1305,10 @@ func checkRootShape(root *yaml.Node) error {
 	}
 	return checkMappingFields(root, "configuration", map[string]nodeKind{
 		"version": kindInt, "logging": kindMap, "metrics": kindMap, "global": kindMap, "firewall": kindMap,
-		"geo": kindMap, "providers": kindMap, "ip_lists": kindMap, "groups": kindMap, "policies": kindSeq, "crowdsec": kindMap,
+		"geo": kindMap, "providers": kindMap, "openziti": kindMap, "ip_lists": kindMap, "groups": kindMap, "policies": kindSeq, "crowdsec": kindMap,
 	}, map[string]func(*yaml.Node, string) error{
 		"logging": checkLogging, "metrics": checkMetrics, "global": checkGlobal, "firewall": checkFirewall,
-		"geo": checkGeo, "providers": checkProviders, "ip_lists": checkIPListsShape, "groups": checkGroupsShape, "policies": checkPoliciesShape, "crowdsec": checkCrowdSec,
+		"geo": checkGeo, "providers": checkProviders, "openziti": checkOpenZiti, "ip_lists": checkIPListsShape, "groups": checkGroupsShape, "policies": checkPoliciesShape, "crowdsec": checkCrowdSec,
 	})
 }
 
@@ -1220,7 +1353,32 @@ func checkProviders(node *yaml.Node, path string) error {
 }
 
 func checkCrowdSec(node *yaml.Node, path string) error {
-	return checkMappingFields(node, path, map[string]nodeKind{"enabled": kindBool, "lapi_url": kindString, "api_key_file": kindString, "update_frequency": kindString}, nil)
+	return checkMappingFields(node, path, map[string]nodeKind{"enabled": kindBool, "lapi_url": kindString, "api_key_file": kindString, "update_frequency": kindString, "transport": kindMap}, map[string]func(*yaml.Node, string) error{"transport": checkTransportShape})
+}
+
+func checkOpenZiti(node *yaml.Node, path string) error {
+	return checkMappingFields(node, path, map[string]nodeKind{"identities": kindMap}, map[string]func(*yaml.Node, string) error{"identities": checkIdentitiesShape})
+}
+
+func checkIdentitiesShape(node *yaml.Node, path string) error {
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if key.Kind != yaml.ScalarNode || key.Tag != "!!str" {
+			return fmt.Errorf("%s: identity names must be strings", path)
+		}
+		entryPath := path + "." + key.Value
+		if err := expectNode(value, kindMap, entryPath); err != nil {
+			return err
+		}
+		if err := checkMappingFields(value, entryPath, map[string]nodeKind{"identity_file": kindString}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkTransportShape(node *yaml.Node, path string) error {
+	return checkMappingFields(node, path, map[string]nodeKind{"type": kindString, "identity": kindString, "service": kindString}, nil)
 }
 
 func checkFirewall(node *yaml.Node, path string) error {
@@ -1258,8 +1416,8 @@ func checkIPListsShape(node *yaml.Node, path string) error {
 			return err
 		}
 		if err := checkMappingFields(value, entryPath, map[string]nodeKind{
-			"url": kindString, "refresh_interval": kindString, "request_timeout": kindString,
-		}, nil); err != nil {
+			"url": kindString, "refresh_interval": kindString, "request_timeout": kindString, "transport": kindMap,
+		}, map[string]func(*yaml.Node, string) error{"transport": checkTransportShape}); err != nil {
 			return err
 		}
 	}

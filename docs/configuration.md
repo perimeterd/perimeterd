@@ -1,8 +1,8 @@
 # Configuration
 
 > **Schema and policy reference.** Offline validation and the source-build
-> runtime support the fields below, including `ip_lists` and dynamic `providers`
-> settings and selectors. Check the
+> runtime support the fields below, including `ip_lists`, dynamic `providers`,
+> and [optional OpenZiti transport](#optional-openziti-configuration). Check the
 > [implementation plan](implementation-plan.md) and
 > [current runtime instructions](operations.md#current-source-build-runtime)
 > before using a configuration for enforcement.
@@ -19,8 +19,8 @@ install that path. The planned package uses it as its configuration location.
 The runtime defaults state and prefix caches to `/var/lib/perimeterd` and
 creates missing directories when invoked as root. Parsing accepts exactly one
 YAML document. Each schema-defined mapping rejects unknown and duplicate
-fields; `groups` and `ip_lists` are intentionally maps whose keys
-are user-defined names. Scalar types are checked without coercion, and `version` must be
+fields; `groups`, `ip_lists`, and `openziti.identities` intentionally use
+user-defined names as mapping keys. Scalar types are checked without coercion, and `version` must be
 exactly `1`. Explicit nulls, aliases, and merge keys are rejected rather than
 silently defaulted or expanded.
 
@@ -28,9 +28,9 @@ silently defaulted or expanded.
 
 The block in [Fully annotated configuration](#fully-annotated-configuration)
 is one complete YAML document. `configs/perimeterd.yaml` is another complete
-example. Every later YAML block in this document is a root-level fragment:
-merge it into a complete configuration at the shown top-level key before
-running `perimeterd validate`; a fragment is not a standalone configuration.
+example. Every later YAML block in this document is a root-level fragment.
+Fragments can be merged at the shown top-level key before running
+`perimeterd validate`; a fragment is not a standalone configuration.
 
 ## Fully annotated configuration
 
@@ -132,6 +132,7 @@ and are always validated; only the selected backend is applied.
 | `ip_lists.<name>.url` | URL | — | Required absolute HTTP(S) URL |
 | `ip_lists.<name>.refresh_interval` | duration | `24h` | Positive per-list interval |
 | `ip_lists.<name>.request_timeout` | duration | `30s` | Positive timeout for a complete fetch |
+| `ip_lists.<name>.transport` | map | direct | Optional [transport binding](#optional-openziti-configuration) |
 | `providers.refresh_interval` | duration | `24h` | Positive interval shared by named-provider sources |
 | `providers.request_timeout` | duration | `30s` | Positive timeout for a complete provider fetch |
 | `policies` | list | `[]` | Explicit priority order |
@@ -139,6 +140,8 @@ and are always validated; only the selected backend is applied.
 | `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
 | `crowdsec.api_key_file` | path | none | Required by schema when enabled |
 | `crowdsec.update_frequency` | duration | `10s` | Positive |
+| `crowdsec.transport` | map | direct | Optional [transport binding](#optional-openziti-configuration) |
+| `openziti.identities` | map | `{}` | Named enrolled identity-file profiles; [fields below](#optional-openziti-configuration) |
 
 `metrics.listen` must parse as one host:port. The loopback default avoids
 accidental unauthenticated exposure; a non-empty listener that cannot bind
@@ -231,8 +234,9 @@ terminate established connections.
 `ip_lists` is a top-level map of reusable text-list sources. Names follow the
 same lowercase DNS-label-like syntax as policy names and occupy a separate
 namespace from `groups`. Each definition accepts only `url`, `refresh_interval`,
-and `request_timeout`; defaults are listed above. Definitions are validated even
-when unreferenced. An omitted or empty `ip_lists` map defines no sources.
+`request_timeout`, and optional [transport](#optional-openziti-configuration);
+defaults are listed above. Definitions are validated even when unreferenced. An omitted or
+empty `ip_lists` map defines no sources.
 
 `url` must be an absolute `http` or `https` URL with a host, no user information,
 and no fragment. Query strings are permitted; file paths and other schemes are
@@ -362,6 +366,100 @@ policies:
 precedence rules. Provider sets may overlap; an exclusion is subtraction, not a
 global allow. Each ID represents the entire published provider address set, not
 a service/region filter or authenticated provider identity.
+
+## Optional OpenZiti configuration
+
+These additive version-1 fields opt individual upstreams into private-service
+connections. Existing configurations keep direct HTTP(S) behavior without an OpenZiti installation,
+identity file, environment setting, or extra enable/disable switch.
+
+The top-level `openziti.identities` map defines reusable named identity
+profiles. Only `ip_lists.<name>.transport` and `crowdsec.transport` select this
+transport. There is no global default that reroutes other sources.
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `openziti.identities` | map | `{}` | Profile names use the same syntax as policy names |
+| `openziti.identities.<name>.identity_file` | path | none | Required absolute path to an externally enrolled SDK identity configuration |
+| `ip_lists.<name>.transport.type` | enum | `direct` | `direct` or `openziti`; omission of the transport mapping also means direct |
+| `crowdsec.transport.type` | enum | `direct` | Same selection, active only when CrowdSec is enabled |
+| `transport.identity` | text | none | Required named identity profile for `openziti`; forbidden for `direct` |
+| `transport.service` | text | none | Required exact, case-sensitive, non-blank Ziti service name for `openziti`; forbidden for `direct` |
+
+Unknown/duplicate keys, invalid types, explicit nulls, unsupported transport
+types, and missing profile references fail offline validation. All definitions
+are checked even when unused or CrowdSec is disabled; profile files are not read
+until an active upstream needs them. `{}` is the direct transport default, not
+an implicit opt-in inferred from identity/service fields. A defined profile
+alone performs no enrollment, authentication, or connectivity check.
+
+Offline validation checks paths and reference syntax only. It does not open
+identity/key files, resolve names, contact controllers, attest permissions or
+service availability, or satisfy posture requirements. Runtime supports
+pre-enrolled, noninteractive certificate identities with embedded PEM or local
+PEM-file references. Referenced paths resolve relative to the identity file's
+directory, never the process working directory. Interactive login/MFA,
+external-token acquisition, enrollment commands, HSM/plugin configuration, and
+credential-file rotation by the daemon are outside this initial feature.
+
+URLs remain ordinary absolute HTTP(S) URLs under their existing validation.
+`service` selects the connection destination; URL host/port still define
+application authority and HTTPS verification. There is no `ziti://` URL,
+implicit hostname-to-service mapping, TLS verification bypass, or replacement
+for `crowdsec.api_key_file`. Existing request/refresh timeouts remain authoritative;
+there is no independent retry budget that can extend them.
+
+### Mixed-transport example
+
+This root-level fragment leaves one list direct while sharing one Ziti
+identity between a private list and LAPI. The service names are independently
+provisioned; the illustrative `.internal` names need not resolve on the host,
+but their HTTPS certificates must verify against the normal trust store.
+Only lists referenced by enabled policies activate their transport.
+
+```yaml
+openziti:
+  identities:
+    private-sources:
+      identity_file: /etc/perimeterd/credentials.d/openziti/private-sources.json
+
+ip_lists:
+  public-feed:
+    url: https://example.org/public-ips.txt
+    # transport omitted: ordinary HTTP(S), with no Ziti dependency
+  private-feed:
+    url: https://feeds.internal/blocked-ips.txt
+    refresh_interval: 6h
+    request_timeout: 30s
+    transport:
+      type: openziti
+      identity: private-sources
+      service: perimeterd-private-feeds
+
+crowdsec:
+  enabled: true
+  lapi_url: https://lapi.internal:8080
+  api_key_file: /etc/perimeterd/credentials.d/crowdsec_api_key
+  transport:
+    type: openziti
+    identity: private-sources
+    service: perimeterd-lapi
+
+policies:
+  - name: feed-ingress
+    priority: 100
+    direction: ingress
+    mode: blocklist
+    traffic: ["any"]
+    include:
+      ip_lists: [public-feed, private-feed]
+```
+
+An omitted/empty `openziti.identities` map is valid for direct-only deployments.
+An unreferenced profile or list and a disabled CrowdSec client cause no identity
+file access or SDK activity. See [architecture](architecture.md#optional-openziti-upstream-transport)
+for selected-resource ownership and [operations](operations.md#openziti-operations)
+for provisioning, secret handling, and rotation.
 
 ## Policy schema
 

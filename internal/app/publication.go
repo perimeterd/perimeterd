@@ -9,6 +9,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 const metricsCloseTimeout = 5 * time.Second
@@ -33,6 +34,7 @@ type runtimeReservation struct {
 	logger      *slog.Logger
 	refreshErr  error
 	attempted   []policy.Selector
+	session     *upstream.Session
 }
 
 func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger) *runtimePublication {
@@ -61,12 +63,25 @@ func (p *runtimePublication) reserve(result stageResult) error {
 			staged.crowdConnected = p.engine.CrowdSecConnected
 		}
 	}
+	var session *upstream.Session
+	// Engine.Apply consumes the candidate handle; publication must retain its
+	// own handle until the source revision is selected or discarded.
+	if result.candidate.session != nil {
+		session = result.candidate.session.Retain()
+		if session == nil {
+			if staged != nil {
+				_ = staged.closeImmediate()
+			}
+			return errors.New("runtime publication could not retain upstream session")
+		}
+	}
 	p.reservation = &runtimeReservation{
 		staged:     staged,
 		replace:    replace,
 		logger:     result.logger,
 		refreshErr: result.refreshErr,
 		attempted:  result.attempted,
+		session:    session,
 	}
 	return nil
 }
@@ -106,9 +121,10 @@ func (p *runtimePublication) recover(revision *state.Revision) error {
 }
 
 func (p *runtimePublication) publishReservation(revision *state.Revision, reservation *runtimeReservation) error {
-	if err := p.source.selectRevision(revision); err != nil {
+	if err := p.source.selectRevision(revision, reservation.session); err != nil {
 		return errors.Join(err, closeReservation(reservation))
 	}
+	reservation.session = nil
 	p.logger = reservation.logger
 	if reservation.refreshErr != nil {
 		p.source.attempted(reservation.attempted, time.Now())
@@ -172,8 +188,16 @@ func (p *runtimePublication) close() error {
 }
 
 func closeReservation(reservation *runtimeReservation) error {
-	if reservation == nil || reservation.staged == nil {
+	if reservation == nil {
 		return nil
 	}
-	return reservation.staged.closeImmediate()
+	var err error
+	if reservation.staged != nil {
+		err = reservation.staged.closeImmediate()
+	}
+	if reservation.session != nil {
+		reservation.session.Close()
+		reservation.session = nil
+	}
+	return err
 }

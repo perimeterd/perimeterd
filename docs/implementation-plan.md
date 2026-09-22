@@ -6,7 +6,8 @@ acceptance criteria. Detailed contracts live in the linked reference documents.
 
 The first release includes both native backends, CrowdSec, Docker coexistence,
 custom HTTP(S) text IP lists, dynamic named-provider feeds, IP/CIDR lookup with
-source explanations, operational integration, and release gates.
+source explanations, optional embedded OpenZiti transport for LAPI/custom lists,
+operational integration, and release gates.
 Implemented does not mean production-ready; the remaining gates below still apply.
 
 ## Status at a glance
@@ -22,6 +23,7 @@ Implemented does not mean production-ready; the remaining gates below still appl
 | Custom HTTP(S) IP lists | Implemented for both backends | Maintain named include/exclude selectors, bounded fetching, exact cache identity, and per-list refresh/recovery |
 | Named provider feeds | Implemented for both backends | Maintain dynamic include/exclude IDs, jsDelivr `@main` resolution without a catalog, exact cache identity, and complete-snapshot publication |
 | IP/CIDR lookup and explanation | Implemented for both backends | Maintain coherent applied-state publication, complete CIDR/traffic partitions, source attribution, and private bounded transport |
+| Optional OpenZiti upstream transport | Implemented for LAPI and custom lists | Maintain explicit opt-in, immutable identity/service bindings, bounded application lifecycle, and transport-aware recovery without direct fallback; retain the documented unmodified-SDK limitation |
 | Operations and delivery | Source-build CLI, logging, readiness, three HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
 
 ## 1. Foundation and offline configuration validation
@@ -132,9 +134,10 @@ and request timeouts. Both include and exclude selectors support list-only and
 mixed country/ASN/list policy through the existing union/subtraction compiler.
 Validation remains offline; unused lists are not fetched.
 
-The resolver validates complete bounded text responses and stages version-2
-immutable objects/manifests with exact list URL/parser identity. Version-1
-RIPEstat recovery still loads, stabilizes, and retains its original object IDs.
+The resolver validates complete bounded text responses with exact list URL/parser
+identity. This milestone introduced version-2 immutable objects/manifests;
+step 9 extends new evidence to version 3. Legacy RIPEstat and direct-list
+recovery still loads, stabilizes, and retains its original object IDs.
 The shared scheduler preserves independent deadlines and applies retry
 cooldowns only to selectors chosen for fetching. URL changes cannot use old
 endpoint fallback; malformed or unavailable feeds never publish partial state.
@@ -167,8 +170,9 @@ https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/{id}/{id}_i
 No catalog, metadata/discovery request, GitHub API, alternate mirror, or
 `go-cloudip` dependency is used. Only missing/due enabled references fetch,
 with `24h` refresh and `30s` request timeout defaults. Provider records use the
-shared bounded text pipeline and version-2 static manifests; existing RIPEstat
-and custom-list cache generations remain recoverable.
+shared bounded text pipeline and static manifests (version 2 at introduction,
+version 3 since step 9); existing RIPEstat and custom-list cache generations
+remain recoverable.
 
 The existing scheduler, exact attempted-selector retry evidence, and writer
 preserve complete-snapshot publication. New missing IDs prevent activation or
@@ -238,7 +242,57 @@ the pinned private Docker coexistence/security gate. No independent firewall
 reader/writer, query-time packet probe, general GeoIP enrichment, or offline
 fallback is part of this feature.
 
-## 9. Operational and release gates
+## 9. Optional OpenZiti upstream transport
+
+**Status:** implemented with unmodified `sdk-golang v1.8.2` and the explicitly
+accepted [SDK cancellation limitation](data-sources.md#sdk-cancellation-limitation).
+
+The [architecture](architecture.md#optional-openziti-upstream-transport),
+[schema](configuration.md#optional-openziti-configuration),
+[source contract](data-sources.md#openziti-upstream-transport), and
+[operator prerequisites](operations.md#openziti-operations) define the feature.
+Direct-only installations remain unchanged; this milestone requires no host
+tunneler and does not extend the SDK to RIPEstat/fixed provider downloads.
+
+Implemented boundaries:
+
+1. **Offline opt-in schema.** Named identity-file profiles and per-list/LAPI
+   `direct`/`openziti` bindings validate without credential reads or network I/O.
+   Omitted/explicit direct settings preserve legacy defaults and saved hashes;
+   disabled/unreferenced consumers do not activate profiles.
+2. **Identity-scoped HTTP transport.** Securely captured enrolled PEM identities
+   define immutable generations. Exact service dialing, isolated origin pools,
+   normal application TLS, redirect/proxy restrictions, and no direct fallback
+   preserve upstream authority. Application admission is limited to eight SDK
+   dial workers and one per generation, with bounded caller and shutdown waits.
+   SDK-internal discovery/authentication can outlive cancellation; no local SDK
+   patch or promise of complete worker drainage is included.
+3. **Transport-aware static evidence.** Version-3 selector objects/manifests
+   record explicit non-secret bindings. Version-1/2 direct evidence remains
+   recoverable under its original identifiers. Changed profile, generation,
+   service, or transport cannot borrow old-route fallback. Recovery/cleanup
+   remains local and independent of credentials or SDK connectivity.
+4. **Selected runtime and CrowdSec epochs.** Staged/active/pending references
+   follow existing publication and recovery decisions. Same-path rotation takes
+   effect through reload. Rejected candidates cannot close selected contexts.
+   LAPI replacement requires a new full snapshot even at the same URL/API key;
+   old authority is not merged and finite expiry continues during outage.
+5. **Executable acceptance.** `make test-openziti` provisions real pinned
+   OpenZiti 2.0.4 and CrowdSec 1.8.1 fixtures. It covers mixed sources, private
+   routing, authorization, redirects/proxies, application TLS, identity rotation,
+   shared identity use, LAPI authority replacement, outage expiry, lookup, and
+   IPv4/IPv6 packets on nftables and both iptables tool families. A dedicated CI
+   job verifies fixture checksums; standard static amd64/arm64 builds retain the
+   SDK without imposing runtime requirements on direct-only deployments.
+
+The [OpenZiti verification matrix](development.md#optional-openziti-transport)
+owns ongoing acceptance. Keep `make verify`, `make test-race`, full native,
+real-LAPI compatibility, Docker coexistence/security, and lookup/lifecycle
+gates passing. No global HTTP interception, automatic enrollment, interactive
+authentication, host DNS/routing changes, firewall bypass, secret persistence,
+or silent ordinary-network fallback is part of this feature.
+
+## 10. Operational and release gates
 
 **Status:** partially implemented.
 
@@ -256,13 +310,13 @@ release scaffolding only with working artifacts and executable checks.
 
 ## Immediate next task
 
-Complete step 9: full metrics collection and export, installed service/package
-lifecycle and architecture coverage, and signed release artifacts with
-executable release CI.
+Complete step 10's metrics, service/package lifecycle, remaining architecture
+coverage, and signed release gates.
 
 Static source-backed policy, custom HTTP(S) lists, dynamic named providers, both
 native backends, CrowdSec synchronization and decision lifecycle, Docker
-iptables bridge coexistence, and daemon-backed lookup are implemented. Keep
-their writer, recovery, packet-path, query, and compatibility gates passing.
+iptables bridge coexistence, daemon-backed lookup, and optional embedded
+OpenZiti list/LAPI transport are implemented. Keep their writer, recovery,
+packet-path, query, and compatibility gates passing.
 Track new work as issues using acceptance criteria from the owning documents
 rather than maintaining another implementation or test plan.

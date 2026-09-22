@@ -150,6 +150,7 @@ func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	defer candidate.releaseSession() // Apply consumes the candidate's staged session handle.
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
 	selected, stageErr := e.crowd.stageForApply(ctx, candidate)
@@ -619,7 +620,8 @@ func (e *Engine) Close() {
 	e.crowd.closeLocked()
 	e.healthy.Store(false)
 	e.mu.Unlock()
-	e.crowd.workers.Wait()
+	waitGroupBounded(&e.crowd.workers, crowdShutdownTimeout)
+	waitGroupBounded(&e.crowd.retiring, crowdShutdownTimeout)
 }
 
 func (e *Engine) startErrorLocked(ctx context.Context) error {

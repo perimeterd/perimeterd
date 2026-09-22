@@ -41,9 +41,11 @@ Version 1 targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
 RIPEstat-derived geographic/ASN policy, custom HTTP(S) text IP lists in policy
 include/exclude selectors with per-list refresh intervals, direct provider IDs
 resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
-coexistence and IP/CIDR lookup with source explanations are implemented.
-Complete observability, systemd packaging, and signed RPM/DEB releases remain
-part of the target rather than currently available features.
+coexistence, IP/CIDR lookup with source explanations, and
+[optional OpenZiti transport](docs/architecture.md#optional-openziti-upstream-transport)
+for selected CrowdSec/custom-list upstreams are implemented. Direct HTTP(S)
+remains the default, with no Ziti prerequisite. Complete observability, systemd
+packaging, and signed RPM/DEB releases remain planned.
 
 The documents below own the detailed contracts. The implementation plan records
 which parts are implemented; source-build commands do not imply installed
