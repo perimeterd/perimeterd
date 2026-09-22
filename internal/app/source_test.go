@@ -168,13 +168,13 @@ func TestSourceRefreshDeadlineResetsTransportRetryFence(t *testing.T) {
 	}
 	runtime := newSourceRuntime(store.Prefixes(), nil)
 	defer runtime.close()
-	if err := runtime.selectRevision(&state.Revision{Epoch: 1, Manifest: first.ManifestID(), Config: cfg}); err != nil {
+	if err := runtime.selectRevision(&state.Revision{Epoch: 1, Manifest: first.ManifestID(), Config: cfg}, nil); err != nil {
 		t.Fatal(err)
 	}
 	deadline := runtime.deadlines[selector]
 	deadline.retry = now.Add(time.Hour)
 	runtime.deadlines[selector] = deadline
-	if err := runtime.selectRevision(&state.Revision{Epoch: 2, Manifest: second.ManifestID(), Config: cfg}); err != nil {
+	if err := runtime.selectRevision(&state.Revision{Epoch: 2, Manifest: second.ManifestID(), Config: cfg}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := runtime.deadlines[selector].retry; !got.IsZero() {

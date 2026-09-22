@@ -42,25 +42,22 @@ func TestBindingValidationAndDeclarativeMatching(t *testing.T) {
 	}
 }
 
-func TestLoadCapturesReferencedIdentityAndLeavesUnusedProfilesInert(t *testing.T) {
+func TestLoadCapturesSuppliedIdentityAndLeavesUnusedProfilesInert(t *testing.T) {
 	dir := t.TempDir()
 	identityPath := writeIdentityFile(t, dir)
-	cfg := config.Config{
-		OpenZiti: config.OpenZitiConfig{Identities: map[string]config.OpenZitiIdentityConfig{
-			"private": {IdentityFile: identityPath},
-			"unused":  {IdentityFile: filepath.Join(dir, "does-not-exist.json")},
-		}},
-		IPLists: map[string]config.IPListConfig{
-			"private": {Transport: config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}},
-		},
-		Policies: []config.Policy{{Mode: "enforce", Include: config.Selector{IPLists: []string{"private"}}}},
+	profiles := map[string]config.OpenZitiIdentityConfig{
+		"private": {IdentityFile: identityPath},
+		"unused":  {IdentityFile: filepath.Join(dir, "does-not-exist.json")},
 	}
+	route := config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}
 	manager := NewManager()
-	session, err := manager.Load(context.Background(), cfg)
+	session, err := manager.Load(context.Background(), map[string]config.OpenZitiIdentityConfig{
+		"private": profiles["private"],
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	binding, err := session.Binding(cfg.IPLists["private"].Transport)
+	binding, err := session.Binding(route)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +72,13 @@ func TestLoadCapturesReferencedIdentityAndLeavesUnusedProfilesInert(t *testing.T
 	if err := os.WriteFile(identityPath, []byte(rotated), 0o600); err != nil { // #nosec G703 -- identityPath is created under t.TempDir, not derived from credential content.
 		t.Fatal(err)
 	}
-	rotatedSession, err := manager.Load(context.Background(), cfg)
+	rotatedSession, err := manager.Load(context.Background(), map[string]config.OpenZitiIdentityConfig{
+		"private": profiles["private"],
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	rotatedBinding, err := rotatedSession.Binding(cfg.IPLists["private"].Transport)
+	rotatedBinding, err := rotatedSession.Binding(route)
 	if err != nil || rotatedBinding == binding {
 		t.Fatalf("identity rotation did not create a new generation: %v", err)
 	}
@@ -87,7 +86,7 @@ func TestLoadCapturesReferencedIdentityAndLeavesUnusedProfilesInert(t *testing.T
 	if err := os.WriteFile(identityPath, []byte("not-an-identity"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bindingAgain, err := session.Binding(cfg.IPLists["private"].Transport)
+	bindingAgain, err := session.Binding(route)
 	if err != nil || bindingAgain != binding {
 		t.Fatalf("captured session reread or changed identity material: %v", err)
 	}
@@ -105,12 +104,8 @@ func TestLoadCapturesReferencedIdentityAndLeavesUnusedProfilesInert(t *testing.T
 func TestLoadRejectsMismatchedClientKeyBeforeGenerationReuse(t *testing.T) {
 	path := writeIdentityFile(t, t.TempDir())
 	route := config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}
-	cfg := config.Config{
-		OpenZiti: config.OpenZitiConfig{Identities: map[string]config.OpenZitiIdentityConfig{
-			"private": {IdentityFile: path},
-		}},
-		IPLists:  map[string]config.IPListConfig{"private": {Transport: route}},
-		Policies: []config.Policy{{Mode: "enforce", Include: config.Selector{IPLists: []string{"private"}}}},
+	profiles := map[string]config.OpenZitiIdentityConfig{
+		"private": {IdentityFile: path},
 	}
 	manager := NewManager()
 	t.Cleanup(func() {
@@ -118,7 +113,7 @@ func TestLoadRejectsMismatchedClientKeyBeforeGenerationReuse(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	session, err := manager.Load(context.Background(), cfg)
+	session, err := manager.Load(context.Background(), profiles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +149,7 @@ func TestLoadRejectsMismatchedClientKeyBeforeGenerationReuse(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil { // #nosec G703 -- fixed credential fixture path, not credential-derived input.
 		t.Fatal(err)
 	}
-	if accepted, err := manager.Load(context.Background(), cfg); err == nil {
+	if accepted, err := manager.Load(context.Background(), profiles); err == nil {
 		accepted.Close()
 		t.Error("reload accepted a mismatched certificate/private key")
 	}
@@ -167,7 +162,7 @@ func TestLoadRejectsMismatchedClientKeyBeforeGenerationReuse(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if accepted, err := fresh.Load(context.Background(), cfg); err == nil {
+	if accepted, err := fresh.Load(context.Background(), profiles); err == nil {
 		accepted.Close()
 		t.Error("initial load accepted a mismatched certificate/private key")
 	}
@@ -175,17 +170,16 @@ func TestLoadRejectsMismatchedClientKeyBeforeGenerationReuse(t *testing.T) {
 
 func TestBoundTransportHonorsCanceledRequestWithoutSDKStartup(t *testing.T) {
 	dir := t.TempDir()
-	cfg := config.Config{
-		OpenZiti: config.OpenZitiConfig{Identities: map[string]config.OpenZitiIdentityConfig{"private": {IdentityFile: writeIdentityFile(t, dir)}}},
-		IPLists:  map[string]config.IPListConfig{"private": {Transport: config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}}},
-		Policies: []config.Policy{{Mode: "enforce", Include: config.Selector{IPLists: []string{"private"}}}},
+	route := config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}
+	profiles := map[string]config.OpenZitiIdentityConfig{
+		"private": {IdentityFile: writeIdentityFile(t, dir)},
 	}
 	manager := NewManager()
-	session, err := manager.Load(context.Background(), cfg)
+	session, err := manager.Load(context.Background(), profiles)
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, err := session.Transport(cfg.IPLists["private"].Transport, "https://allowed.invalid/list")
+	transport, err := session.Transport(route, "https://allowed.invalid/list")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,13 +268,11 @@ func TestControllerStallDoesNotBlockCallerOrManagerShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	route := config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}
-	cfg := config.Config{
-		OpenZiti: config.OpenZitiConfig{Identities: map[string]config.OpenZitiIdentityConfig{"private": {IdentityFile: path}}},
-		IPLists:  map[string]config.IPListConfig{"private": {Transport: route}},
-		Policies: []config.Policy{{Mode: "enforce", Include: config.Selector{IPLists: []string{"private"}}}},
+	profiles := map[string]config.OpenZitiIdentityConfig{
+		"private": {IdentityFile: path},
 	}
 	manager := NewManager()
-	session, err := manager.Load(context.Background(), cfg)
+	session, err := manager.Load(context.Background(), profiles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,22 +333,20 @@ func TestControllerStallDoesNotBlockCallerOrManagerShutdown(t *testing.T) {
 }
 
 func TestSDKWireDebugIsRejectedOnlyForActiveProfiles(t *testing.T) {
-	path := writeIdentityFile(t, t.TempDir())
-	cfg := config.Config{
-		OpenZiti: config.OpenZitiConfig{Identities: map[string]config.OpenZitiIdentityConfig{"private": {IdentityFile: path}}},
-		IPLists: map[string]config.IPListConfig{
-			"private": {Transport: config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}},
-		},
+	profiles := map[string]config.OpenZitiIdentityConfig{
+		"active": {IdentityFile: filepath.Join(t.TempDir(), "active-does-not-exist.json")},
+		"unused": {IdentityFile: filepath.Join(t.TempDir(), "unused-does-not-exist.json")},
 	}
-	t.Setenv("SWAGGER_DEBUG", "1")
 	manager := NewManager()
-	session, err := manager.Load(context.Background(), cfg)
+	session, err := manager.Load(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("unused SDK profile changed direct-only behavior: %v", err)
 	}
 	session.Close()
-	cfg.Policies = []config.Policy{{Mode: "blocklist", Include: config.Selector{IPLists: []string{"private"}}}}
-	if session, err := manager.Load(context.Background(), cfg); err == nil {
+	t.Setenv("SWAGGER_DEBUG", "1")
+	if session, err := manager.Load(context.Background(), map[string]config.OpenZitiIdentityConfig{
+		"active": profiles["active"],
+	}); err == nil {
 		session.Close()
 		t.Fatal("active SDK profile accepted secret-bearing wire diagnostics")
 	}

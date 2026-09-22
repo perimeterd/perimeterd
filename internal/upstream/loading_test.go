@@ -12,7 +12,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/config"
 )
 
-func TestLoadRejectsOversizedReferencedCredential(t *testing.T) {
+func TestLoadRejectsOversizedSuppliedCredential(t *testing.T) {
 	dir := t.TempDir()
 	identityPath := writeIdentityFile(t, dir)
 	identityData, err := os.ReadFile(identityPath) // #nosec G304 -- helper creates this credential under t.TempDir.
@@ -40,16 +40,10 @@ func TestLoadRejectsOversizedReferencedCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := config.Config{
-		OpenZiti: config.OpenZitiConfig{Identities: map[string]config.OpenZitiIdentityConfig{
-			"private": {IdentityFile: identityPath},
-		}},
-		IPLists: map[string]config.IPListConfig{
-			"private": {Transport: config.TransportConfig{Type: TypeOpenZiti, Identity: "private", Service: "source"}},
-		},
-		Policies: []config.Policy{{Mode: "enforce", Include: config.Selector{IPLists: []string{"private"}}}},
+	profiles := map[string]config.OpenZitiIdentityConfig{
+		"private": {IdentityFile: identityPath},
 	}
-	if _, err := NewManager().Load(context.Background(), cfg); err == nil {
+	if _, err := NewManager().Load(context.Background(), profiles); err == nil {
 		t.Fatal("oversized credential was accepted")
 	}
 }

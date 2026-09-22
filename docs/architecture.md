@@ -226,6 +226,14 @@ does not imply SDK authentication has stopped: see the explicitly accepted
 SDK reconnect/service refresh does not become another source scheduler, LAPI
 cursor consumer, or writer.
 
+`Candidate` contains only immutable configuration, compiled policy, and source
+evidence. A pointer-owned staged candidate owns transient upstream sessions
+beside that data. Application consumes the staged owner after releasing writer
+locks; publication retains an independent session handle before that consumption.
+Selection, rejection, and uncertain-commit recovery explicitly transfer or
+release their own handles, rather than attaching resource ownership to copied
+candidate values.
+
 On startup or admitted reload, read only referenced identity profiles and
 capture validated credential material as an immutable generation. Construct
 replacement contexts/pools outside the apply critical section. Ordinary
@@ -235,6 +243,9 @@ through an untracked file watch or SDK credential-file rewrite.
 Loading credentials is a local check, not a requirement for successful network
 authentication before reusing valid same-route committed static fallback.
 Fresh fetches and CrowdSec synchronization still require live connectivity.
+Source resolution derives active identity profiles from the same required-selector
+set used for fetching, plus enabled CrowdSec. The upstream manager captures only
+the supplied profile map; it does not independently interpret policy activation.
 
 Stage affected static-source resolution and any replacement CrowdSec full
 snapshot with the candidate. Even when its URL/API key is unchanged, a changed
@@ -527,6 +538,12 @@ unjournaled target may be created.
 The journal's referenced revisions retain the full ownership and target metadata,
 including nftables hook definitions when priority changes. Family progress helps
 recovery inspect interrupted work; it is not the commit point.
+
+Source-cache loading and pruning share one manifest decoder for raw bindings,
+canonical wire decoding, and semantic validation. Filesystem storage separately
+enforces bounded reads, content-address checks, and durable publication barriers.
+Splitting those responsibilities does not relax the trust rules for either
+recovery or garbage collection.
 
 Persist credential locations and source identity, never credential contents or
 CrowdSec decisions. Recovery restores dynamic-container references without

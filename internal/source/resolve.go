@@ -67,11 +67,11 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 		if selector.Kind != policy.IPList {
 			continue
 		}
-		list, ok := cfg.IPLists[selector.Value]
-		if !ok {
-			return Resolution{}, fmt.Errorf("source: custom list %q is not configured", selector.Value)
+		spec, specErr := DescribeSelector(cfg, selector)
+		if specErr != nil {
+			return Resolution{}, specErr
 		}
-		binding, bindingErr := r.bindingForRoute(list.Transport)
+		binding, bindingErr := r.bindingForRoute(spec.Transport)
 		if bindingErr != nil {
 			return Resolution{}, fmt.Errorf("source: custom list %q transport: %w", selector.Value, bindingErr)
 		}
@@ -213,50 +213,59 @@ func selectorTiming(cfg config.Config, selector policy.Selector) (time.Duration,
 		if list.RefreshInterval <= 0 || list.RequestTimeout <= 0 {
 			return 0, 0, fmt.Errorf("source: custom list %q has invalid timing", selector.Value)
 		}
-		return list.RefreshInterval, list.RequestTimeout, nil
 	case policy.Provider:
 		if cfg.Providers.RefreshInterval <= 0 || cfg.Providers.RequestTimeout <= 0 {
 			return 0, 0, errors.New("source: provider refresh interval and request timeout must be positive")
 		}
-		return cfg.Providers.RefreshInterval, cfg.Providers.RequestTimeout, nil
 	default:
-		return cfg.Geo.RefreshInterval, cfg.Geo.RequestTimeout, nil
+		if cfg.Geo.RefreshInterval <= 0 || cfg.Geo.RequestTimeout <= 0 {
+			return 0, 0, errors.New("source: refresh interval and request timeout must be positive")
+		}
+	}
+	spec, err := DescribeSelector(cfg, selector)
+	if err != nil {
+		return 0, 0, err
+	}
+	return spec.RefreshInterval, spec.RequestTimeout, nil
+}
+
+func validSelectorTiming(selector policy.Selector, spec SelectorSpec) error {
+	if spec.RefreshInterval > 0 && spec.RequestTimeout > 0 {
+		return nil
+	}
+	switch selector.Kind {
+	case policy.IPList:
+		return fmt.Errorf("source: custom list %q has invalid timing", selector.Value)
+	case policy.Provider:
+		return errors.New("source: provider refresh interval and request timeout must be positive")
+	default:
+		return errors.New("source: refresh interval and request timeout must be positive")
 	}
 }
 
 func recordMatchesConfig(record Record, cfg config.Config) bool {
+	spec, err := DescribeSelector(cfg, record.Selector)
+	if err != nil {
+		return false
+	}
 	switch record.Selector.Kind {
 	case policy.IPList:
-		list, ok := cfg.IPLists[record.Selector.Value]
-		if !ok {
-			return false
-		}
-		endpoint, err := normalizeListURL(list.URL)
-		return err == nil &&
-			record.SourceKind == listSourceKind &&
-			record.SourceName == record.Selector.Value &&
-			record.Endpoint == endpoint &&
-			record.APIVersion == listFormatVersion &&
-			bindingMatchesConfig(record.Transport, list.Transport)
+		return record.SourceKind == spec.SourceKind &&
+			record.SourceName == spec.SourceName &&
+			record.Endpoint == spec.Endpoint &&
+			record.APIVersion == spec.APIVersion &&
+			bindingMatchesConfig(record.Transport, spec.Transport)
 	case policy.Provider:
-		expected, err := providerEndpoint(record.Selector.Value)
-		return err == nil &&
-			record.SourceKind == providerSourceKind &&
-			record.SourceName == record.Selector.Value &&
-			record.Endpoint == expected &&
-			record.APIVersion == listFormatVersion &&
+		return record.SourceKind == spec.SourceKind &&
+			record.SourceName == spec.SourceName &&
+			record.Endpoint == spec.Endpoint &&
+			record.APIVersion == spec.APIVersion &&
 			isDirectBinding(record.Transport)
 	case policy.Country, policy.ASN:
-		if record.SourceKind != "" && record.SourceKind != ripeSourceKind {
+		if record.SourceKind != "" && record.SourceKind != spec.SourceKind {
 			return false
 		}
-		expected := countryEndpoint
-		version := endpointVersions[countryEndpoint]
-		if record.Selector.Kind == policy.ASN {
-			expected = asnEndpoint
-			version = endpointVersions[asnEndpoint]
-		}
-		return record.Endpoint == expected && record.APIVersion == version && isDirectBinding(record.Transport)
+		return record.Endpoint == spec.Endpoint && record.APIVersion == spec.APIVersion && isDirectBinding(record.Transport)
 	default:
 		return false
 	}
@@ -466,10 +475,14 @@ func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []
 }
 
 func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector policy.Selector) (Record, error) {
-	_, timeout, err := selectorTiming(cfg, selector)
+	spec, err := DescribeSelector(cfg, selector)
 	if err != nil {
 		return Record{}, err
 	}
+	if err := validSelectorTiming(selector, spec); err != nil {
+		return Record{}, err
+	}
+	timeout := spec.RequestTimeout
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	select {
@@ -480,38 +493,24 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	}
 
 	text := selector.Kind == policy.IPList || selector.Kind == policy.Provider
-	endpoint := countryEndpoint
+	endpoint := spec.Endpoint
 	sourceLabel := ""
 	values := url.Values{"sourceapp": {"perimeterd"}}
-	var route config.TransportConfig
+	route := spec.Transport
 	var binding upstream.Binding
 	switch selector.Kind {
 	case policy.IPList:
 		sourceLabel = fmt.Sprintf("custom list %q", selector.Value)
-		configured, ok := cfg.IPLists[selector.Value]
-		if !ok {
-			return Record{}, fmt.Errorf("custom list %q is not configured", selector.Value)
-		}
-		route = configured.Transport
 		binding, err = r.bindingForRoute(route)
 		if err != nil {
 			return Record{}, fmt.Errorf("custom list %q transport: %w", selector.Value, err)
 		}
-		endpoint, err = normalizeListURL(configured.URL)
-		if err != nil {
-			return Record{}, fmt.Errorf("custom list %q has invalid URL", selector.Value)
-		}
 	case policy.Provider:
 		sourceLabel = fmt.Sprintf("provider %q", selector.Value)
-		endpoint, err = providerEndpoint(selector.Value)
-		if err != nil {
-			return Record{}, err
-		}
 	case policy.Country:
 		values.Set("resource", selector.Value)
 		values.Set("v4_format", "prefix")
 	case policy.ASN:
-		endpoint = asnEndpoint
 		values.Set("resource", selector.Value[2:])
 	default:
 		return Record{}, fmt.Errorf("unsupported source selector kind %q", selector.Kind)

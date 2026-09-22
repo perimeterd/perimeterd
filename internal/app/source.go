@@ -51,7 +51,7 @@ func newSourceRuntime(cache *source.Cache, client *http.Client) *sourceRuntime {
 	return &sourceRuntime{cache: cache, resolver: source.NewResolver(cache, client)}
 }
 
-func (s *sourceRuntime) selectRevision(revision *state.Revision, selected ...*upstream.Session) error {
+func (s *sourceRuntime) selectRevision(revision *state.Revision, nextSession *upstream.Session) error {
 	var snapshot source.Snapshot
 	if revision != nil && revision.Manifest != "" {
 		var err error
@@ -60,18 +60,7 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision, selected ...*up
 			return fmt.Errorf("load committed source snapshot: %w", err)
 		}
 	}
-	if s.active == nil || revision == nil || s.active.Epoch != revision.Epoch {
-		if s.refreshCancel != nil {
-			s.refreshCancel()
-			s.refreshCancel = nil
-			s.refreshSequence = 0
-		}
-	}
 	oldSession := s.session
-	var nextSession *upstream.Session
-	if len(selected) > 0 {
-		nextSession = selected[0]
-	}
 	if nextSession == nil && s.active != nil && revision != nil &&
 		(s.active == revision || (s.active.ID != "" && s.active.ID == revision.ID)) {
 		// Recovery of the same committed revision keeps its captured route
@@ -83,14 +72,16 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision, selected ...*up
 	timestamps := &sourceTimestamps{}
 	if revision != nil {
 		for _, record := range snapshot.Records() {
-			interval, jitter := revision.Config.Geo.RefreshInterval, revision.Config.Geo.RefreshJitter
+			spec, err := source.DescribeSelector(revision.Config, record.Selector)
+			if err != nil {
+				return fmt.Errorf("describe committed source: %w", err)
+			}
+			interval, jitter := spec.RefreshInterval, spec.RefreshJitter
 			stamp := &timestamps.ripe
 			switch record.Selector.Kind {
 			case policy.IPList:
-				interval, jitter = revision.Config.IPLists[record.Selector.Value].RefreshInterval, 0
 				stamp = &timestamps.ipList
 			case policy.Provider:
-				interval, jitter = revision.Config.Providers.RefreshInterval, 0
 				stamp = &timestamps.provider
 			}
 			if unix := record.RetrievedAt.Unix(); *stamp == 0 || unix < *stamp {
@@ -105,6 +96,13 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision, selected ...*up
 				}
 			}
 			deadlines[record.Selector] = deadline
+		}
+	}
+	if s.active == nil || revision == nil || s.active.Epoch != revision.Epoch {
+		if s.refreshCancel != nil {
+			s.refreshCancel()
+			s.refreshCancel = nil
+			s.refreshSequence = 0
 		}
 	}
 	s.active = revision
@@ -257,25 +255,24 @@ func collectPrefixes(store *state.Store) error {
 	return store.Prefixes().Collect(manifests)
 }
 
-func stageSource(ctx context.Context, opts Options, resolver *source.Resolver, epoch, refresh uint64, cfg config.Config, committed string, sessions ...*upstream.Session) stageResult {
-	var session *upstream.Session
-	if len(sessions) > 0 {
-		session = sessions[0]
-	}
-	result := stageResult{candidate: Candidate{epoch: epoch, refresh: refresh, session: session}, cfg: cfg}
+// stageSource takes ownership of session, including on resolution failure. The
+// returned staging owner must be consumed by applyStaged or explicitly closed.
+func stageSource(ctx context.Context, opts Options, resolver *source.Resolver, epoch, refresh uint64, cfg config.Config, committed string, session *upstream.Session) stageResult {
+	staged := &stagedCandidate{Candidate: Candidate{epoch: epoch, refresh: refresh}, session: session}
+	result := stageResult{candidate: staged}
 	resolved, err := resolver.Resolve(ctx, cfg, committed, refresh == 0)
 	result.attempted = resolved.Attempted
 	if err != nil {
 		result.err = fmt.Errorf("resolve source snapshot: %w", err)
 		return result
 	}
-	candidate, err := newCandidate(epoch, opts.ConfigPath, cfg, resolved.Snapshot, session)
+	candidate, err := NewCandidate(epoch, opts.ConfigPath, cfg, resolved.Snapshot)
 	if err != nil {
 		result.err = fmt.Errorf("compile configuration: %w", err)
 		return result
 	}
 	candidate.refresh = refresh
-	result.candidate = candidate
+	staged.Candidate = candidate
 	result.refreshErr = resolved.RefreshError
 	result.logger = newLogger(cfg, opts.Stderr)
 	result.err = ctx.Err()

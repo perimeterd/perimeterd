@@ -43,6 +43,15 @@ to their canonical documents rather than this contributor guide.
 
 The most useful file boundaries when changing an existing path are:
 
+- `internal/config/config.go`, `parse.go`, and `normalize.go`: normalized public
+  models, strict raw YAML decoding, and defaults/semantic normalization.
+- `internal/app/candidate.go` and `staged_candidate.go`: immutable candidate data
+  and separately owned transient staging resources.
+- `internal/upstream/identity.go` and `manager.go`: validated credential capture
+  and identity-generation/session lifecycle.
+- `internal/source/source.go`: shared selector metadata and active identity-profile
+  selection; `cache_format.go` and `cache.go`: canonical cache wire validation and
+  filesystem storage.
 - `internal/app/publication.go`: staged metrics/listener reservations and
   transaction-gated runtime publication.
 - `internal/app/crowdsec.go`: staged client epochs, serialized dynamic
@@ -68,8 +77,9 @@ The most useful file boundaries when changing an existing path are:
   scenarios (`geo_test.go`, `custom_list_test.go`, and `providers_test.go`), native backend scenarios (`nftables_test.go` and
   `iptables_test.go`), real Docker coexistence (`docker_harness_test.go`,
   `docker_test.go`), actual daemon lookup and packet parity (`lookup_test.go`),
-  runtime/recovery boundaries (`runtime_test.go`, `recovery_test.go`), and
-  failure injection (`crash_test.go`).
+  runtime/recovery boundaries (`runtime_test.go`, `recovery_test.go`), OpenZiti
+  acceptance scenarios and fixture machinery (`openziti_test.go`,
+  `openziti_harness_test.go`), and failure injection (`crash_test.go`).
 
 ### Planned additions
 
@@ -172,6 +182,14 @@ counters, ownership collisions, and interrupted transactions, and never
 applies test rules to the development host's firewall. Tagged E2E sources are
 formatted and linted by the ordinary gates but execute only through opt-in
 native/Docker targets. CI runs the native gate in a separate Linux job.
+
+Normal daemon shutdown must exit successfully through the shared lifecycle
+helper, including when the process exited before cleanup began. Crash scenarios
+use an explicit expected-kill path. Reload assertions wait for the intended
+configuration to become durably selected, candidate-correlated rejection
+evidence, or changed packet behavior; a request starting is not proof that its
+candidate finished. Keep bounded quiet windows for absence assertions and real
+lease-expiry waits, not fixed sleeps standing in for reload completion.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent

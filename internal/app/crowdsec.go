@@ -117,7 +117,7 @@ func (c *crowdRuntime) nextOperationLocked() (uint64, error) {
 
 // stageForApply is serialized by Engine.applyMu, not Engine.mu. Retain the old
 // authenticated client until selection is certain, including same-path rotation.
-func (c *crowdRuntime) stageForApply(ctx context.Context, candidate Candidate) (*crowdState, error) {
+func (c *crowdRuntime) stageForApply(ctx context.Context, candidate Candidate, session *upstream.Session) (*crowdState, error) {
 	e := c.engine
 	e.mu.Lock()
 	if err := e.startErrorLocked(ctx); err != nil {
@@ -149,11 +149,11 @@ func (c *crowdRuntime) stageForApply(ctx context.Context, candidate Candidate) (
 		return nil, nil
 	}
 	if candidate.cfg.CrowdSec.Transport.Type == upstream.TypeOpenZiti {
-		if candidate.session == nil {
+		if session == nil {
 			return nil, errors.New("CrowdSec OpenZiti transport requires a loaded session")
 		}
 		var err error
-		transport, err = candidate.session.Transport(candidate.cfg.CrowdSec.Transport, candidate.cfg.CrowdSec.LAPIURL)
+		transport, err = session.Transport(candidate.cfg.CrowdSec.Transport, candidate.cfg.CrowdSec.LAPIURL)
 		if err != nil {
 			return nil, err
 		}

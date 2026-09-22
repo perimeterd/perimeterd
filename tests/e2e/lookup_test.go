@@ -145,7 +145,7 @@ func startLookupDaemon(t *testing.T, configPath, backend, table string) *daemonP
 		return startDaemon(t, configPath, table)
 	}
 	return startDaemonProcess(t, configPath, "lookup iptables policy", func() bool {
-		return activeIPTablesRevision() != ""
+		return activeRevision() != ""
 	})
 }
 
@@ -197,7 +197,7 @@ func writeLookupConfig(t *testing.T, path, backend, table, mainURL, carveURL str
 	}
 	body := fmt.Sprintf(`version: 1
 logging:
-  level: error
+  level: debug
   format: text
 metrics:
   listen: ""
@@ -315,9 +315,10 @@ func TestE2ELookupNative(t *testing.T) {
 	waitForLookupVerdict(t, "8.21.0.2", "ingress", "tcp", port, "blocked")
 
 	// A malformed reload is rejected without replacing the committed query view.
-	writeInvalidConfig(t, configPath)
+	writeInvalidConfigMarker(t, configPath, "unsupported-lookup-reload")
+	diagnosticOffset := daemonDiagnosticOffset(daemon)
 	daemon.reload(t)
-	time.Sleep(500 * time.Millisecond)
+	waitForDaemonDiagnostic(t, daemon, []string{"unsupported-lookup-reload"}, diagnosticOffset)
 	waitForLookupVerdict(t, "8.21.0.2", "ingress", "tcp", port, "blocked")
 
 	daemon.stop(t)
@@ -409,7 +410,7 @@ func TestE2ELookupCoverage(t *testing.T) {
 	}
 
 	// Disabling a family makes it explicitly unmanaged rather than an implicit allow.
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	writeLookupCoverageConfig(t, configPath, backend, table, fixture.URL("/v4-only"), true, false)
 	daemon.reload(t)
 	if backend != "nftables" {

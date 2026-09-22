@@ -115,7 +115,7 @@ func TestE2EDockerCoexistence(t *testing.T) {
 		}
 	}
 	baseline := dockerForeignSnapshot(t)
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	writeDockerCoexistenceConfig(t, configPath, "reject", false, containerIPs, "DOCKER-USER")
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -135,7 +135,7 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	assertDockerUserOrdering(t, "iptables")
 	assertDockerUserOrdering(t, "ip6tables")
 
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	writeDockerCoexistenceConfig(t, configPath, "reject", true, containerIPs, "DOCKER-USER")
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -155,7 +155,7 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	assertDockerUserOrdering(t, "ip6tables")
 	// A candidate with a missing parent must fail closed: the active revision and
 	// enforcement remain untouched, and no Docker-owned chain is removed.
-	active := activeIPTablesRevision()
+	active := activeRevision()
 	writeDockerCoexistenceConfig(t, configPath, "reject", true, containerIPs, "DOCKER-USER-NOT-PRESENT")
 	daemon.reload(t)
 	daemon.waitReloadFailure(t, active)
@@ -260,7 +260,7 @@ func (d *dockerDaemon) waitReloadFailure(t *testing.T, active string) {
 	select {
 	case err := <-d.rejected:
 		t.Logf("candidate rejected without replacing active policy: %v", err)
-		if got := activeIPTablesRevision(); got != active {
+		if got := activeRevision(); got != active {
 			t.Fatalf("failed reload changed active revision: before=%q after=%q", active, got)
 		}
 	case err := <-d.done:

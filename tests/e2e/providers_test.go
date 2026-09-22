@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -93,6 +94,7 @@ type providerRuntime struct {
 	done    <-chan error
 	once    sync.Once
 	stopErr error
+	output  *lockedBuffer
 }
 
 func startProviderRuntime(t *testing.T, configPath string, client *http.Client) *providerRuntime {
@@ -101,6 +103,7 @@ func startProviderRuntime(t *testing.T, configPath string, client *http.Client) 
 	signals := make(chan os.Signal, 8)
 	done := make(chan error, 1)
 	ready := make(chan string, 4)
+	output := new(lockedBuffer)
 	go func() {
 		done <- app.Run(ctx, app.Options{
 			ConfigPath:   configPath,
@@ -108,7 +111,7 @@ func startProviderRuntime(t *testing.T, configPath string, client *http.Client) 
 			LockPath:     "/run/perimeterd/owner.lock",
 			SourceClient: client,
 			Signals:      signals,
-			Stderr:       os.Stderr,
+			Stderr:       io.MultiWriter(os.Stderr, output),
 			Notify: func(message string) error {
 				ready <- message
 				return nil
@@ -122,7 +125,7 @@ func startProviderRuntime(t *testing.T, configPath string, client *http.Client) 
 		select {
 		case message := <-ready:
 			if strings.Contains(message, "READY=1") {
-				runtime := &providerRuntime{cancel: cancel, signals: signals, done: done}
+				runtime := &providerRuntime{cancel: cancel, signals: signals, done: done, output: output}
 				t.Cleanup(func() { runtime.stop(t) })
 				return runtime
 			}
@@ -144,6 +147,19 @@ func (r *providerRuntime) reload(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("provider runtime did not accept reload signal")
 	}
+}
+
+func (r *providerRuntime) waitForRejection(t *testing.T, providerID string, offset int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		output := r.output.String()
+		if offset <= len(output) && strings.Contains(output[offset:], providerID) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("provider reload did not report rejection for %q:\n%s", providerID, r.output.String())
 }
 
 func (r *providerRuntime) stop(t *testing.T) {
@@ -196,7 +212,7 @@ func writeProviderConfig(t *testing.T, path, backend, table, supplementURL, prov
 	t.Helper()
 	var yaml strings.Builder
 	yaml.WriteString("version: 1\n")
-	yaml.WriteString("logging:\n  level: error\n  format: text\n")
+	yaml.WriteString("logging:\n  level: debug\n  format: text\n")
 	yaml.WriteString("metrics:\n  listen: \"\"\n")
 	yaml.WriteString("global:\n  allowlist: []\n  blocklist: []\n")
 	if backend == "nftables" {
@@ -415,9 +431,10 @@ func TestE2EProviders(t *testing.T) {
 	beforeEpoch := activeProviderRevision(t).Epoch
 	writeProviderConfig(t, configPath, backend, table, providerConfigPath(t, fixture), providerMissingID, true)
 	missingBefore := fixture.Requests("/provider/" + providerMissingID)
+	diagnosticOffset := len(runtime.output.String())
 	runtime.reload(t)
 	waitCustomListRequests(t, fixture, "/provider/"+providerMissingID, missingBefore+1)
-	time.Sleep(750 * time.Millisecond)
+	runtime.waitForRejection(t, providerMissingID, diagnosticOffset)
 	if activeProviderRevision(t).Epoch != beforeEpoch {
 		t.Fatal("missing provider reload replaced the active configuration")
 	}
@@ -427,7 +444,8 @@ func TestE2EProviders(t *testing.T) {
 	replacementBefore := fixture.Requests("/provider/" + providerInitialID)
 	fixture.Set("/provider/"+providerInitialID, http.StatusOK, providerReplacement)
 	waitCustomListRequests(t, fixture, "/provider/"+providerInitialID, replacementBefore+1)
-	time.Sleep(750 * time.Millisecond)
+	waitCrowdPacket(t, peer, "tcp4", fixtureIPv4Host+":18480", "reject")
+	waitCrowdPacket(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18480", "reject")
 	providerPacketReplacement(t, peer)
 
 	// 404 and malformed responses retain that complete replacement snapshot.
@@ -441,7 +459,6 @@ func TestE2EProviders(t *testing.T) {
 		before := fixture.Requests("/provider/" + providerInitialID)
 		fixture.Set("/provider/"+providerInitialID, response.status, response.body)
 		waitCustomListRequests(t, fixture, "/provider/"+providerInitialID, before+1)
-		time.Sleep(500 * time.Millisecond)
 		providerPacketReplacement(t, peer)
 	}
 

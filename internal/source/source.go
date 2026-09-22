@@ -22,6 +22,124 @@ const (
 	listFormatVersion  = "1"
 )
 
+// SelectorSpec describes the authoritative source metadata for one canonical
+// selector. It is intentionally declarative: Transport is the configured
+// route, while records additionally capture the loaded transport generation.
+type SelectorSpec struct {
+	RefreshInterval time.Duration
+	RequestTimeout  time.Duration
+	RefreshJitter   time.Duration
+	Transport       config.TransportConfig
+	Endpoint        string
+	SourceKind      string
+	SourceName      string
+	APIVersion      string
+}
+
+// DescribeSelector returns the source identity, endpoint, transport, and
+// scheduling metadata for selector. Timing values are extracted without
+// validating them; resolver fetch paths retain their existing validation
+// timing and error semantics.
+func DescribeSelector(cfg config.Config, selector policy.Selector) (SelectorSpec, error) {
+	switch selector.Kind {
+	case policy.IPList:
+		list, ok := cfg.IPLists[selector.Value]
+		if !ok {
+			return SelectorSpec{}, fmt.Errorf("source: custom list %q is not configured", selector.Value)
+		}
+		endpoint, err := normalizeListURL(list.URL)
+		if err != nil {
+			return SelectorSpec{}, fmt.Errorf("source: custom list %q has invalid URL", selector.Value)
+		}
+		return SelectorSpec{
+			RefreshInterval: list.RefreshInterval,
+			RequestTimeout:  list.RequestTimeout,
+			Transport:       list.Transport,
+			Endpoint:        endpoint,
+			SourceKind:      listSourceKind,
+			SourceName:      selector.Value,
+			APIVersion:      listFormatVersion,
+		}, nil
+	case policy.Provider:
+		endpoint, err := providerEndpoint(selector.Value)
+		if err != nil {
+			return SelectorSpec{}, err
+		}
+		return SelectorSpec{
+			RefreshInterval: cfg.Providers.RefreshInterval,
+			RequestTimeout:  cfg.Providers.RequestTimeout,
+			Endpoint:        endpoint,
+			SourceKind:      providerSourceKind,
+			SourceName:      selector.Value,
+			APIVersion:      listFormatVersion,
+		}, nil
+	case policy.Country:
+		return SelectorSpec{
+			RefreshInterval: cfg.Geo.RefreshInterval,
+			RequestTimeout:  cfg.Geo.RequestTimeout,
+			RefreshJitter:   cfg.Geo.RefreshJitter,
+			Endpoint:        countryEndpoint,
+			SourceKind:      ripeSourceKind,
+			APIVersion:      endpointVersions[countryEndpoint],
+		}, nil
+	case policy.ASN:
+		return SelectorSpec{
+			RefreshInterval: cfg.Geo.RefreshInterval,
+			RequestTimeout:  cfg.Geo.RequestTimeout,
+			RefreshJitter:   cfg.Geo.RefreshJitter,
+			Endpoint:        asnEndpoint,
+			SourceKind:      ripeSourceKind,
+			APIVersion:      endpointVersions[asnEndpoint],
+		}, nil
+	default:
+		return SelectorSpec{}, fmt.Errorf("source: unsupported source selector kind %q", selector.Kind)
+	}
+}
+
+// RequiredIdentities returns the active OpenZiti identity profiles referenced
+// by enabled custom-list policies and by enabled CrowdSec. It performs no
+// credential or network I/O.
+func RequiredIdentities(cfg config.Config) (map[string]config.OpenZitiIdentityConfig, error) {
+	required := make(map[string]config.OpenZitiIdentityConfig)
+	add := func(label string, transport config.TransportConfig) error {
+		switch transport.Type {
+		case "", upstream.TypeDirect:
+			return nil
+		case upstream.TypeOpenZiti:
+			profile, ok := cfg.OpenZiti.Identities[transport.Identity]
+			if !ok {
+				return fmt.Errorf("source: %s references unknown OpenZiti identity %q", label, transport.Identity)
+			}
+			required[transport.Identity] = profile
+			return nil
+		default:
+			return fmt.Errorf("source: %s uses unsupported transport %q", label, transport.Type)
+		}
+	}
+	selectors, err := policy.RequiredSelectors(cfg)
+	if err != nil {
+		return nil, err
+	}
+	for _, selector := range selectors {
+		if selector.Kind != policy.IPList {
+			continue
+		}
+		list, ok := cfg.IPLists[selector.Value]
+		if !ok {
+			return nil, fmt.Errorf("source: custom list %q is not configured", selector.Value)
+		}
+		if err := add(fmt.Sprintf("custom list %q", selector.Value), list.Transport); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.CrowdSec.Enabled {
+		if err := add("enabled CrowdSec", cfg.CrowdSec.Transport); err != nil {
+			return nil, err
+		}
+	}
+	return required, nil
+}
+
 // providerEndpoint returns the fixed, documented feed URL for one provider
 // identifier. Provider identifiers are syntax-validated by configuration and
 // policy; the source layer repeats that check before constructing a request so

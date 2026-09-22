@@ -5,6 +5,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/perimeterd/perimeterd/internal/config"
 )
 
 type lockedBuffer struct {
@@ -37,11 +40,43 @@ func (b *lockedBuffer) String() string {
 }
 
 type daemonProcess struct {
-	cmd    *exec.Cmd
-	output *lockedBuffer
-	done   chan struct{}
-	mu     sync.Mutex
-	err    error
+	cmd          *exec.Cmd
+	output       *lockedBuffer
+	done         chan struct{}
+	mu           sync.Mutex
+	err          error
+	expectedExit bool
+	redactOutput func([]byte) string
+}
+
+func (d *daemonProcess) markExpectedExit() {
+	d.mu.Lock()
+	d.expectedExit = true
+	d.mu.Unlock()
+}
+
+func (d *daemonProcess) isExpectedExit() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.expectedExit
+}
+
+func (d *daemonProcess) diagnosticOutput() string {
+	value := []byte(d.output.String())
+	if d.redactOutput != nil {
+		return d.redactOutput(value)
+	}
+	return string(value)
+}
+
+func (d *daemonProcess) successfulExit(t *testing.T) {
+	t.Helper()
+	if d.isExpectedExit() {
+		return
+	}
+	if err := d.waitErr(); err != nil {
+		t.Errorf("perimeterd exited unsuccessfully: %v\n%s", err, d.diagnosticOutput())
+	}
 }
 
 func startDaemon(t *testing.T, configPath, table string) *daemonProcess {
@@ -124,6 +159,7 @@ func (d *daemonProcess) stop(t *testing.T) {
 	t.Helper()
 	select {
 	case <-d.done:
+		d.successfulExit(t)
 		return
 	default:
 	}
@@ -132,11 +168,149 @@ func (d *daemonProcess) stop(t *testing.T) {
 	}
 	select {
 	case <-d.done:
+		d.successfulExit(t)
 	case <-time.After(20 * time.Second):
+		// A forced kill is an explicit failure of normal shutdown. Callers
+		// that intentionally kill a daemon must use kill instead.
 		_ = d.cmd.Process.Kill()
 		<-d.done
-		t.Errorf("perimeterd did not stop after SIGTERM\n%s", d.output.String())
+		t.Errorf("perimeterd did not stop after SIGTERM\n%s", d.diagnosticOutput())
 	}
+}
+
+func (d *daemonProcess) kill(t *testing.T) {
+	t.Helper()
+	d.markExpectedExit()
+	select {
+	case <-d.done:
+		return
+	default:
+	}
+	if err := d.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Errorf("kill perimeterd: %v", err)
+	}
+	select {
+	case <-d.done:
+	case <-time.After(5 * time.Second):
+		t.Errorf("perimeterd did not exit after kill\n%s", d.diagnosticOutput())
+	}
+}
+
+func waitForActiveRevisionChange(t *testing.T, before, configPath string) string {
+	t.Helper()
+	expected, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("load expected configuration: %v", err)
+	}
+	expectedJSON, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		marker := activeRevision()
+		var active struct {
+			Payload struct {
+				ID string `json:"id"`
+			} `json:"payload"`
+		}
+		if marker != "" && marker != before && json.Unmarshal([]byte(marker), &active) == nil &&
+			len(active.Payload.ID) == 32 && strings.Trim(active.Payload.ID, "0123456789abcdef") == "" {
+			// The active ID is constrained to 32 lowercase hexadecimal characters.
+			data, readErr := os.ReadFile(filepath.Join("/var/lib/perimeterd/revisions", active.Payload.ID+".json"))
+			var revision struct {
+				Payload struct {
+					Config config.Config `json:"config"`
+				} `json:"payload"`
+			}
+			if readErr == nil && json.Unmarshal(data, &revision) == nil {
+				selectedJSON, marshalErr := json.Marshal(revision.Payload.Config)
+				if marshalErr == nil && bytes.Equal(expectedJSON, selectedJSON) {
+					return marker
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("active revision did not select the reloaded configuration")
+	return ""
+}
+
+func TestDaemonStopReportsFailedExit(t *testing.T) {
+	const (
+		helperEnv = "PERIMETERD_E2E_DAEMON_STOP_FAILURE"
+		marker    = "DAEMON_STOP_FAILURE_CHECK_COMPLETED"
+	)
+	if os.Getenv(helperEnv) == "1" {
+		cmd := exec.Command("/bin/sh", "-c", "exit 23") // #nosec G204 -- fixed helper command used only by this regression.
+		output := new(lockedBuffer)
+		cmd.Stdout, cmd.Stderr = output, output
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start failed-exit helper: %v", err)
+		}
+		d := &daemonProcess{cmd: cmd, output: output, done: make(chan struct{})}
+		go func() {
+			err := cmd.Wait()
+			d.mu.Lock()
+			d.err = err
+			d.mu.Unlock()
+			close(d.done)
+		}()
+		<-d.done
+		d.stop(t)
+		if _, err := fmt.Fprintln(os.Stdout, marker); err != nil {
+			t.Fatalf("write shutdown-check result: %v", err)
+		}
+		return
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test executable: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// #nosec G204 -- invokes this test executable with a fixed regression selector.
+	cmd := exec.CommandContext(ctx, self, "-test.run", "^TestDaemonStopReportsFailedExit$")
+	cmd.Env = append(os.Environ(), helperEnv+"=1")
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("shutdown regression helper timed out: %v", ctx.Err())
+	}
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok || exitErr.ExitCode() != 1 {
+		t.Fatalf("shutdown regression helper did not fail with expected test status: err=%v output=%s", err, output)
+	}
+	if !bytes.Contains(output, []byte(marker)) {
+		t.Fatalf("shutdown regression helper did not complete the stop check: %s", output)
+	}
+}
+
+func daemonDiagnosticOffset(daemon *daemonProcess) int {
+	return len(daemon.output.String())
+}
+
+func waitForDaemonDiagnostic(t *testing.T, daemon *daemonProcess, markers []string, offset int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		output := daemon.output.String()
+		if offset <= len(output) {
+			for line := range strings.SplitSeq(output[offset:], "\n") {
+				matched := true
+				for _, marker := range markers {
+					if !strings.Contains(line, marker) {
+						matched = false
+						break
+					}
+				}
+				if matched {
+					return
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("daemon did not report reload candidate markers %q:\n%s", markers, daemon.diagnosticOutput())
 }
 
 func (d *daemonProcess) reload(t *testing.T) {
@@ -174,7 +348,7 @@ func writeConfigFamilies(t *testing.T, path, table, action string, allow, block 
 	t.Helper()
 	var yaml strings.Builder
 	yaml.WriteString("version: 1\n")
-	yaml.WriteString("logging:\n  level: error\n  format: text\n")
+	yaml.WriteString("logging:\n  level: debug\n  format: text\n")
 	yaml.WriteString("metrics:\n  listen: \"\"\n")
 	yaml.WriteString("global:\n")
 	if len(allow) == 0 {
@@ -203,7 +377,13 @@ func writeConfigFamilies(t *testing.T, path, table, action string, allow, block 
 
 func writeInvalidConfig(t *testing.T, path string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte("version: 1\nfirewall:\n  backend: unsupported\n"), 0o600); err != nil {
+	writeInvalidConfigMarker(t, path, "unsupported")
+}
+
+func writeInvalidConfigMarker(t *testing.T, path, marker string) {
+	t.Helper()
+	body := fmt.Sprintf("version: 1\nfirewall:\n  backend: %s\n", marker)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write invalid config: %v", err)
 	}
 }
@@ -217,7 +397,7 @@ func assertLockCollision(t *testing.T, configPath string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	// #nosec G204 -- the validated E2E binary is launched only by this test harness.
+	// #nosec G204 -- e2eBinary validates the fixture executable; arguments are not shell-expanded.
 	cmd := exec.CommandContext(ctx, e2eBinary(t), "run", "--config", configPath)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard

@@ -190,17 +190,12 @@ func waitForFailureMarker(t *testing.T, tools iptablesTools, suffix string) {
 	t.Fatalf("iptables failure marker %q did not appear; command log:\n%s", suffix, data)
 }
 
-func activeIPTablesRevision() string {
-	data, _ := os.ReadFile("/var/lib/perimeterd/active.json")
-	return string(data)
-}
-
 func waitForIPTablesCommit(t *testing.T, before string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		_, err := os.Stat("/var/lib/perimeterd/journal.json")
-		active := activeIPTablesRevision()
+		active := activeRevision()
 		if os.IsNotExist(err) && active != "" && active != before {
 			return
 		}
@@ -418,7 +413,7 @@ func TestE2EIPTables(t *testing.T) {
 	// families. They must precede the matching blocks without accepting other
 	// traffic implicitly.
 	writeIPTablesConfig(t, configPath, "drop", []string{"0.0.0.0/0", "::/0"}, []string{"0.0.0.0/0", "::/0"}, true, true, customIPTablesAttachments())
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
 	if after := iptablesProcessedPackets(t, "entry_v4_ingress/processed"); after < processedBefore {
@@ -454,7 +449,7 @@ func TestE2EIPTables(t *testing.T) {
 	exchangeIPTablesByte(t, conn)
 
 	writeIPTablesConfig(t, configPath, "reject", nil, []string{"0.0.0.0/0", "::/0"}, true, true, customIPTablesAttachments())
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
 	exchangeIPTablesByte(t, conn)
@@ -466,7 +461,7 @@ func TestE2EIPTables(t *testing.T) {
 	// Disabling one family retires only that family. An entirely disabled
 	// model is the canonical empty target and unhooks both families.
 	writeIPTablesConfig(t, configPath, "reject", nil, []string{"0.0.0.0/0"}, true, false, customIPTablesAttachments())
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
 	waitForIPTablesOwned(t, "v4")
@@ -475,7 +470,7 @@ func TestE2EIPTables(t *testing.T) {
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18380", "success", "tcp")
 
 	writeIPTablesConfig(t, configPath, "reject", nil, nil, false, false, customIPTablesAttachments())
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
 	waitNoIPTablesOwned(t, "v4", "v6")
@@ -483,7 +478,7 @@ func TestE2EIPTables(t *testing.T) {
 	assertIPTablesForeign(t, "v6")
 
 	writeIPTablesConfig(t, configPath, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, true, true, customIPTablesAttachments())
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
 	waitForIPTablesOwned(t, "v4", "v6")
@@ -584,7 +579,7 @@ func TestE2EIPTablesFailures(t *testing.T) {
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18480", "drop", "tcp")
 	writeFailureMode(t, tools, "")
 	writeIPTablesConfig(t, configPath, "reject", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, true, true, defaultIPTablesAttachments())
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18480", "reject", "tcp")
@@ -598,13 +593,13 @@ func TestE2EIPTablesFailures(t *testing.T) {
 	waitForFailureMarker(t, tools, ".v6-second-comp-1")
 	waitForFailureMarker(t, tools, ".v6-second-comp-2")
 	waitForIPTablesHealth(t, false)
-	selected := activeIPTablesRevision()
+	selected := activeRevision()
 	daemon.reload(t)
 	for range 3 {
 		time.Sleep(300 * time.Millisecond)
 		waitForIPTablesHealth(t, false)
 	}
-	if activeIPTablesRevision() != selected {
+	if activeRevision() != selected {
 		t.Fatal("unrecovered writer committed another candidate")
 	}
 	journal := filepath.Join("/var/lib/perimeterd", "journal.json")
@@ -650,7 +645,6 @@ func TestE2EIPTablesMigration(t *testing.T) {
 	writeFailureMode(t, tools, "precommit")
 	daemon.reload(t)
 	waitForFailureMarker(t, tools, ".precommit")
-	time.Sleep(2 * time.Second)
 	if _, err := nftTableMayFail(table); err != nil {
 		t.Fatalf("pre-commit migration failure removed nft target: %v", err)
 	}
@@ -673,7 +667,7 @@ func TestE2EIPTablesMigration(t *testing.T) {
 	// Retirement of the old iptables target occurs after nftables commit. The
 	// injected failure therefore leaves the new target authoritative and the
 	// old target recoverable for the next startup.
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	writeIPTablesConfig(t, configPath, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, true, true, defaultIPTablesAttachments())
 	daemon.reload(t)
 	// Staged objects appear before selection and durable commit. Do not let
@@ -933,7 +927,7 @@ func TestE2EIPTablesMissingParentCleanup(t *testing.T) {
 				}
 			}
 			if operation != "cleanup" {
-				before := activeIPTablesRevision()
+				before := activeRevision()
 				if operation == "migration" {
 					writeConfig(t, path, "pde2e_missing_parent", "reject", nil, block, -10)
 				} else {
@@ -1034,7 +1028,7 @@ func TestE2EIPTablesForeignSetNames(t *testing.T) {
 	daemon := startIPTablesDaemon(t, path, "v4", "v6")
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18890", "drop", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18890", "drop", "tcp")
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	writeIPTablesConfig(t, path, "reject", nil, block, true, true, defaultIPTablesAttachments())
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -1123,7 +1117,7 @@ func TestE2EIPTablesOptionOperands(t *testing.T) {
 		for _, inspect := range tools {
 			before[inspect] = command(t, 10*time.Second, inspect, "-S")
 		}
-		active := activeIPTablesRevision()
+		active := activeRevision()
 		if err := backend.Preflight(context.Background(), target, target, nil); err == nil {
 			t.Fatal("preflight accepted a hidden foreign jump into an owned chain")
 		}
@@ -1138,7 +1132,7 @@ func TestE2EIPTablesOptionOperands(t *testing.T) {
 				t.Fatalf("rejected operations changed %s rules:\nbefore: %s\nafter: %s", inspect, before[inspect], after)
 			}
 		}
-		if activeIPTablesRevision() != active {
+		if activeRevision() != active {
 			t.Fatal("rejected operations changed the committed revision")
 		}
 		command(t, 10*time.Second, tool, "-D", "INPUT", "-m", "comment", "--comment", "-j", "-j", ownedChain)
@@ -1203,7 +1197,7 @@ func TestE2EIPTablesSetReferences(t *testing.T) {
 				before[tool] = command(t, 10*time.Second, tool, "-S")
 			}
 			saved := command(t, 10*time.Second, "ipset", "save", ownedSet)
-			active := activeIPTablesRevision()
+			active := activeRevision()
 			if err := backend.Preflight(context.Background(), target, target, nil); err == nil {
 				t.Fatal("preflight accepted an unaccounted native set reference")
 			}
@@ -1221,7 +1215,7 @@ func TestE2EIPTablesSetReferences(t *testing.T) {
 			if after := command(t, 10*time.Second, "ipset", "save", ownedSet); !bytes.Equal(after, saved) {
 				t.Fatal("fenced operations changed owned set contents")
 			}
-			if activeIPTablesRevision() != active {
+			if activeRevision() != active {
 				t.Fatal("fenced operations changed the committed revision")
 			}
 		}

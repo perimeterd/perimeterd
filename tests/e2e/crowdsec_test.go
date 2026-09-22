@@ -270,7 +270,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	}
 	table := fmt.Sprintf("crowd_owned_%d", os.Getpid())
 	writeCrowdConfig(t, configPath, backend, table, server.URL, keyPath, true, nil)
-	daemon := startDaemonProcess(t, configPath, "CrowdSec initial projection", func() bool { return activeIPTablesRevision() != "" })
+	daemon := startDaemonProcess(t, configPath, "CrowdSec initial projection", func() bool { return activeRevision() != "" })
 	// Readiness cannot precede existing decisions becoming effective.
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18680", "reject", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18680", "reject", "tcp")
@@ -313,7 +313,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	fixture.set(7, "::/0", 5*time.Minute)
 	waitCrowdPacket(t, peer, "tcp4", fixtureIPv4Host+":18687", "reject")
 	waitCrowdPacket(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18687", "reject")
-	before := activeIPTablesRevision()
+	before := activeRevision()
 	writeCrowdConfig(t, configPath, backend, table, server.URL, keyPath, true, []string{fixtureIPv4Peer})
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -322,7 +322,7 @@ func TestE2ECrowdSec(t *testing.T) {
 
 	// Re-reading the same credential path must stage authentication without
 	// discarding the old client's retained credential or stream authority.
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	starts, _, _ := fixture.counters()
 	if err := os.WriteFile(keyPath, []byte("invalid-replacement-secret"), 0o600); err != nil {
 		t.Fatal(err)
@@ -330,7 +330,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	daemon.reload(t)
 	waitCrowdCondition(t, "replacement authentication rejected", func() bool { _, failures, _ := fixture.counters(); return failures > 0 })
 	waitCrowdCondition(t, "old credential resumed authoritative synchronization", func() bool { count, _, _ := fixture.counters(); return count > starts })
-	if activeIPTablesRevision() != before {
+	if activeRevision() != before {
 		t.Fatal("failed credential replacement committed configuration")
 	}
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18689", "reject", "tcp")
@@ -342,7 +342,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	}
 
 	replacement, replacementServer := newCrowdFixture(t)
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	writeCrowdConfig(t, configPath, backend, table, replacementServer.URL, keyPath, true, nil)
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -350,7 +350,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18690", "success", "tcp")
 	replacement.set(8, fixtureIPv4Peer, 5*time.Minute)
 	waitCrowdPacket(t, peer, "tcp4", fixtureIPv4Host+":18691", "reject")
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	writeCrowdConfig(t, configPath, backend, table, replacementServer.URL, keyPath, false, nil)
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -363,7 +363,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	// a new full snapshot, not recover decisions from durable target metadata.
 	replacement.set(8, fixtureIPv4Peer, 7*time.Second)
 	replacement.set(9, fixtureIPv6Peer, 5*time.Minute)
-	before = activeIPTablesRevision()
+	before = activeRevision()
 	writeCrowdConfig(t, configPath, backend, table, replacementServer.URL, keyPath, true, nil)
 	daemon.reload(t)
 	waitForIPTablesCommit(t, before)
@@ -373,7 +373,7 @@ func TestE2ECrowdSec(t *testing.T) {
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18694", "reject", "tcp")
 	replacement.remove(9)
 	replacement.set(8, fixtureIPv4Peer, 5*time.Minute)
-	daemon = startDaemonProcess(t, configPath, "CrowdSec restart authority", func() bool { return activeIPTablesRevision() != "" })
+	daemon = startDaemonProcess(t, configPath, "CrowdSec restart authority", func() bool { return activeRevision() != "" })
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18695", "reject", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18695", "success", "tcp")
 	daemon.stop(t)

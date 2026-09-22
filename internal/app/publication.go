@@ -51,11 +51,11 @@ func (p *runtimePublication) reserve(result stageResult) error {
 	if p.reservation != nil {
 		return errors.New("runtime publication already has a reservation")
 	}
-	replace := p.active == nil || p.active.listen != result.cfg.Metrics.Listen
+	replace := p.active == nil || p.active.listen != result.candidate.cfg.Metrics.Listen
 	var staged *metricsServer
 	if replace {
 		var err error
-		staged, err = bindMetrics(result.cfg.Metrics.Listen, p.metricsHealthy, p.source.snapshotTimestamps)
+		staged, err = bindMetrics(result.candidate.cfg.Metrics.Listen, p.metricsHealthy, p.source.snapshotTimestamps)
 		if err != nil {
 			return err
 		}
@@ -63,17 +63,14 @@ func (p *runtimePublication) reserve(result stageResult) error {
 			staged.crowdConnected = p.engine.CrowdSecConnected
 		}
 	}
-	var session *upstream.Session
-	// Engine.Apply consumes the candidate handle; publication must retain its
-	// own handle until the source revision is selected or discarded.
-	if result.candidate.session != nil {
-		session = result.candidate.session.Retain()
-		if session == nil {
-			if staged != nil {
-				_ = staged.closeImmediate()
-			}
-			return errors.New("runtime publication could not retain upstream session")
+	// Application consumes the staging owner; publication holds an independent
+	// handle until the revision is selected or discarded.
+	session, err := result.candidate.retainSession()
+	if err != nil {
+		if staged != nil {
+			_ = staged.closeImmediate()
 		}
+		return err
 	}
 	p.reservation = &runtimeReservation{
 		staged:     staged,
@@ -110,12 +107,12 @@ func (p *runtimePublication) publish(revision *state.Revision) error {
 func (p *runtimePublication) recover(revision *state.Revision) error {
 	reservation := p.reservation
 	if reservation == nil {
-		return p.source.selectRevision(revision)
+		return p.source.selectRevision(revision, nil)
 	}
 	p.reservation = nil
 	if reservation.transaction == "" || revision == nil || revision.ID != reservation.transaction {
 		_ = closeReservation(reservation)
-		return p.source.selectRevision(revision)
+		return p.source.selectRevision(revision, nil)
 	}
 	return p.publishReservation(revision, reservation)
 }

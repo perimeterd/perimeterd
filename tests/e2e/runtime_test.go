@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -51,14 +50,16 @@ func TestE2ERuntime(t *testing.T) {
 	// Removing one configured family retires only that family's path. The
 	// remaining IPv4 block stays active while IPv6 traffic returns normally.
 	writeConfigFamilies(t, configPath, table, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -10, true, false)
+	before := activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18080", "success", "tcp")
 	probeEgress(t, peer, "tcp6", "["+fixtureIPv6Peer+"]:18081", "success", "tcp")
 	writeConfig(t, configPath, table, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -10)
+	before = activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 
 	beforeCounters := nftCounters(t, table)
 	if len(beforeCounters) == 0 {
@@ -67,8 +68,9 @@ func TestE2ERuntime(t *testing.T) {
 
 	// Explicit global allows take precedence over the same global blocks.
 	writeConfig(t, configPath, table, "drop", []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -10)
+	before = activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "success", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18080", "success", "tcp")
 	probeEgress(t, peer, "tcp4", fixtureIPv4Peer+":18081", "success", "tcp")
@@ -76,8 +78,9 @@ func TestE2ERuntime(t *testing.T) {
 
 	// Native nftables /0 sets retain allow-before-block precedence.
 	writeConfig(t, configPath, table, "drop", []string{"0.0.0.0/0", "::/0"}, []string{"0.0.0.0/0", "::/0"}, -10)
+	before = activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "success", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18080", "success", "tcp")
 
@@ -108,8 +111,9 @@ func TestE2ERuntime(t *testing.T) {
 		t.Fatalf("initial established response: %v", err)
 	}
 	writeConfig(t, configPath, table, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -10)
+	before = activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -127,24 +131,27 @@ func TestE2ERuntime(t *testing.T) {
 	// Reject is observable as a prompt connection failure, unlike DROP's
 	// timeout. A malformed HUP must preserve this active enforcement.
 	writeConfig(t, configPath, table, "reject", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -10)
+	before = activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "reject", "tcp")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18080", "reject", "tcp")
 	probeIngress(t, peer, "udp4", fixtureIPv4Host+":18082", "reject", "udp")
 	probeIngress(t, peer, "udp6", "["+fixtureIPv6Host+"]:18082", "reject", "udp")
 	probeEgress(t, peer, "udp4", fixtureIPv4Peer+":18083", "reject", "udp")
 	probeEgress(t, peer, "udp6", "["+fixtureIPv6Peer+"]:18083", "reject", "udp")
-	writeInvalidConfig(t, configPath)
+	writeInvalidConfigMarker(t, configPath, "unsupported-native-reload")
+	diagnosticOffset := daemonDiagnosticOffset(daemon)
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForDaemonDiagnostic(t, daemon, []string{"unsupported-native-reload"}, diagnosticOffset)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "reject", "tcp")
 
 	// Priority-only reload replaces only hook chains. The stable counters remain
 	// present and retain their values while the generated path is unchanged.
 	writeConfig(t, configPath, table, "reject", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -9)
+	before = activeRevision()
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForActiveRevisionChange(t, before, configPath)
 	priorities := nftHookPriorities(t, table)
 	foundPriority := false
 	for _, priority := range priorities {
@@ -173,8 +180,9 @@ func TestE2ERuntime(t *testing.T) {
 	// An unrecorded same-name table is a hard collision. Reload failure must
 	// preserve the active target and the foreign table byte-for-byte.
 	writeConfig(t, configPath, collision, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -9)
+	diagnosticOffset = daemonDiagnosticOffset(daemon)
 	daemon.reload(t)
-	time.Sleep(2 * time.Second)
+	waitForDaemonDiagnostic(t, daemon, []string{"foreign_child"}, diagnosticOffset)
 	if _, err := nftTableMayFail(table); err != nil {
 		t.Fatalf("collision reload removed active table: %v", err)
 	}
@@ -203,14 +211,7 @@ func TestE2ERuntime(t *testing.T) {
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
 
 	// Normal TERM deliberately leaves the committed target active.
-	if err := daemon.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatalf("terminate daemon: %v", err)
-	}
-	select {
-	case <-daemon.done:
-	case <-time.After(20 * time.Second):
-		t.Fatal("daemon did not terminate")
-	}
+	daemon.stop(t)
 	if _, err := nftTableMayFail(migrated); err != nil {
 		t.Fatalf("normal stop removed active nftables table: %v", err)
 	}
@@ -220,8 +221,7 @@ func TestE2ERuntime(t *testing.T) {
 	// packet enforcement before the process can serve.
 	flushOwnedTableRules(t, migrated)
 	daemon = startDaemon(t, configPath, migrated)
-	time.Sleep(2 * time.Second)
-	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
+	waitCrowdPacket(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop")
 	probeEgress(t, peer, "tcp4", fixtureIPv4Peer+":18081", "drop", "tcp")
 	daemon.stop(t)
 

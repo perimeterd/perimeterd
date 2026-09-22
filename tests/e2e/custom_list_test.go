@@ -85,6 +85,23 @@ func waitCustomListRequests(t *testing.T, fixture *customListServer, path string
 	t.Fatalf("custom list %s did not receive request %d (received %d)", path, minimum, fixture.Requests(path))
 }
 
+func waitCustomListRefreshStops(t *testing.T, fixture *customListServer, path string) {
+	t.Helper()
+	last := fixture.Requests(path)
+	quietSince := time.Now()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Since(quietSince) < 750*time.Millisecond {
+		if time.Now().After(deadline) {
+			t.Fatalf("custom list %s continued refreshing", path)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if current := fixture.Requests(path); current != last {
+			last = current
+			quietSince = time.Now()
+		}
+	}
+}
+
 func activeCustomListEndpoint(t *testing.T, listName string) string {
 	t.Helper()
 	activeBytes, err := os.ReadFile("/var/lib/perimeterd/active.json")
@@ -148,7 +165,7 @@ func writeCustomListConfig(t *testing.T, path, backend, table, mainURL, carveURL
 	t.Helper()
 	var yaml strings.Builder
 	yaml.WriteString("version: 1\n")
-	yaml.WriteString("logging:\n  level: error\n  format: text\n")
+	yaml.WriteString("logging:\n  level: debug\n  format: text\n")
 	yaml.WriteString("metrics:\n  listen: \"\"\n")
 	yaml.WriteString("global:\n  allowlist: []\n  blocklist: []\n")
 	if backend == "nftables" {
@@ -328,7 +345,8 @@ func TestE2ECustomIPLists(t *testing.T) {
 	mainRequests := fixture.Requests("/main")
 	fixture.Set("/main", http.StatusOK, replacementBody)
 	waitCustomListRequests(t, fixture, "/main", mainRequests+1)
-	time.Sleep(2 * time.Second)
+	waitCrowdPacket(t, peer, "tcp4", "8.21.0.1:18480", "success")
+	waitCrowdPacket(t, peer, "tcp6", "[2600:21::1]:18480", "success")
 	exerciseReplacementCustomList(t, peer)
 
 	// Malformed, empty, and unavailable responses must not replace the last
@@ -344,7 +362,6 @@ func TestE2ECustomIPLists(t *testing.T) {
 		before := fixture.Requests("/main")
 		fixture.Set("/main", response.status, response.body)
 		waitCustomListRequests(t, fixture, "/main", before+1)
-		time.Sleep(750 * time.Millisecond)
 		assertReplacementBlockRetained(t, peer)
 	}
 
@@ -352,13 +369,15 @@ func TestE2ECustomIPLists(t *testing.T) {
 	// changed URL cannot borrow the old same-name object.
 	fixture.Set("/main", http.StatusOK, replacementBody)
 	writeCustomListConfig(t, configPath, backend, table, fixture.URL("/main"), fixture.URL("/carve"), "24h", true)
+	beforeRevision := activeRevision()
 	daemon.reload(t)
-	time.Sleep(750 * time.Millisecond)
+	waitForActiveRevisionChange(t, beforeRevision, configPath)
 	oldRequests := fixture.Requests("/main")
 	writeCustomListConfig(t, configPath, backend, table, changed.URL("/main"), fixture.URL("/carve"), "24h", true)
+	diagnosticOffset := daemonDiagnosticOffset(daemon)
 	daemon.reload(t)
 	waitCustomListRequests(t, changed, "/main", 1)
-	time.Sleep(750 * time.Millisecond)
+	waitForDaemonDiagnostic(t, daemon, []string{"ip_list/main"}, diagnosticOffset)
 	if got := fixture.Requests("/main"); got != oldRequests {
 		t.Fatalf("changed-URL reload unexpectedly fetched old URL: before=%d after=%d", oldRequests, got)
 	}
@@ -370,13 +389,15 @@ func TestE2ECustomIPLists(t *testing.T) {
 	// Restore the original identity, then make it due and unavailable. Startup
 	// must use the complete committed fallback, retaining both families.
 	writeCustomListConfig(t, configPath, backend, table, fixture.URL("/main"), fixture.URL("/carve"), "24h", true)
+	beforeRevision = activeRevision()
 	daemon.reload(t)
-	time.Sleep(750 * time.Millisecond)
+	waitForActiveRevisionChange(t, beforeRevision, configPath)
 	fixture.Set("/main", http.StatusServiceUnavailable, "restart outage\n")
 	writeCustomListConfig(t, configPath, backend, table, fixture.URL("/main"), fixture.URL("/carve"), "200ms", true)
+	beforeRevision = activeRevision()
 	daemon.reload(t)
 	waitCustomListRequests(t, fixture, "/main", fixture.Requests("/main")+1)
-	time.Sleep(750 * time.Millisecond)
+	waitForActiveRevisionChange(t, beforeRevision, configPath)
 	assertReplacementBlockRetained(t, peer)
 	daemon.stop(t)
 	if backend == "nftables" {
@@ -396,9 +417,5 @@ func TestE2ECustomIPLists(t *testing.T) {
 	} else {
 		waitNoIPTablesOwned(t, "v4", "v6")
 	}
-	beforeRemovalRequests := fixture.Requests("/main")
-	time.Sleep(750 * time.Millisecond)
-	if got := fixture.Requests("/main"); got != beforeRemovalRequests {
-		t.Fatalf("unreferenced list continued refreshing: before=%d after=%d", beforeRemovalRequests, got)
-	}
+	waitCustomListRefreshStops(t, fixture, "/main")
 }

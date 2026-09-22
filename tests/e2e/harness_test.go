@@ -25,6 +25,11 @@ const (
 	e2eCheckpointError = "PERIMETERD_E2E_CHECKPOINT_ERROR"
 )
 
+func activeRevision() string {
+	data, _ := os.ReadFile("/var/lib/perimeterd/active.json")
+	return string(data)
+}
+
 func TestMain(m *testing.M) {
 	if os.Getenv(e2eEnabledEnv) != "1" && os.Getenv(e2eChildEnv) != "1" {
 		fmt.Fprintln(os.Stderr, "PERIMETERD_E2E=1 is required; refusing to run the privileged E2E suite")

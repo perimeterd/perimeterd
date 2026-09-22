@@ -15,6 +15,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
+	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
 var (
@@ -144,16 +145,26 @@ func (e *Engine) currentLocked(candidate Candidate) bool {
 	return candidate.epoch == e.admitted
 }
 
-// Apply admits a fully staged candidate to the backend and durable store. All
+// Apply admits a fully compiled candidate to the backend and durable store. All
 // mutations occur only after a read-only preflight and durable preparation.
 func (e *Engine) Apply(ctx context.Context, candidate Candidate) (Outcome, error) {
+	return e.apply(ctx, candidate, nil)
+}
+
+// applyStaged consumes staging resources only after application releases its
+// writer locks. Publication must retain its independent handle beforehand.
+func (e *Engine) applyStaged(ctx context.Context, staged *stagedCandidate) (Outcome, error) {
+	defer staged.close()
+	return e.apply(ctx, staged.Candidate, staged.session)
+}
+
+func (e *Engine) apply(ctx context.Context, candidate Candidate, session *upstream.Session) (Outcome, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	defer candidate.releaseSession() // Apply consumes the candidate's staged session handle.
 	e.applyMu.Lock()
 	defer e.applyMu.Unlock()
-	selected, stageErr := e.crowd.stageForApply(ctx, candidate)
+	selected, stageErr := e.crowd.stageForApply(ctx, candidate, session)
 	e.mu.Lock()
 	defer func() {
 		e.stagedQuery = nil
