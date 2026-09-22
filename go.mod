@@ -7,7 +7,7 @@ require (
 	github.com/crowdsecurity/go-cs-bouncer v0.0.21
 	github.com/go-openapi/runtime v0.33.2
 	github.com/openziti/identity v1.0.143
-	github.com/openziti/sdk-golang v1.8.2
+	github.com/openziti/sdk-golang v1.9.1
 	github.com/sirupsen/logrus v1.10.2
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sys v0.48.0
@@ -201,6 +201,7 @@ require (
 	github.com/nunnatsa/ginkgolinter v0.24.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
 	github.com/openziti/channel/v4 v4.3.13 // indirect
+	github.com/openziti/channel/v5 v5.0.10 // indirect
 	github.com/openziti/edge-api v0.36.1 // indirect
 	github.com/openziti/foundation/v2 v2.0.104 // indirect
 	github.com/openziti/metrics v1.4.5 // indirect
@@ -252,8 +253,8 @@ require (
 	github.com/tetafro/godot v1.5.6 // indirect
 	github.com/timakin/bodyclose v0.0.0-20260129054331-73d1f95b84b4 // indirect
 	github.com/timonwong/loggercheck v0.11.0 // indirect
-	github.com/tklauser/go-sysconf v0.3.16 // indirect
-	github.com/tklauser/numcpus v0.11.0 // indirect
+	github.com/tklauser/go-sysconf v0.4.0 // indirect
+	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/tomarrell/wrapcheck/v2 v2.12.0 // indirect
 	github.com/tommy-muehle/go-mnd/v2 v2.5.1 // indirect
 	github.com/ultraware/funlen v0.2.0 // indirect
