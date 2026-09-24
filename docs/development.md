@@ -67,8 +67,8 @@ The most useful file boundaries when changing an existing path are:
 - `internal/upstream/identity.go` and `manager.go`: validated credential capture
   and identity-generation/session lifecycle.
 - `internal/source/source.go`: shared selector metadata and active identity-profile
-  selection; `cache_format.go` and `cache.go`: canonical cache wire validation and
-  filesystem storage.
+  selection; `cache_format.go`: cache wire schemas and validation; `cache_json.go`:
+  canonical JSON codec (no format or behavior change); `cache.go`: filesystem storage.
 - `internal/app/publication.go`: staged metrics/listener reservations and
   transaction-gated runtime publication.
 - `internal/app/crowdsec.go`: staged client epochs, serialized dynamic
