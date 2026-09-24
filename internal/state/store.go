@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
@@ -509,6 +510,57 @@ func (s *Store) Finish() error {
 		if err := syncDirectory(s.revisions); err != nil {
 			return fmt.Errorf("retire revision sync: %w", err)
 		}
+	}
+	return nil
+}
+
+// CollectRevisions removes unreferenced revision files after startup recovery.
+// The caller must hold the lifecycle lock and have no staging workers.
+func (s *Store) CollectRevisions() (retErr error) {
+	view, err := s.read()
+	if err != nil {
+		return err
+	}
+	if view.Journal != nil {
+		return errors.New("state: cannot collect revisions with a pending journal")
+	}
+	if err := ensureDirectory(s.revisions, stateDirMode); err != nil {
+		return fmt.Errorf("state revisions directory: %w", err)
+	}
+	entries, err := os.ReadDir(s.revisions)
+	if err != nil {
+		return fmt.Errorf("list revisions: %w", err)
+	}
+	removed := false
+	defer func() {
+		if removed {
+			if err := syncDirectory(s.revisions); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("sync collected revisions: %w", err))
+			}
+		}
+	}()
+	for _, entry := range entries {
+		name := entry.Name()
+		if id, ok := strings.CutSuffix(name, ".json"); ok && validateID(id, "revision") == nil {
+			if view.Active != nil && id == view.Active.ID {
+				continue
+			}
+		} else if !strings.HasPrefix(name, ".state-tmp-") || len(name) == len(".state-tmp-") {
+			// Do not infer ownership from arbitrary files in the directory.
+			continue
+		}
+		path := filepath.Join(s.revisions, name)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("inspect orphan revision %q: %w", name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("state: orphan revision %q is unsafe", name)
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove orphan revision %q: %w", name, err)
+		}
+		removed = true
 	}
 	return nil
 }

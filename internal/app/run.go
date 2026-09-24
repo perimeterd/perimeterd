@@ -159,6 +159,9 @@ func Run(ctx context.Context, options Options) error {
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
+	if err := store.CollectRevisions(); err != nil {
+		return errors.Join(fmt.Errorf("collect orphan revisions: %w", err), stopNotifier())
+	}
 	if err := collectPrefixes(store); err != nil {
 		return errors.Join(fmt.Errorf("collect unused prefix cache: %w", err), stopNotifier())
 	}

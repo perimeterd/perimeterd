@@ -308,6 +308,183 @@ func TestStoreCleanupIntentRetainsUnionUntilFinish(t *testing.T) {
 	}
 }
 
+func TestStoreCollectRevisionsAfterRecovery(t *testing.T) {
+	store, dir := openTestStore(t, nil)
+	first := persistStoreRevision(t, store, "11111111111111111111111111111111")
+	if err := store.Finish(); err != nil {
+		t.Fatalf("finish first revision: %v", err)
+	}
+	second := storeTestRevision(t, store, "22222222222222222222222222222222")
+	if err := store.Prepare(first, second); err != nil {
+		t.Fatalf("prepare replacement: %v", err)
+	}
+	if err := store.Commit(second); err != nil {
+		t.Fatalf("commit replacement: %v", err)
+	}
+	if err := store.Finish(); err != nil {
+		t.Fatalf("finish replacement: %v", err)
+	}
+	// Simulate interruption after removing the journal, but before retiring
+	// the old file; and interruption after a candidate write, before journal.
+	if err := store.writeImmutableRevision(first); err != nil {
+		t.Fatalf("restore retired revision: %v", err)
+	}
+	uncommitted := storeTestRevision(t, store, "33333333333333333333333333333333")
+	if err := store.writeImmutableRevision(uncommitted); err != nil {
+		t.Fatalf("write uncommitted revision: %v", err)
+	}
+	revisions := filepath.Join(dir, "revisions")
+	temp, err := os.CreateTemp(revisions, ".state-tmp-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := temp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(revisions, "operator-note.json")
+	if err := os.WriteFile(foreign, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := Open(dir, nil)
+	if err != nil {
+		t.Fatalf("reopen state: %v", err)
+	}
+	if err := restarted.CollectRevisions(); err != nil {
+		t.Fatalf("collect revisions: %v", err)
+	}
+	for _, path := range []string{store.revisionPath(first.ID), store.revisionPath(uncommitted.ID), temp.Name()} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("orphan %q after collection: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Fatalf("unrecognized file was removed: %v", err)
+	}
+	view, err := restarted.Read()
+	if err != nil || view.Active == nil || view.Active.ID != second.ID {
+		t.Fatalf("active revision after collection: %#v, %v", view.Active, err)
+	}
+}
+
+func TestStoreCollectRevisionsWithoutActiveRevision(t *testing.T) {
+	store, _ := openTestStore(t, nil)
+	orphan := storeTestRevision(t, store, "11111111111111111111111111111111")
+	if err := store.writeImmutableRevision(orphan); err != nil {
+		t.Fatalf("write uncommitted revision: %v", err)
+	}
+	if err := store.CollectRevisions(); err != nil {
+		t.Fatalf("collect revisions: %v", err)
+	}
+	if _, err := os.Lstat(store.revisionPath(orphan.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uncommitted revision after collection: %v", err)
+	}
+}
+
+func TestStoreCollectRevisionsRefusesPendingOrBrokenReferences(t *testing.T) {
+	store, dir := openTestStore(t, nil)
+	persistStoreRevision(t, store, "11111111111111111111111111111111")
+	orphan := storeTestRevision(t, store, "22222222222222222222222222222222")
+	if err := store.writeImmutableRevision(orphan); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	if err := store.CollectRevisions(); err == nil {
+		t.Fatal("collected revisions with a pending journal")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "revisions", orphan.ID+".json")); err != nil {
+		t.Fatalf("pending recovery lost orphan file: %v", err)
+	}
+	if err := store.Finish(); err != nil {
+		t.Fatalf("finish pending journal: %v", err)
+	}
+	if err := os.Remove(store.revisionPath("11111111111111111111111111111111")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CollectRevisions(); err == nil {
+		t.Fatal("collected revisions with a missing referenced active file")
+	}
+	if _, err := os.Stat(store.revisionPath(orphan.ID)); err != nil {
+		t.Fatalf("invalid recovery removed orphan file: %v", err)
+	}
+}
+
+func TestStoreCollectRevisionsRejectsUnsafeMatchingFiles(t *testing.T) {
+	for name, create := range map[string]func(t *testing.T, path string){
+		"symlink": func(t *testing.T, path string) {
+			t.Helper()
+			target := filepath.Join(t.TempDir(), "outside")
+			if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if data, err := os.ReadFile(target); err != nil || string(data) != "keep" { // #nosec G304 -- fixture in t.TempDir checks that an outside symlink target was untouched.
+					t.Errorf("symlink target changed: %q, %v", data, err)
+				}
+			})
+		},
+		"world-readable": func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.WriteFile(path, []byte("keep"), 0o644); err != nil { // #nosec G306 -- unsafe permissions are the test case.
+				t.Fatal(err)
+			}
+		},
+		"directory": func(t *testing.T, path string) {
+			t.Helper()
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, dir := openTestStore(t, nil)
+			path := filepath.Join(dir, "revisions", "11111111111111111111111111111111.json")
+			create(t, path)
+			if err := store.CollectRevisions(); err == nil {
+				t.Fatal("accepted an unsafe orphan file")
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("unsafe orphan was removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestStoreCollectRevisionsRetriesAfterPartialRemoval(t *testing.T) {
+	store, _ := openTestStore(t, nil)
+	orphan := storeTestRevision(t, store, "11111111111111111111111111111111")
+	if err := store.writeImmutableRevision(orphan); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	later := storeTestRevision(t, store, "33333333333333333333333333333333")
+	if err := store.writeImmutableRevision(later); err != nil {
+		t.Fatalf("write later orphan: %v", err)
+	}
+	unsafe := store.revisionPath("22222222222222222222222222222222")
+	if err := os.Symlink(store.revisionPath(orphan.ID), unsafe); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CollectRevisions(); err == nil {
+		t.Fatal("accepted unsafe orphan after partial removal")
+	}
+	if _, err := os.Lstat(store.revisionPath(orphan.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("earlier orphan after partial removal: %v", err)
+	}
+	if _, err := os.Stat(store.revisionPath(later.ID)); err != nil {
+		t.Fatalf("later orphan lost before retry: %v", err)
+	}
+	if err := os.Remove(unsafe); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CollectRevisions(); err != nil {
+		t.Fatalf("retry after unsafe file removal: %v", err)
+	}
+	if _, err := os.Lstat(store.revisionPath(later.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("later orphan after retry: %v", err)
+	}
+}
+
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

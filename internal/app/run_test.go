@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/state"
 )
 
 func TestStartupNotifierDeliversBoundedExtensionAndErrors(t *testing.T) {
@@ -359,6 +360,55 @@ func assertRunHealth(t *testing.T, address string, want int) {
 	needle := fmt.Sprintf("perimeterd_enforcement_health %d", want)
 	if !strings.Contains(string(body), needle) {
 		t.Fatalf("metrics body = %q, want %q", body, needle)
+	}
+}
+
+func TestRunRestartCollectsOrphanRevisions(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	configPath := filepath.Join(dir, "policy.yaml")
+	writeRunConfig(t, configPath, runAddress(t), "198.51.100.0/24")
+	backend := &runBackend{recordingBackend: &recordingBackend{}, applied: make(chan struct{}, 16)}
+	cancel, _, ready, done := startRun(t, configPath, stateDir, backend, nil)
+	awaitRunReady(t, ready)
+	awaitRunApply(t, backend.applied)
+	awaitRunStop(t, cancel, done)
+
+	store, err := state.Open(stateDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := store.Read()
+	if err != nil || view.Active == nil || view.Journal != nil {
+		t.Fatalf("stopped state: %#v, %v", view, err)
+	}
+	revisions := filepath.Join(stateDir, "revisions")
+	active, err := os.ReadFile(filepath.Join(revisions, view.Active.ID+".json")) // #nosec G304 -- referenced test revision in a private state directory.
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(revisions, "ffffffffffffffffffffffffffffffff.json")
+	if err := os.WriteFile(orphan, active, 0o600); err != nil { // #nosec G703 -- fixed orphan filename under the private test state directory.
+		t.Fatal(err)
+	}
+	temp, err := os.CreateTemp(revisions, ".state-tmp-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := temp.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cancel, _, ready, done = startRun(t, configPath, stateDir, backend, nil)
+	defer awaitRunStop(t, cancel, done)
+	awaitRunReady(t, ready)
+	for _, path := range []string{orphan, temp.Name()} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("startup did not collect %q: %v", path, err)
+		}
+	}
+	view, err = store.Read()
+	if err != nil || view.Active == nil {
+		t.Fatalf("startup lost active revision: %#v, %v", view.Active, err)
 	}
 }
 

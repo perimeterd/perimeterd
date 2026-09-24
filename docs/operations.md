@@ -123,6 +123,14 @@ ownership checks. A committed static policy remains in the kernel after a
 normal stop. CrowdSec entries retain only their remaining finite kernel lease;
 without the daemon, they can expire before the original decision deadline.
 
+After successful startup recovery, while holding the lifecycle lock and before
+staging new policy, perimeterd removes unreferenced revision files and leftover
+revision publication temp files under `/var/lib/perimeterd/revisions/`. The active
+revision is retained; collection does not run while a journal is pending.
+Unknown filenames are left untouched, and an unsafe matching file or cleanup
+error prevents startup rather than risking removal of recovery evidence.
+Collection runs on restart, not periodically while the service is running.
+
 Source-backed candidates use immutable, content-addressed manifests under
 `/var/lib/perimeterd/prefixes/`; the committed revision selects its manifest.
 Do not edit these files or choose one by modification time. Startup validates
