@@ -25,12 +25,13 @@ type nftExecutor func(context.Context, []string, []byte) ([]byte, error)
 // NFT is the native nftables backend. It only invokes nft with typed JSON and
 // never parses human-oriented command output.
 type NFT struct {
-	exec nftExecutor
+	exec       nftExecutor
+	retirement *counterRetirementReporter
 }
 
 // NewNFT returns a backend using the host nft executable. Tests in this
 // package may inject a bounded executor without changing production behavior.
-func NewNFT() *NFT { return &NFT{exec: nativeNFTExecutor} }
+func NewNFT() *NFT { return &NFT{exec: nativeNFTExecutor, retirement: &counterRetirementReporter{}} }
 
 func nativeNFTExecutor(ctx context.Context, args []string, input []byte) ([]byte, error) {
 	return executeNative(ctx, "nft", args, input, maxNFTInput, maxNFTOutput)
@@ -103,6 +104,8 @@ type nftObject struct {
 	Flags      []string
 	Timeout    json.RawMessage
 	HasTimeout bool
+	Packets    json.RawMessage
+	Bytes      json.RawMessage
 }
 
 type baseDefinition struct {
@@ -316,6 +319,8 @@ func decodeNFTObject(kind string, raw json.RawMessage) (nftObject, error) {
 		Elem    json.RawMessage   `json:"elem"`
 		Flags   []string          `json:"flags"`
 		Timeout json.RawMessage   `json:"timeout"`
+		Packets json.RawMessage   `json:"packets"`
+		Bytes   json.RawMessage   `json:"bytes"`
 	}
 	switch kind {
 	case "table", "chain", "set", "counter", "rule", "element":
@@ -331,6 +336,7 @@ func decodeNFTObject(kind string, raw json.RawMessage) (nftObject, error) {
 	object.Family, object.Table, object.Name, object.Chain = common.Family, common.Table, common.Name, common.Chain
 	object.Comment, object.Type, object.Hook, object.Policy, object.Expr, object.Elem = common.Comment, common.Type, common.Hook, common.Policy, common.Expr, common.Elem
 	object.Flags, object.Timeout = common.Flags, common.Timeout
+	object.Packets, object.Bytes = common.Packets, common.Bytes
 	object.HasTimeout = common.Timeout != nil
 	if common.Prio != "" {
 		value, err := strconv.ParseInt(string(common.Prio), 10, 32)
@@ -847,6 +853,10 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 		if !inventory.present {
 			return nil
 		}
+		if n.retirement != nil && n.retirement.enabled() {
+			values, snapshotErr := nftCounterSnapshots(previous, inventory)
+			n.retirement.report(previous, values, snapshotErr)
+		}
 		return n.applyBatch(ctx, nftBatch{Nftables: []nftCommand{{Delete: map[string]any{"table": map[string]any{"family": "inet", "name": previous.Table}}}}})
 	}
 	inventory, err := n.inspect(ctx, previous.Table, previous, candidate)
@@ -921,6 +931,10 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 			batch.Nftables = append(batch.Nftables, nftCommand{Delete: map[string]any{"counter": objectRef(previous.Table, counter.Name)}})
 		}
 	}
+	if n.retirement != nil && n.retirement.enabled() {
+		values, snapshotErr := nftCounterSnapshots(previous, inventory)
+		n.retirement.report(previous, values, snapshotErr)
+	}
 	return n.applyBatch(ctx, batch)
 }
 
@@ -934,6 +948,10 @@ func (n *NFT) retireSingle(ctx context.Context, target *Target) error {
 	}
 	if !inventory.present {
 		return nil
+	}
+	if n.retirement != nil && n.retirement.enabled() {
+		values, snapshotErr := nftCounterSnapshots(target, inventory)
+		n.retirement.report(target, values, snapshotErr)
 	}
 	return n.applyBatch(ctx, nftBatch{Nftables: []nftCommand{{Delete: map[string]any{"table": map[string]any{"family": "inet", "name": target.Table}}}}})
 }
@@ -966,4 +984,134 @@ func (n *NFT) Cleanup(ctx context.Context, targets []*Target) error {
 		batch.Nftables = append(batch.Nftables, nftCommand{Delete: map[string]any{"table": map[string]any{"family": "inet", "name": table}}})
 	}
 	return n.applyBatch(ctx, batch)
+}
+
+// SetCounterRetirementHook installs the observer called before native counter removal.
+func (n *NFT) SetCounterRetirementHook(hook CounterRetirementHook) {
+	if n == nil {
+		return
+	}
+	if n.retirement == nil {
+		n.retirement = &counterRetirementReporter{}
+	}
+	n.retirement.set(hook)
+}
+
+func (n *NFT) setCounterRetirementReporter(reporter *counterRetirementReporter) {
+	n.retirement = reporter
+}
+
+// SnapshotCounters returns cumulative values from only the target's exact
+// perimeterd-owned named counters.
+func (n *NFT) SnapshotCounters(ctx context.Context, target *Target) (map[string]CounterSnapshot, error) {
+	if target == nil {
+		return nil, errors.New("nft backend: counter snapshot requires a target")
+	}
+	if err := validateNFTTarget(target); err != nil {
+		return nil, err
+	}
+	inventory, err := n.counterInventory(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	return nftCounterSnapshots(target, inventory)
+}
+
+func (n *NFT) counterInventory(ctx context.Context, target *Target) (*nftInventory, error) {
+	tables, err := n.listTables(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var table *nftObject
+	for index := range tables {
+		object := &tables[index]
+		if object.Kind == "table" && object.Family == "inet" && object.Name == target.Table {
+			if table != nil {
+				return nil, errors.New("nft backend: duplicate table in counter snapshot")
+			}
+			table = object
+		}
+	}
+	if table == nil {
+		return nil, errors.New("nft backend: owned table is absent during counter snapshot")
+	}
+	if table.Comment != tableComment(target.Owner) {
+		return nil, errors.New("nft backend: counter snapshot table ownership mismatch")
+	}
+	objects, _, err := n.listTable(ctx, target.Table)
+	if err != nil {
+		return nil, err
+	}
+	inventory := newNFTInventory()
+	inventory.present, inventory.table = true, *table
+	for _, object := range objects {
+		if object.Kind == "table" && object.Family == "inet" && object.Name == target.Table {
+			if object.Comment != tableComment(target.Owner) {
+				return nil, errors.New("nft backend: counter snapshot table ownership mismatch")
+			}
+			inventory.table = object
+		}
+		if object.Kind != "counter" {
+			continue
+		}
+		if object.Family != "inet" || object.Table != target.Table || object.Name == "" {
+			return nil, errors.New("nft backend: malformed counter snapshot inventory")
+		}
+		if _, exists := inventory.counters[object.Name]; exists {
+			return nil, fmt.Errorf("nft backend: duplicate counter %q in snapshot", object.Name)
+		}
+		inventory.counters[object.Name] = object
+	}
+	return inventory, nil
+}
+
+func nftCounterSnapshots(target *Target, inventory *nftInventory) (map[string]CounterSnapshot, error) {
+	if inventory == nil || !inventory.present || inventory.table.Comment != tableComment(target.Owner) {
+		return nil, errors.New("nft backend: owned table is absent or not owned during counter snapshot")
+	}
+	if len(target.Counters) > maxCounterSnapshotRows {
+		return nil, fmt.Errorf("nft backend: counter snapshot exceeds %d rules", maxCounterSnapshotRows)
+	}
+	result := make(map[string]CounterSnapshot, len(target.Counters))
+	for _, spec := range target.Counters {
+		if !validRole(spec.Role) || !validFamily(spec.Family) || !validDirection(spec.Direction) ||
+			spec.Name != counterName(target.Owner, spec.Family, spec.Direction, spec.Role) {
+			return nil, fmt.Errorf("nft backend: invalid owned counter identity %q", spec.Name)
+		}
+		counter, exists := inventory.counters[spec.Name]
+		if !exists {
+			return nil, fmt.Errorf("nft backend: owned counter %q is absent", spec.Name)
+		}
+		if counter.Family != "inet" || counter.Table != target.Table ||
+			counter.Comment != ownershipComment(target.Owner, stableToken, "counter/"+spec.Name, true) {
+			return nil, fmt.Errorf("nft backend: counter %q ownership mismatch", spec.Name)
+		}
+		packets, err := parseNFTCounterValue(counter.Packets)
+		if err != nil {
+			return nil, fmt.Errorf("nft backend: counter %q packets: %w", spec.Name, err)
+		}
+		byteCount, err := parseNFTCounterValue(counter.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("nft backend: counter %q bytes: %w", spec.Name, err)
+		}
+		value, err := newCounterSnapshot(target, target.Table+"/"+spec.Name, spec.Family, spec.Direction, spec.Role, packets, byteCount)
+		if err != nil {
+			return nil, err
+		}
+		if err := addCounterSnapshot(result, value); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func parseNFTCounterValue(value json.RawMessage) (uint64, error) {
+	if len(value) == 0 {
+		return 0, errors.New("missing native value")
+	}
+	parsed, err := strconv.ParseUint(string(bytes.TrimSpace(value)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid native value: %w", err)
+	}
+	return parsed, nil
 }

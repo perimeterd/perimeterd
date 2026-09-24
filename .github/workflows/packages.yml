@@ -1,0 +1,115 @@
+name: Packages
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        default: ''
+      prerelease:
+        type: boolean
+        default: false
+      artifact-name:
+        type: string
+        default: package-dist
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.27.1'
+          check-latest: false
+      - name: Install checksum-pinned GoReleaser and Syft
+        run: |
+          scripts/install-release-tools.sh "$RUNNER_TEMP/release-tools"
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+      - name: Check release configuration and admission regressions
+        run: |
+          goreleaser check
+          python3 tests/release/test_metadata.py
+      - name: Build lower-version upgrade fixture
+        env:
+          SNAPSHOT_VERSION: 0.0.0-0
+        run: |
+          goreleaser release --snapshot --clean --skip=publish,sbom
+          mv dist dist-upgrade
+      - name: Build the candidate artifacts once
+        id: candidate
+        env:
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          GORELEASER_CURRENT_TAG: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$VERSION" ]]; then
+            unset GORELEASER_CURRENT_TAG
+            goreleaser release --snapshot --clean --skip=publish
+          else
+            if [[ "$PRERELEASE" == true ]]; then
+              git tag "$VERSION" "$GITHUB_SHA"
+            fi
+            goreleaser release --clean --skip=publish
+          fi
+          python3 scripts/release-assets.py dist release-assets
+          echo "version=$(jq -er .version dist/metadata.json)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: release-assets/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact-name }}-upgrade
+          path: |
+            dist-upgrade/*.deb
+            dist-upgrade/*.rpm
+          if-no-files-found: error
+
+  smoke:
+    needs: build
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: ${{ inputs.artifact-name }}-upgrade
+          path: dist-upgrade
+      - name: Install pinned non-native architecture emulation
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          image: tonistiigi/binfmt@sha256:d3b963f787999e6c0219a48dba02978769286ff61a5f4d26245cb6a6e5567ea3
+          platforms: arm64
+      - name: Install, validate, and upgrade matching-architecture packages
+        env:
+          PACKAGE_CONTAINER_RUNTIME: docker
+          PACKAGE_EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: tests/packaging/run.sh dist '${{ matrix.arch }}' dist-upgrade
+
+  systemd:
+    needs: build
+    uses: ./.github/workflows/systemd.yml
+    with:
+      artifact-name: ${{ inputs.artifact-name }}

@@ -1,0 +1,180 @@
+version: 2
+project_name: perimeterd
+
+builds:
+  - id: linux
+    main: ./cmd/perimeterd
+    binary: perimeterd
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X github.com/perimeterd/perimeterd/internal/cli.Version={{ .Version }} -X github.com/perimeterd/perimeterd/internal/cli.Commit={{ .FullCommit }} -X github.com/perimeterd/perimeterd/internal/cli.BuildTime={{ .Date }}
+
+nfpms:
+  - id: packages
+    package_name: perimeterd
+    file_name_template: "{{ .ConventionalFileName }}"
+    ids:
+      - linux
+    formats:
+      - deb
+      - rpm
+    goamd64:
+      - v1
+    vendor: Perimeterd contributors
+    homepage: https://github.com/perimeterd/perimeterd
+    maintainer: Perimeterd maintainers
+    description: Block unwanted traffic at your Linux perimeter
+    license: MIT
+    section: net
+    priority: optional
+    release: 1
+    umask: 0o022
+    contents:
+      - dst: /etc/perimeterd
+        type: dir
+        file_info:
+          mode: 0700
+          owner: root
+          group: root
+      - src: configs/perimeterd.yaml
+        dst: /etc/perimeterd/perimeterd.yaml
+        type: "config|noreplace"
+        file_info:
+          mode: 0600
+          owner: root
+          group: root
+      - dst: /etc/perimeterd/credentials.d
+        type: dir
+        file_info:
+          mode: 0700
+          owner: root
+          group: root
+      - dst: /var/lib/perimeterd
+        type: dir
+        file_info:
+          mode: 0700
+          owner: root
+          group: root
+      - dst: /run/perimeterd
+        type: dir
+        file_info:
+          mode: 0700
+          owner: root
+          group: root
+      - src: packaging/perimeterd.service
+        dst: /usr/lib/systemd/system/perimeterd.service
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: packaging/perimeterd.tmpfiles.conf
+        dst: /usr/lib/tmpfiles.d/perimeterd.conf
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: README.md
+        dst: /usr/share/doc/perimeterd/README.md
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: LICENSE
+        dst: /usr/share/doc/perimeterd/copyright
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: docs/architecture.md
+        dst: /usr/share/doc/perimeterd/architecture.md
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: docs/configuration.md
+        dst: /usr/share/doc/perimeterd/configuration.md
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: docs/data-sources.md
+        dst: /usr/share/doc/perimeterd/data-sources.md
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: docs/firewall-backends.md
+        dst: /usr/share/doc/perimeterd/firewall-backends.md
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: docs/operations.md
+        dst: /usr/share/doc/perimeterd/operations.md
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+    scripts:
+      postinstall: packaging/scripts/postinstall.sh
+      preremove: packaging/scripts/preremove.sh
+      postremove: packaging/scripts/postremove.sh
+    overrides:
+      deb:
+        dependencies:
+          - ca-certificates
+          - nftables | iptables
+          - nftables | ipset
+      rpm:
+        dependencies:
+          - ca-certificates
+          - "(nftables or (iptables and ipset))"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+sboms:
+  - id: package-sbom
+    artifacts: package
+    documents:
+      - "${artifact}.spdx.sbom.json"
+    cmd: syft
+    args:
+      - "$artifact"
+      - --output
+      - "spdx-json=$document"
+  - id: source-sbom
+    artifacts: source
+    documents:
+      - "${artifact}.spdx.sbom.json"
+    cmd: syft
+    args:
+      - "$artifact"
+      - --output
+      - "spdx-json=$document"
+
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}-source-{{ .Version }}"
+  prefix_template: "{{ .ProjectName }}-{{ .Version }}/"
+  format: tar.gz
+
+snapshot:
+  version_template: '{{ if index .Env "SNAPSHOT_VERSION" }}{{ .Env.SNAPSHOT_VERSION }}{{ else }}0.0.1-dev.{{ .ShortCommit }}{{ end }}'
+
+release:
+  github:
+    owner: perimeterd
+    name: perimeterd
+  prerelease: auto

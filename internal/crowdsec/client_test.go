@@ -35,9 +35,14 @@ func response(status int, body io.Reader, headers http.Header) *http.Response {
 
 func TestClientPollInjectsDedupAndExplicitStartup(t *testing.T) {
 	var got *http.Request
+	var observed []bool
+	failedPoll := false
 	body := `{"new":[{"id":42,"type":"ban","scope":"Ip","value":"192.0.2.9","duration":"1h","origin":"cscli","scenario":"s"}],"deleted":[]}`
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		got = req
+		if failedPoll {
+			return response(http.StatusBadGateway, strings.NewReader("unavailable"), nil), nil
+		}
 		return response(http.StatusOK, strings.NewReader(body), nil), nil
 	})
 	client, err := NewClient(crowdConfig(t, "http://lapi.example/base"), transport)
@@ -45,6 +50,9 @@ func TestClientPollInjectsDedupAndExplicitStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
+	client.SetRequestObserver(func(success bool) {
+		observed = append(observed, success)
+	})
 
 	batch, err := client.Poll(context.Background(), false)
 	if err != nil {
@@ -62,6 +70,13 @@ func TestClientPollInjectsDedupAndExplicitStartup(t *testing.T) {
 	}
 	if len(batch.New) != 1 || batch.New[0].ID != 42 || batch.New[0].Prefix != netip.MustParsePrefix("192.0.2.9/32") {
 		t.Fatalf("unexpected batch: %#v", batch)
+	}
+	failedPoll = true
+	if _, err := client.Poll(context.Background(), false); err == nil {
+		t.Fatal("failed stream response was accepted")
+	}
+	if len(observed) != 2 || !observed[0] || observed[1] {
+		t.Fatalf("request observations = %#v", observed)
 	}
 }
 

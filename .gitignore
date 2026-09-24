@@ -19,6 +19,10 @@ profile.cov
 
 # Local build output
 /bin/
+/dist/
+/dist-upgrade/
+/release-assets/
+__pycache__/
 
 # Dependency directories (remove the comment below to include it)
 # vendor/

@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
 )
 
 // metricsServer owns a staged metrics listener. Binding is performed before a
@@ -20,6 +22,10 @@ type metricsServer struct {
 }
 
 func bindMetrics(listen string, health func() bool, snapshotTimestamps func() sourceTimestamps) (*metricsServer, error) {
+	return bindMetricsWithCollector(listen, health, snapshotTimestamps, metricspkg.New("dev", "unknown", "unknown"))
+}
+
+func bindMetricsWithCollector(listen string, health func() bool, snapshotTimestamps func() sourceTimestamps, collector *metricspkg.Collector) (*metricsServer, error) {
 	if listen == "" {
 		return nil, nil
 	}
@@ -30,7 +36,20 @@ func bindMetrics(listen string, health func() bool, snapshotTimestamps func() so
 	if err != nil {
 		return nil, fmt.Errorf("bind metrics %q: %w", listen, err)
 	}
+	if collector == nil {
+		collector = metricspkg.New("dev", "unknown", "unknown")
+	}
 	var metrics *metricsServer
+	var timestamps func() metricspkg.PrefixTimestamps
+	if snapshotTimestamps != nil {
+		timestamps = func() metricspkg.PrefixTimestamps {
+			value := snapshotTimestamps()
+			return metricspkg.PrefixTimestamps{RIPestat: value.ripe, IPList: value.ipList, Provider: value.provider}
+		}
+	}
+	handler := collector.Handler(health, timestamps, func() bool {
+		return metrics != nil && metrics.crowdConnected != nil && metrics.crowdConnected()
+	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -38,33 +57,7 @@ func bindMetrics(listen string, health func() bool, snapshotTimestamps func() so
 			return
 		}
 		writer.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		value := 0
-		if health() {
-			value = 1
-		}
-		_, _ = fmt.Fprintf(writer, "# HELP perimeterd_enforcement_health Whether the selected firewall state is healthy.\n# TYPE perimeterd_enforcement_health gauge\nperimeterd_enforcement_health %d\n", value)
-		if snapshotTimestamps != nil {
-			stamps := snapshotTimestamps()
-			if stamps.ripe != 0 || stamps.ipList != 0 || stamps.provider != 0 {
-				_, _ = fmt.Fprint(writer, "# HELP perimeterd_prefix_snapshot_timestamp_seconds Oldest retrieval time in the committed prefix snapshot by source.\n# TYPE perimeterd_prefix_snapshot_timestamp_seconds gauge\n")
-			}
-			if stamps.ripe != 0 {
-				_, _ = fmt.Fprintf(writer, "perimeterd_prefix_snapshot_timestamp_seconds{source=\"ripestat\"} %d\n", stamps.ripe)
-			}
-			if stamps.ipList != 0 {
-				_, _ = fmt.Fprintf(writer, "perimeterd_prefix_snapshot_timestamp_seconds{source=\"ip_list\"} %d\n", stamps.ipList)
-			}
-			if stamps.provider != 0 {
-				_, _ = fmt.Fprintf(writer, "perimeterd_prefix_snapshot_timestamp_seconds{source=\"provider\"} %d\n", stamps.provider)
-			}
-		}
-		if metrics != nil && metrics.crowdConnected != nil {
-			value := 0
-			if metrics.crowdConnected() {
-				value = 1
-			}
-			_, _ = fmt.Fprintf(writer, "# HELP perimeterd_crowdsec_connected Whether the CrowdSec client has a valid connection.\n# TYPE perimeterd_crowdsec_connected gauge\nperimeterd_crowdsec_connected %d\n", value)
-		}
+		handler.ServeHTTP(writer, request)
 	})
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		http.NotFound(writer, request)

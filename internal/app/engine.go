@@ -13,6 +13,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/lookup"
+	"github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
 	"github.com/perimeterd/perimeterd/internal/upstream"
@@ -43,6 +44,9 @@ type Engine struct {
 	store      *state.Store
 	backend    firewall.Backend
 	checkpoint func(string) error
+	telemetry  *metrics.Collector
+
+	counterTelemetryEnabled bool
 
 	admitted        uint64
 	activeEpoch     uint64
@@ -81,13 +85,35 @@ func NewEngine(store *state.Store, backend firewall.Backend, checkpoint func(str
 	return engine
 }
 
+func (e *Engine) setTelemetry(collector *metrics.Collector) {
+	e.telemetry = collector
+}
+
 func (e *Engine) applyBackendLocked(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
 	if (previous != nil && previous.DynamicGeneration != "") || (candidate != nil && candidate.DynamicGeneration != "") {
 		if _, err := e.crowd.nextOperationLocked(); err != nil {
 			return err
 		}
 	}
-	return e.backend.Apply(ctx, previous, candidate, dynamic)
+	backend := ""
+	if candidate != nil {
+		backend = candidate.Backend()
+	} else if previous != nil {
+		backend = previous.Backend()
+	}
+	err := e.backend.Apply(ctx, previous, candidate, dynamic)
+	if e.telemetry != nil {
+		e.telemetry.BackendApply(backend, err == nil)
+	}
+	return err
+}
+
+func (e *Engine) retireBackendLocked(ctx context.Context, previous, candidate *firewall.Target) error {
+	err := e.backend.Retire(ctx, previous, candidate)
+	if err == nil && e.counterTelemetryEnabled && candidate != nil {
+		e.observeNativeCountersLocked(ctx, candidate)
+	}
+	return err
 }
 
 // Admit reserves a monotonically increasing request epoch. Admission itself is
@@ -158,7 +184,22 @@ func (e *Engine) applyStaged(ctx context.Context, staged *stagedCandidate) (Outc
 	return e.apply(ctx, staged.Candidate, staged.session)
 }
 
-func (e *Engine) apply(ctx context.Context, candidate Candidate, session *upstream.Session) (Outcome, error) {
+func (e *Engine) apply(ctx context.Context, candidate Candidate, session *upstream.Session) (final Outcome, finalErr error) {
+	reason := "config"
+	if candidate.refresh != 0 {
+		reason = "source_refresh"
+	}
+	reconcileStarted := time.Now()
+	defer func() {
+		if e.telemetry == nil {
+			return
+		}
+		result := "error"
+		if finalErr == nil && final.Committed {
+			result = "success"
+		}
+		e.telemetry.Reconcile(reason, result, time.Since(reconcileStarted))
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -312,7 +353,7 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 	if err := e.check("before-retire"); err != nil {
 		return e.resolveCommittedLocked(ctx, previous, candidateRevision, candidateTarget, previousTarget, err)
 	}
-	if err := e.backend.Retire(ctx, previousTarget, candidateTarget); err != nil {
+	if err := e.retireBackendLocked(ctx, previousTarget, candidateTarget); err != nil {
 		return e.committedFailureLocked(candidateRevision, err)
 	}
 	if err := e.store.Finish(); err != nil {
@@ -335,7 +376,7 @@ func (e *Engine) rollbackLocked(ctx context.Context, previous, candidate *state.
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, errors.Join(original, fmt.Errorf("restore previous firewall target: %w", err))
 	}
-	if err := e.backend.Retire(ctx, candidateTarget, previousTarget); err != nil {
+	if err := e.retireBackendLocked(ctx, candidateTarget, previousTarget); err != nil {
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, errors.Join(original, fmt.Errorf("retire failed candidate: %w", err))
 	}
@@ -376,7 +417,7 @@ func (e *Engine) resolveCommittedLocked(ctx context.Context, previous, candidate
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Committed: true, Active: candidate, Degraded: true}, errors.Join(cause, err)
 	}
-	if err := e.backend.Retire(ctx, previousTarget, candidateTarget); err != nil {
+	if err := e.retireBackendLocked(ctx, previousTarget, candidateTarget); err != nil {
 		return e.committedFailureLocked(candidate, errors.Join(cause, err))
 	}
 	if err := e.store.Finish(); err != nil {
@@ -407,7 +448,18 @@ func (e *Engine) failLocked(err error) (Outcome, error) {
 
 // Recover resolves persisted transactions before configuration is read. It
 // uses only the observed active record, journal, and complete target metadata.
-func (e *Engine) Recover(ctx context.Context) (*state.Revision, error) {
+func (e *Engine) Recover(ctx context.Context) (revision *state.Revision, resultErr error) {
+	started := time.Now()
+	defer func() {
+		if e.telemetry == nil {
+			return
+		}
+		result := "error"
+		if resultErr == nil {
+			result = "success"
+		}
+		e.telemetry.Reconcile("recovery", result, time.Since(started))
+	}()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -472,7 +524,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		if err := e.store.MarkPhase("committed"); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		if err := e.backend.Retire(ctx, targetOf(view.Active), targetOf(view.Active)); err != nil {
+		if err := e.retireBackendLocked(ctx, targetOf(view.Active), targetOf(view.Active)); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		if err := e.store.Finish(); err != nil {
@@ -519,7 +571,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		if err := e.store.MarkPhase("committed"); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		if err := e.backend.Retire(ctx, prevTarget, candidateTarget); err != nil {
+		if err := e.retireBackendLocked(ctx, prevTarget, candidateTarget); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
 		if err := e.store.Finish(); err != nil {
@@ -532,7 +584,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 	if err := e.applyBackendLocked(ctx, candidateTarget, prevTarget, nil); err != nil {
 		return nil, e.recoveryFailureLocked(err)
 	}
-	if err := e.backend.Retire(ctx, candidateTarget, prevTarget); err != nil {
+	if err := e.retireBackendLocked(ctx, candidateTarget, prevTarget); err != nil {
 		return nil, e.recoveryFailureLocked(err)
 	}
 	if err := e.store.Finish(); err != nil {

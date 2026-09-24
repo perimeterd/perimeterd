@@ -10,9 +10,67 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestE2ENFTMetrics(t *testing.T) {
+	if os.Getenv(e2eChildEnv) != "1" {
+		runIsolated(t, "TestE2ENFTMetrics", "nft-metrics")
+		return
+	}
+	requireIsolatedChild(t)
+	prepareMounts(t)
+	peer := newPeerNamespace(t)
+	table := fmt.Sprintf("pdmetrics_%d", os.Getpid())
+	path := tempConfig(t, "metrics")
+	writeMetricsConfig := func(priority int) {
+		writeConfig(t, path, table, "drop", nil, []string{fixtureIPv4Peer + "/32"}, priority)
+		// #nosec G304 -- path is generated beneath this isolated test's private fixture directory.
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data = []byte(strings.Replace(string(data), `listen: ""`, `listen: "127.0.0.1:19096"`, 1))
+		// #nosec G703 -- path is generated beneath this isolated test's private fixture directory.
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeMetricsConfig(-10)
+	daemon := startDaemon(t, path, table)
+	for phase := range 2 {
+		if phase != 0 {
+			before := activeRevision()
+			writeMetricsConfig(-9)
+			daemon.reload(t)
+			waitForActiveRevisionChange(t, before, path)
+		}
+		probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
+		var packets, bytes uint64
+		walkJSON(objectJSON(t, table), func(object map[string]any) {
+			counter, ok := object["counter"].(map[string]any)
+			if !ok {
+				return
+			}
+			name, _ := counter["name"].(string)
+			if strings.HasSuffix(name, "_counter_v4_ingress_denied_global_blocklist_drop") {
+				packets = uint64(counter["packets"].(float64))
+				bytes = uint64(counter["bytes"].(float64))
+			}
+		})
+		if packets == 0 || bytes == 0 {
+			t.Fatal("native nftables denial did not account for the probe")
+		}
+		labels := map[string]string{"backend": "nftables", "family": "ipv4", "direction": "ingress", "reason": "global_blocklist", "action": "drop"}
+		body := waitForE2EMetrics(t, "http://127.0.0.1:19096/metrics", []e2eMetricExpectation{
+			{name: "perimeterd_firewall_denied_packets_total", labels: labels, value: packets},
+			{name: "perimeterd_firewall_denied_bytes_total", labels: labels, value: bytes},
+		})
+		assertE2EMetricLabelNames(t, body, "perimeterd_firewall_denied_packets_total", "backend", "family", "direction", "reason", "action")
+	}
+}
 
 func TestE2ERuntime(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {

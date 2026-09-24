@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -408,6 +410,30 @@ func TestE2EIPTables(t *testing.T) {
 	probeIngress(t, peer, "tcp4", fixtureLANHost+":18384", "success", "tcp")
 	probeEgress(t, peer, "tcp4", fixtureLANPeer+":18384", "success", "tcp")
 	processedBefore := iptablesProcessedPackets(t, "entry_v4_ingress/processed")
+	processedCounters := iptablesNativeRoleCounters(t, "v4", "ingress", `entry_v4_ingress/processed"`)
+	if len(processedCounters) != 1 {
+		t.Fatalf("expected one IPv4 ingress processed rule, got %+v", processedCounters)
+	}
+	dropCounters := iptablesNativeRoleCounters(t, "v4", "ingress", `/denied/global_blocklist/drop"`)
+	if len(dropCounters) == 0 {
+		t.Fatal("native global-blocklist denial counter is missing")
+	}
+	initialDropPackets, initialDropBytes := sumIPTablesNativeCounters(dropCounters)
+	if initialDropPackets == 0 || initialDropBytes == 0 {
+		t.Fatalf("blocked traffic did not reach native denial counters: packets=%d bytes=%d", initialDropPackets, initialDropBytes)
+	}
+	metricLabels := map[string]string{"backend": "iptables", "family": "ipv4", "direction": "ingress"}
+	dropMetricLabels := map[string]string{"backend": "iptables", "family": "ipv4", "direction": "ingress", "reason": "global_blocklist", "action": "drop"}
+	metricsBody := waitForE2EMetrics(t, "http://127.0.0.1:19095/metrics", []e2eMetricExpectation{
+		{name: "perimeterd_firewall_processed_packets_total", labels: metricLabels, value: processedCounters[0].packets},
+		{name: "perimeterd_firewall_processed_bytes_total", labels: metricLabels, value: processedCounters[0].bytes},
+		{name: "perimeterd_firewall_denied_packets_total", labels: dropMetricLabels, value: initialDropPackets},
+		{name: "perimeterd_firewall_denied_bytes_total", labels: dropMetricLabels, value: initialDropBytes},
+		{name: "perimeterd_firewall_counter_read_total", labels: map[string]string{"backend": "iptables", "result": "success"}, value: 1, minimum: true},
+	})
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_processed_packets_total", "backend", "direction", "family")
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_denied_packets_total", "action", "backend", "direction", "family", "reason")
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_counter_read_total", "backend", "result")
 
 	// Global allow entries are deliberately identical /0 entries in both
 	// families. They must precede the matching blocks without accepting other
@@ -457,6 +483,25 @@ func TestE2EIPTables(t *testing.T) {
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18380", "reject", "tcp")
 	probeEgress(t, peer, "udp4", fixtureIPv4Peer+":18383", "reject", "udp")
 	probeEgress(t, peer, "udp6", "["+fixtureIPv6Peer+"]:18383", "reject", "udp")
+	processedCounters = iptablesNativeRoleCounters(t, "v4", "ingress", `entry_v4_ingress/processed"`)
+	rejectCounters := iptablesNativeRoleCounters(t, "v4", "ingress", `/denied/global_blocklist/reject"`)
+	processedPackets, processedBytes := sumIPTablesNativeCounters(processedCounters)
+	rejectPackets, rejectBytes := sumIPTablesNativeCounters(rejectCounters)
+	if rejectPackets == 0 || rejectBytes == 0 {
+		t.Fatal("post-reload reject traffic did not reach the new native denial counters")
+	}
+	metricsBody = waitForE2EMetrics(t, "http://127.0.0.1:19095/metrics", []e2eMetricExpectation{
+		{name: "perimeterd_firewall_processed_packets_total", labels: metricLabels, value: processedPackets},
+		{name: "perimeterd_firewall_processed_bytes_total", labels: metricLabels, value: processedBytes},
+		{name: "perimeterd_firewall_denied_packets_total", labels: dropMetricLabels, value: initialDropPackets, minimum: true},
+		{name: "perimeterd_firewall_denied_bytes_total", labels: dropMetricLabels, value: initialDropBytes, minimum: true},
+		{name: "perimeterd_firewall_denied_packets_total", labels: map[string]string{"backend": "iptables", "family": "ipv4", "direction": "ingress", "reason": "global_blocklist", "action": "reject"}, value: rejectPackets},
+		{name: "perimeterd_firewall_denied_bytes_total", labels: map[string]string{"backend": "iptables", "family": "ipv4", "direction": "ingress", "reason": "global_blocklist", "action": "reject"}, value: rejectBytes},
+		{name: "perimeterd_firewall_counter_read_total", labels: map[string]string{"backend": "iptables", "result": "success"}, value: 1, minimum: true},
+	})
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_processed_packets_total", "backend", "direction", "family")
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_denied_packets_total", "action", "backend", "direction", "family", "reason")
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_counter_read_total", "backend", "result")
 
 	// Disabling one family retires only that family. An entirely disabled
 	// model is the canonical empty target and unhooks both families.
@@ -852,6 +897,235 @@ func TestE2EIPTablesRecovery(t *testing.T) {
 	}
 	command(t, 30*time.Second, e2eBinary(t), "cleanup")
 	waitNoIPTablesOwned(t, "v4", "v6")
+}
+
+type iptablesE2ECounter struct {
+	chain   string
+	packets uint64
+	bytes   uint64
+}
+
+func iptablesNativeRoleCounters(t *testing.T, family, direction, roleFragment string) []iptablesE2ECounter {
+	t.Helper()
+	data, err := iptablesSaveMayFail(family)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var values []iptablesE2ECounter
+	for _, line := range strings.Split(string(data), "\n") {
+		matchesPath := strings.Contains(line, "role=entry_"+family+"_"+direction+"/") ||
+			strings.Contains(line, "role=path_"+family+"_"+direction+"/")
+		if !strings.HasPrefix(line, "[") || !strings.Contains(line, "perimeterd owner=") || !matchesPath || !strings.Contains(line, roleFragment) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 || fields[1] != "-A" {
+			t.Fatalf("malformed native counter rule: %q", line)
+		}
+		var value iptablesE2ECounter
+		value.chain = fields[2]
+		if _, err := fmt.Sscanf(fields[0], "[%d:%d]", &value.packets, &value.bytes); err != nil {
+			t.Fatalf("parse native rule counters %q: %v", line, err)
+		}
+		values = append(values, value)
+	}
+	sort.Slice(values, func(left, right int) bool { return values[left].chain < values[right].chain })
+	return values
+}
+
+func sumIPTablesNativeCounters(values []iptablesE2ECounter) (packets, bytes uint64) {
+	for _, value := range values {
+		packets += value.packets
+		bytes += value.bytes
+	}
+	return packets, bytes
+}
+
+type e2eMetricExpectation struct {
+	name    string
+	labels  map[string]string
+	value   uint64
+	minimum bool
+}
+
+func waitForE2EMetrics(t *testing.T, endpoint string, expected []e2eMetricExpectation) string {
+	t.Helper()
+	client := &http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(45 * time.Second)
+	var latest, mismatch string
+	for time.Now().Before(deadline) {
+		response, err := client.Get(endpoint)
+		if err == nil {
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr == nil && response.StatusCode == http.StatusOK {
+				latest = string(body)
+				mismatch = ""
+				for _, item := range expected {
+					value, ok := e2eMetricValue(latest, item.name, item.labels)
+					if !ok || item.minimum && value < float64(item.value) || !item.minimum && value != float64(item.value) {
+						mismatch = fmt.Sprintf("%s labels=%v value=%v (present=%t), want %d minimum=%t", item.name, item.labels, value, ok, item.value, item.minimum)
+						break
+					}
+				}
+				if mismatch == "" {
+					return latest
+				}
+			} else {
+				mismatch = fmt.Sprintf("metrics endpoint status/read error: status=%d err=%v", response.StatusCode, readErr)
+			}
+		} else {
+			mismatch = err.Error()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("metrics at %s did not match native counters: %s\n%s", endpoint, mismatch, latest)
+	return ""
+}
+
+func e2eMetricValue(body, name string, expectedLabels map[string]string) (float64, bool) {
+	for _, line := range strings.Split(body, "\n") {
+		sampleName, labels, value, ok := parseE2EMetricLine(line)
+		if ok && sampleName == name && sameE2EMetricLabels(labels, expectedLabels) {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func parseE2EMetricLine(line string) (string, map[string]string, float64, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || strings.HasPrefix(line, "#") {
+		return "", nil, 0, false
+	}
+	name, labels := fields[0], make(map[string]string)
+	if open := strings.IndexByte(name, '{'); open >= 0 {
+		close := strings.LastIndexByte(name, '}')
+		if close < open {
+			return "", nil, 0, false
+		}
+		raw := name[open+1 : close]
+		name = name[:open]
+		if raw != "" {
+			for _, pair := range strings.Split(raw, ",") {
+				key, encoded, ok := strings.Cut(pair, "=")
+				if !ok {
+					return "", nil, 0, false
+				}
+				value, err := strconv.Unquote(encoded)
+				if err != nil {
+					return "", nil, 0, false
+				}
+				labels[key] = value
+			}
+		}
+	}
+	value, err := strconv.ParseFloat(fields[1], 64)
+	if err != nil {
+		return "", nil, 0, false
+	}
+	return name, labels, value, true
+}
+
+func sameE2EMetricLabels(actual, expected map[string]string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for key, value := range expected {
+		if actual[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func assertE2EMetricLabelNames(t *testing.T, body, name string, expected ...string) {
+	t.Helper()
+	sort.Strings(expected)
+	found := false
+	for _, line := range strings.Split(body, "\n") {
+		sampleName, labels, _, ok := parseE2EMetricLine(line)
+		if !ok || sampleName != name {
+			continue
+		}
+		found = true
+		actual := make([]string, 0, len(labels))
+		for key := range labels {
+			actual = append(actual, key)
+		}
+		sort.Strings(actual)
+		if strings.Join(actual, ",") != strings.Join(expected, ",") {
+			t.Fatalf("%s exposes unbounded or unexpected labels: got %v, want %v", name, actual, expected)
+		}
+	}
+	if !found {
+		t.Fatalf("metrics exposition has no %s samples", name)
+	}
+}
+
+func iptablesManagedEntry(t *testing.T, parent string) string {
+	t.Helper()
+	chain := parent
+	// An attachment may jump straight to its entry or through an interface
+	// filter. The filter itself has no processed counter.
+	for range 3 {
+		output := command(t, 10*time.Second, "iptables", "-S", chain)
+		next := ""
+		for _, line := range strings.Split(string(output), "\n") {
+			if !strings.HasPrefix(line, "-A "+chain+" ") || !strings.Contains(line, "perimeterd owner=") {
+				continue
+			}
+			if strings.Contains(line, `role=entry_v4_ingress/processed"`) {
+				return chain
+			}
+			fields := strings.Fields(line)
+			for index := 0; index+1 < len(fields); index++ {
+				if fields[index] == "-j" || fields[index] == "-g" {
+					next = fields[index+1]
+					break
+				}
+			}
+			if next != "" {
+				break
+			}
+		}
+		if next == "" {
+			t.Fatalf("missing managed entry for %s in chain %s:\n%s", parent, chain, output)
+		}
+		chain = next
+	}
+	t.Fatalf("managed entry for %s exceeds the attachment/filter/entry path", parent)
+	return ""
+}
+
+func assertIPTablesDoubleTraversal(t *testing.T, before, after []iptablesE2ECounter, forwardEntry, dockerEntry string) {
+	t.Helper()
+	if forwardEntry == dockerEntry || len(before) != 2 || len(after) != 2 {
+		t.Fatalf("expected distinct FORWARD and DOCKER-USER counters: entries=(%q,%q) before=%+v after=%+v", forwardEntry, dockerEntry, before, after)
+	}
+	beforeByChain, afterByChain := make(map[string]iptablesE2ECounter, 2), make(map[string]iptablesE2ECounter, 2)
+	for _, value := range before {
+		beforeByChain[value.chain] = value
+	}
+	for _, value := range after {
+		afterByChain[value.chain] = value
+	}
+	var packets, bytes uint64
+	for _, chain := range []string{forwardEntry, dockerEntry} {
+		old, oldExists := beforeByChain[chain]
+		current, currentExists := afterByChain[chain]
+		if !oldExists || !currentExists || current.packets <= old.packets || current.bytes <= old.bytes {
+			t.Fatalf("allowed packet did not traverse managed chain %s: before=%+v after=%+v", chain, old, current)
+		}
+		packetDelta, byteDelta := current.packets-old.packets, current.bytes-old.bytes
+		if packets != 0 && packetDelta != packets || bytes != 0 && byteDelta != bytes {
+			t.Fatalf("FORWARD and DOCKER-USER observed different packet/byte deltas: packets=%d bytes=%d now=(%d,%d)", packets, bytes, packetDelta, byteDelta)
+		}
+		packets, bytes = packetDelta, byteDelta
+	}
+	if packets == 0 || bytes == 0 {
+		t.Fatalf("double traversal did not record packet/byte counts: packets=%d bytes=%d", packets, bytes)
+	}
 }
 
 func iptablesProcessedPackets(t *testing.T, role string) uint64 {

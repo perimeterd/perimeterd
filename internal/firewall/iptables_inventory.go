@@ -33,10 +33,11 @@ func (k iptChainKey) withChain(name string) iptChainKey {
 
 type iptObservedRule struct {
 	iptChainKey
-	Args       []string
-	Packets    uint64
-	Bytes      uint64
-	References []iptRuleReference
+	Args        []string
+	Packets     uint64
+	Bytes       uint64
+	HasCounters bool
+	References  []iptRuleReference
 }
 
 type iptReferenceKind uint8

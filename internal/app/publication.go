@@ -7,24 +7,31 @@ import (
 	"sync/atomic"
 	"time"
 
+	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/state"
 	"github.com/perimeterd/perimeterd/internal/upstream"
 )
 
-const metricsCloseTimeout = 5 * time.Second
+const (
+	metricsCloseTimeout         = 5 * time.Second
+	nativeCounterSampleInterval = 15 * time.Second
+)
 
 // runtimePublication owns the listener and logger that describe the active
 // runtime. A reservation is kept here from binding through durable recovery so
 // an uncertain apply cannot leak or accidentally publish its resources.
 type runtimePublication struct {
-	engine      *Engine
-	source      *sourceRuntime
-	logger      *slog.Logger
-	health      atomic.Bool
-	active      *metricsServer
-	reservation *runtimeReservation
-	closed      bool
+	engine        *Engine
+	source        *sourceRuntime
+	logger        *slog.Logger
+	collector     *metricspkg.Collector
+	health        atomic.Bool
+	active        *metricsServer
+	reservation   *runtimeReservation
+	counterCancel context.CancelFunc
+	counterDone   chan struct{}
+	closed        bool
 }
 
 type runtimeReservation struct {
@@ -35,10 +42,14 @@ type runtimeReservation struct {
 	refreshErr  error
 	attempted   []policy.Selector
 	session     *upstream.Session
+	prefixes    []metricspkg.PrefixCount
 }
 
-func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger) *runtimePublication {
+func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger, collectors ...*metricspkg.Collector) *runtimePublication {
 	publication := &runtimePublication{engine: engine, source: source, logger: logger}
+	if len(collectors) != 0 {
+		publication.collector = collectors[0]
+	}
 	publication.health.Store(true)
 	return publication
 }
@@ -47,15 +58,19 @@ func (p *runtimePublication) metricsHealthy() bool {
 	return p.engine.Healthy() && p.health.Load()
 }
 
-func (p *runtimePublication) reserve(result stageResult) error {
+func (p *runtimePublication) reserve(result stageResult, contexts ...context.Context) error {
 	if p.reservation != nil {
 		return errors.New("runtime publication already has a reservation")
+	}
+	ctx := context.Background()
+	if len(contexts) != 0 && contexts[0] != nil {
+		ctx = contexts[0]
 	}
 	replace := p.active == nil || p.active.listen != result.candidate.cfg.Metrics.Listen
 	var staged *metricsServer
 	if replace {
 		var err error
-		staged, err = bindMetrics(result.candidate.cfg.Metrics.Listen, p.metricsHealthy, p.source.snapshotTimestamps)
+		staged, err = bindMetricsWithCollector(result.candidate.cfg.Metrics.Listen, p.metricsHealthy, p.source.snapshotTimestamps, p.collector)
 		if err != nil {
 			return err
 		}
@@ -79,6 +94,10 @@ func (p *runtimePublication) reserve(result stageResult) error {
 		refreshErr: result.refreshErr,
 		attempted:  result.attempted,
 		session:    session,
+		prefixes:   prefixCounts(result.candidate.Candidate),
+	}
+	if p.active == nil && staged != nil {
+		p.engine.enableCounterTelemetry(ctx)
 	}
 	return nil
 }
@@ -112,6 +131,10 @@ func (p *runtimePublication) recover(revision *state.Revision) error {
 	p.reservation = nil
 	if reservation.transaction == "" || revision == nil || revision.ID != reservation.transaction {
 		_ = closeReservation(reservation)
+		if p.active == nil {
+			p.stopCounterSampler()
+			p.engine.disableCounterTelemetry()
+		}
 		return p.source.selectRevision(revision, nil)
 	}
 	return p.publishReservation(revision, reservation)
@@ -119,10 +142,18 @@ func (p *runtimePublication) recover(revision *state.Revision) error {
 
 func (p *runtimePublication) publishReservation(revision *state.Revision, reservation *runtimeReservation) error {
 	if err := p.source.selectRevision(revision, reservation.session); err != nil {
-		return errors.Join(err, closeReservation(reservation))
+		closeErr := closeReservation(reservation)
+		if p.active == nil {
+			p.stopCounterSampler()
+			p.engine.disableCounterTelemetry()
+		}
+		return errors.Join(err, closeErr)
 	}
 	reservation.session = nil
 	p.logger = reservation.logger
+	if p.collector != nil {
+		p.collector.SetPrefixes(reservation.prefixes)
+	}
 	if reservation.refreshErr != nil {
 		p.source.attempted(reservation.attempted, time.Now())
 		p.source.schedule()
@@ -147,6 +178,12 @@ func (p *runtimePublication) publishReservation(revision *state.Revision, reserv
 			p.logger.Warn("retiring metrics listener failed", "error", err)
 		}
 	}
+	if p.active == nil {
+		p.stopCounterSampler()
+		p.engine.disableCounterTelemetry()
+	} else {
+		p.startCounterSampler()
+	}
 	if !retireFailed {
 		p.health.Store(true)
 	}
@@ -156,7 +193,49 @@ func (p *runtimePublication) publishReservation(revision *state.Revision, reserv
 func (p *runtimePublication) discard() error {
 	reservation := p.reservation
 	p.reservation = nil
-	return closeReservation(reservation)
+	err := closeReservation(reservation)
+	if p.active == nil {
+		p.stopCounterSampler()
+		p.engine.disableCounterTelemetry()
+	}
+	return err
+}
+
+func (p *runtimePublication) startCounterSampler() {
+	if p.collector == nil || p.active == nil || !p.engine.supportsNativeCounterTelemetry() || p.counterCancel != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	p.counterCancel, p.counterDone = cancel, done
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(nativeCounterSampleInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			p.engine.sampleNativeCounters(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (p *runtimePublication) stopCounterSampler() {
+	if p.counterCancel == nil {
+		return
+	}
+	p.counterCancel()
+	<-p.counterDone
+	p.counterCancel = nil
+	p.counterDone = nil
 }
 
 func (p *runtimePublication) metricsErrors() <-chan error {
@@ -171,6 +250,8 @@ func (p *runtimePublication) close() error {
 		return nil
 	}
 	p.closed = true
+	p.stopCounterSampler()
+	p.engine.disableCounterTelemetry()
 	reservation := p.reservation
 	p.reservation = nil
 	reservationErr := closeReservation(reservation)

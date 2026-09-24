@@ -73,7 +73,7 @@ global:
 	if len(cfg.Global.Blocklist) != 1 || cfg.Global.Blocklist[0] != netip.MustParsePrefix("203.0.113.0/24") {
 		t.Fatalf("blocklist was not masked/deduplicated: %v", cfg.Global.Blocklist)
 	}
-	for _, local := range builtinLocalRanges() {
+	for _, local := range BuiltinLocalRanges() {
 		found := false
 		for _, prefix := range cfg.Global.Allowlist {
 			if prefix == local {

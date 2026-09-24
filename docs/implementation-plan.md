@@ -8,12 +8,12 @@ The first release includes both native backends, CrowdSec, Docker coexistence,
 custom HTTP(S) text IP lists, dynamic named-provider feeds, IP/CIDR lookup with
 source explanations, optional embedded OpenZiti transport for LAPI/custom lists,
 operational integration, and release gates.
-Implemented does not mean production-ready; the remaining gates below still apply.
+Implemented does not mean production-ready; every release must pass the gates below.
 
 Use [Status at a glance](#status-at-a-glance) for delivered capabilities and
-[Operational and release gates](#10-operational-and-release-gates) for remaining
-work. Completed milestones below are delivery summaries, not separate schema,
-algorithm, or test specifications.
+[Operational and release gates](#10-operational-and-release-gates) for release
+qualification. Completed milestones below are delivery summaries, not separate
+schema, algorithm, or test specifications.
 
 ## Status at a glance
 
@@ -29,7 +29,7 @@ algorithm, or test specifications.
 | Named provider feeds | Implemented for both backends | Maintain dynamic include/exclude IDs, jsDelivr `@main` resolution without a catalog, exact cache identity, and complete-snapshot publication |
 | IP/CIDR lookup and explanation | Implemented for both backends | Maintain coherent applied-state publication, complete CIDR/traffic partitions, source attribution, and private bounded transport |
 | Optional OpenZiti upstream transport | Implemented for LAPI and custom lists | Maintain explicit opt-in, immutable identity/service bindings, bounded application lifecycle, and transport-aware recovery without direct fallback; retain the documented unmodified-SDK limitation |
-| Operations and delivery | Source-build CLI, logging, readiness, three HTTP gauges, and native accounting implemented | Full metrics exporter, installed service, packaging, architecture coverage, signed releases |
+| Operations and delivery | Full Prometheus export, installed service/tmpfiles, amd64/arm64 DEB/RPM packages, and signed release automation implemented | Keep native, package, fast systemd-VM, architecture, and provenance gates mandatory for stable releases and main prereleases |
 
 ## 1. Foundation and offline configuration validation
 
@@ -203,25 +203,29 @@ owns acceptance and fixture requirements.
 
 ## 10. Operational and release gates
 
-**Status:** partially implemented.
+**Status:** implemented.
 
-Source builds provide stdout logging, three Prometheus gauges, native packet/byte
-accounting, and bounded systemd readiness notifications. Remaining work:
-
-- Full metrics collection and export.
-- Installed systemd/tmpfiles payloads and verified service lifecycle.
-- RPM/DEB package lifecycle and remaining architecture coverage.
-- Signed release artifacts and release CI.
+- Full bounded-label Prometheus instrumentation and 15-second native counter
+  collection, including monotonic retirement/recovery handling.
+- Installed systemd/tmpfiles payloads and executable VM checks for readiness,
+  sandboxing, restart, degraded recovery, lock preservation, and safe package
+  removal. The real 75-minute startup deadline check remains opt-in.
+- Static amd64/arm64 RPM/DEB artifacts, real installation/upgrade/removal checks
+  in matching-architecture Debian/Fedora containers, SBOMs, and checksums.
+- Signed bare-SemVer stable-tag admission (`0.0.1`, `0.0.2`, …), automatic main
+  prereleases, and GitHub-signed provenance for the same artifacts that passed
+  the required release gates.
 
 The [development](development.md#version-1-verification-and-delivery-requirements)
-and [operations](operations.md) contracts define acceptance. Add packaging and
-release scaffolding only with working artifacts and executable checks.
+and [operations](operations.md) contracts own acceptance. Stable publication
+requires configured trusted public keys; actual publication and attestation
+run in GitHub Actions, not during local package builds.
 
 ## Immediate next task
 
-Complete [step 10](#10-operational-and-release-gates): metrics, service/package
-lifecycle, remaining architecture coverage, and signed release gates. Maintain
-the [verification matrix](development.md#verification-matrix) for delivered
-features while adding these operational artifacts.
+Maintain the [verification matrix](development.md#verification-matrix) and keep
+the fast VM and other operational gates mandatory on both publication channels;
+run the real 75-minute deadline scenario explicitly when needed. Configure
+trusted release-signing public keys before the first stable tag.
 Track new work as issues using acceptance criteria from the owning documents
 rather than maintaining another implementation or test plan.

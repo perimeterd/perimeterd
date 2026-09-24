@@ -26,16 +26,17 @@ type iptablesExecutor func(context.Context, string, []string, []byte) ([]byte, e
 // IPTables stages immutable generations before selecting them independently in
 // IPv4 and IPv6. The durable journal, not observed rules, authorizes recovery.
 type IPTables struct {
-	exec     iptablesExecutor
-	progress FamilyProgress
-	mu       sync.Mutex
-	variant  string
+	exec       iptablesExecutor
+	progress   FamilyProgress
+	mu         sync.Mutex
+	variant    string
+	retirement *counterRetirementReporter
 }
 
 // NewIPTables uses a matched native tool family from PATH and reports selections
 // after successful family switches, including compensation and unhooking.
 func NewIPTables(progress FamilyProgress) *IPTables {
-	return &IPTables{exec: nativeIPTablesExecutor, progress: progress}
+	return &IPTables{exec: nativeIPTablesExecutor, progress: progress, retirement: &counterRetirementReporter{}}
 }
 
 func nativeIPTablesExecutor(ctx context.Context, command string, args []string, input []byte) ([]byte, error) {
@@ -543,7 +544,7 @@ func (i *IPTables) Apply(ctx context.Context, previous, candidate *Target, dynam
 	return nil
 }
 
-func (i *IPTables) remove(ctx context.Context, remove, keep []*Target) error {
+func (i *IPTables) remove(ctx context.Context, remove, keep []*Target, retiring *Target) error {
 	all := append(append([]*Target(nil), remove...), keep...)
 	expected, err := expectedIPTWithProjection(nil, all...)
 	if err != nil {
@@ -560,6 +561,10 @@ func (i *IPTables) remove(ctx context.Context, remove, keep []*Target) error {
 	retained, err := expectedIPTWithProjection(nil, keep...)
 	if err != nil {
 		return err
+	}
+	if retiring != nil && i.retirement != nil && i.retirement.enabled() {
+		values, snapshotErr := iptCounterSnapshots(retiring, expected.models[retiring], inventory)
+		i.retirement.report(retiring, values, snapshotErr)
 	}
 	for key := range retained.chains {
 		delete(obsolete.chains, key)
@@ -699,7 +704,7 @@ func (i *IPTables) Retire(ctx context.Context, previous, candidate *Target) erro
 	if previous == nil {
 		return ctx.Err()
 	}
-	return i.remove(ctx, []*Target{previous}, []*Target{candidate})
+	return i.remove(ctx, []*Target{previous}, []*Target{candidate}, previous)
 }
 
 // Cleanup removes only objects authorized by the complete recorded target union.
@@ -707,7 +712,7 @@ func (i *IPTables) Cleanup(ctx context.Context, targets []*Target) error {
 	if len(targets) == 0 {
 		return ctx.Err()
 	}
-	return i.remove(ctx, targets, nil)
+	return i.remove(ctx, targets, nil, nil)
 }
 
 var _ Backend = (*IPTables)(nil)

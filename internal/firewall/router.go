@@ -11,13 +11,19 @@ import (
 // Native routes persisted targets without auto-detection or fallback. A backend
 // migration installs the replacement first; retirement happens after commit.
 type Native struct {
-	nft      Backend
-	iptables Backend
+	nft        Backend
+	iptables   Backend
+	retirement *counterRetirementReporter
 }
 
 // NewNative constructs a dispatcher without probing unused backend tools.
 func NewNative(progress FamilyProgress) *Native {
-	return &Native{nft: NewNFT(), iptables: NewIPTables(progress)}
+	reporter := &counterRetirementReporter{}
+	nft := NewNFT()
+	nft.setCounterRetirementReporter(reporter)
+	iptables := NewIPTables(progress)
+	iptables.setCounterRetirementReporter(reporter)
+	return &Native{nft: nft, iptables: iptables, retirement: reporter}
 }
 
 func (n *Native) implementation(kind string) Backend {
@@ -140,4 +146,42 @@ func (n *Native) UpdateDynamic(ctx context.Context, target *Target, prefixes []p
 		return err
 	}
 	return n.implementation(target.Backend()).UpdateDynamic(ctx, target, prefixes)
+}
+
+// SetCounterRetirementHook registers the metrics consumer for final snapshots
+// collected before native generation objects are removed.
+func (n *Native) SetCounterRetirementHook(hook CounterRetirementHook) {
+	if n == nil {
+		return
+	}
+	if n.retirement == nil {
+		n.retirement = &counterRetirementReporter{}
+	}
+	n.retirement.set(hook)
+	for _, backend := range []Backend{n.nft, n.iptables} {
+		if setter, ok := backend.(interface {
+			setCounterRetirementReporter(*counterRetirementReporter)
+		}); ok {
+			setter.setCounterRetirementReporter(n.retirement)
+		}
+	}
+}
+
+// SnapshotCounters reads current cumulative counters from the selected native
+// target. Callers serialize this operation with backend mutations.
+func (n *Native) SnapshotCounters(ctx context.Context, target *Target) (map[string]CounterSnapshot, error) {
+	if n == nil || target == nil {
+		return nil, errors.New("firewall counter snapshot requires a native target")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := ValidateTarget(target); err != nil {
+		return nil, err
+	}
+	snapshotter, ok := n.implementation(target.Backend()).(CounterSnapshotter)
+	if !ok {
+		return nil, fmt.Errorf("firewall backend %q does not expose native counters", target.Backend())
+	}
+	return snapshotter.SnapshotCounters(ctx, target)
 }

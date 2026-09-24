@@ -475,6 +475,11 @@ func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []
 }
 
 func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector policy.Selector) (Record, error) {
+	requestSource := selectorMetricSource(selector.Kind)
+	success := false
+	if r.observeRequest != nil {
+		defer func() { r.observeRequest(requestSource, success) }()
+	}
 	spec, err := DescribeSelector(cfg, selector)
 	if err != nil {
 		return Record{}, err
@@ -613,7 +618,21 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		return Record{}, err
 	}
 	record.Transport = binding
+	success = true
 	return record, nil
+}
+
+func selectorMetricSource(kind policy.SelectorKind) string {
+	switch kind {
+	case policy.Country, policy.ASN:
+		return ripeSourceKind
+	case policy.IPList:
+		return listSourceKind
+	case policy.Provider:
+		return providerSourceKind
+	default:
+		return "unknown"
+	}
 }
 
 func parseList(body []byte, endpoint string, selector policy.Selector) (Record, error) {

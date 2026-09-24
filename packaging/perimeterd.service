@@ -1,0 +1,40 @@
+[Unit]
+Description=Block unwanted traffic at your Linux perimeter
+Wants=network-online.target
+Requires=systemd-tmpfiles-setup.service
+After=network-online.target crowdsec.service systemd-tmpfiles-setup.service
+
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=90s
+ExecStart=/usr/bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+StateDirectory=perimeterd
+RuntimeDirectory=perimeterd
+RuntimeDirectoryPreserve=yes
+StateDirectoryMode=0700
+RuntimeDirectoryMode=0700
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+UMask=0077
+ReadWritePaths=/run/xtables.lock
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

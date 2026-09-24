@@ -92,6 +92,25 @@ func (s *Store) Decisions() []Decision {
 	return out
 }
 
+// CountFamilies reports retained decisions whose absolute deadlines are still
+// in the future, without allocating a snapshot slice.
+func (s *Store) CountFamilies(now time.Time) (ipv4, ipv6 int) {
+	if s == nil {
+		return 0, 0
+	}
+	for _, retained := range s.decisions {
+		if !retained.decision.Deadline.After(now) {
+			continue
+		}
+		if retained.decision.Prefix.Addr().Is4() {
+			ipv4++
+		} else {
+			ipv6++
+		}
+	}
+	return ipv4, ipv6
+}
+
 func cmpInt64(a, b int64) int {
 	if a < b {
 		return -1

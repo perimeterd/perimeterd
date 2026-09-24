@@ -59,25 +59,27 @@ type crowdState struct {
 }
 
 type crowdRuntime struct {
-	engine      *Engine
-	transport   http.RoundTripper
-	ctx         context.Context
-	cancel      context.CancelFunc
-	workers     sync.WaitGroup
-	retiring    sync.WaitGroup
-	nextEpoch   uint64
-	operation   uint64
-	watermark   uint64
-	connected   atomic.Bool
-	enforced    atomic.Bool
-	active      *crowdState
-	staged      *crowdState
-	transaction string
-	grantAt     time.Time
-	grantDone   time.Time
-	dirty       bool
-	retryAt     time.Time
-	retryDelay  time.Duration
+	engine        *Engine
+	transport     http.RoundTripper
+	ctx           context.Context
+	cancel        context.CancelFunc
+	workers       sync.WaitGroup
+	retiring      sync.WaitGroup
+	nextEpoch     uint64
+	operation     uint64
+	watermark     uint64
+	connected     atomic.Bool
+	enforced      atomic.Bool
+	decisionsIPv4 atomic.Int64
+	decisionsIPv6 atomic.Int64
+	active        *crowdState
+	staged        *crowdState
+	transaction   string
+	grantAt       time.Time
+	grantDone     time.Time
+	dirty         bool
+	retryAt       time.Time
+	retryDelay    time.Duration
 }
 
 func newCrowdRuntime(engine *Engine) *crowdRuntime {
@@ -167,6 +169,11 @@ func (c *crowdRuntime) stageForApply(ctx context.Context, candidate Candidate, s
 		}
 		return nil, err
 	}
+	if e.telemetry != nil {
+		client.SetRequestObserver(func(success bool) {
+			e.telemetry.SourceRequest("crowdsec", success)
+		})
+	}
 	pollCtx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(c.ctx, cancel)
 	defer func() { stop(); cancel() }()
@@ -237,6 +244,7 @@ func (c *crowdRuntime) activateLocked(s *crowdState) {
 	old := c.active
 	c.stopStateLocked(old, old != nil && (s == nil || old.client != s.client))
 	c.active = s
+	c.publishDecisionCountsLocked(time.Now())
 	c.connected.Store(s != nil)
 	c.dirty = false
 	c.retryAt = time.Time{}
@@ -245,6 +253,18 @@ func (c *crowdRuntime) activateLocked(s *crowdState) {
 	if s != nil {
 		c.startPollLocked(s, false)
 		c.startExpiryLocked(s)
+	}
+}
+
+func (c *crowdRuntime) publishDecisionCountsLocked(now time.Time) {
+	var ipv4, ipv6 int
+	if c.active != nil && c.active.store != nil {
+		ipv4, ipv6 = c.active.store.CountFamilies(now)
+	}
+	c.decisionsIPv4.Store(int64(ipv4))
+	c.decisionsIPv6.Store(int64(ipv6))
+	if c.engine.telemetry != nil {
+		c.engine.telemetry.SetCrowdSecDecisions(ipv4, ipv6)
 	}
 }
 
@@ -398,7 +418,18 @@ func (c *crowdRuntime) failedWriteLocked(now time.Time) {
 // construct a new operation from the latest store, never replay an old payload.
 // Target selection and transaction checks share one freshly validated durable
 // view; no view is carried across dispatches or failure retries.
-func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState, activation bool) error {
+func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState, activation bool) (resultErr error) {
+	started := time.Now()
+	defer func() {
+		if c.engine.telemetry == nil {
+			return
+		}
+		result := "error"
+		if resultErr == nil {
+			result = "success"
+		}
+		c.engine.telemetry.Reconcile("crowdsec", result, time.Since(started))
+	}()
 	if c.engine.closing.Load() {
 		return errEngineClosed
 	}
@@ -424,6 +455,9 @@ func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState, activ
 	target := view.Active.Target
 	now := time.Now()
 	s.store.Expire(now)
+	if c.active == s {
+		c.publishDecisionCountsLocked(now)
+	}
 	epoch, revision := s.epoch, s.store.Revision()
 	projection := s.store.Projection(now)
 	op, err := c.nextOperationLocked()
@@ -436,9 +470,13 @@ func (c *crowdRuntime) reconcileLocked(ctx context.Context, s *crowdState, activ
 	}
 	writeStart := time.Now()
 	c.engine.invalidateLookupLocked()
-	if err := c.engine.backend.UpdateDynamic(ctx, target, projection); err != nil {
+	applyErr := c.engine.backend.UpdateDynamic(ctx, target, projection)
+	if c.engine.telemetry != nil {
+		c.engine.telemetry.BackendApply(target.Backend(), applyErr == nil)
+	}
+	if applyErr != nil {
 		c.failedWriteLocked(time.Now())
-		return err
+		return applyErr
 	}
 	writeFinish := time.Now()
 	c.watermark = op
@@ -524,6 +562,7 @@ func (c *crowdRuntime) pollLoop(ctx context.Context, s *crowdState, full bool) {
 				before := s.store.Revision()
 				err = s.store.Apply(batch, s.sequence, time.Now())
 				if err == nil {
+					c.publishDecisionCountsLocked(time.Now())
 					c.connected.Store(true)
 					if before != s.store.Revision() {
 						c.signalLocked(s)
@@ -607,6 +646,9 @@ func (c *crowdRuntime) maintainLocked(ctx context.Context, s *crowdState, now ti
 		return
 	}
 	expired := s.store.Expire(now)
+	if expired {
+		c.publishDecisionCountsLocked(now)
+	}
 	if c.dirty {
 		if now.Before(c.retryAt) {
 			return

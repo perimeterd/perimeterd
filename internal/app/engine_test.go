@@ -3,12 +3,15 @@ package app
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
@@ -609,5 +612,66 @@ func TestEngineRefreshAdmissionSurvivesFailedReloadAndFencesOldWork(t *testing.T
 	view, err = store.Read()
 	if err != nil || view.Active == nil || view.Active.ID != reloaded.Transaction {
 		t.Fatalf("old refresh replaced reloaded policy: %+v, %v", view.Active, err)
+	}
+}
+
+type counterTelemetryBackend struct {
+	*recordingBackend
+	packets uint64
+	readErr error
+	hook    firewall.CounterRetirementHook
+}
+
+func (b *counterTelemetryBackend) SnapshotCounters(_ context.Context, target *firewall.Target) (map[string]firewall.CounterSnapshot, error) {
+	if b.readErr != nil {
+		return nil, b.readErr
+	}
+	return map[string]firewall.CounterSnapshot{"processed": {
+		Backend: target.Backend(), Generation: target.Generation, Rule: "processed",
+		Family: policy.IPv4, Direction: policy.Ingress, ProcessedPackets: b.packets,
+	}}, nil
+}
+
+func (b *counterTelemetryBackend) SetCounterRetirementHook(hook firewall.CounterRetirementHook) {
+	b.hook = hook
+}
+
+func TestEngineReactivationAfterFailedPrimingRead(t *testing.T) {
+	backend := &counterTelemetryBackend{recordingBackend: &recordingBackend{}}
+	engine, _ := newTestEngine(t, backend, nil)
+	defer engine.Close()
+	collector := metricspkg.New("test", "commit", "time")
+	engine.setTelemetry(collector)
+	outcome, err := engine.Apply(context.Background(), admitCandidate(t, engine, parseEngineConfig(t, "9.9.9.0/24")))
+	if err != nil || !outcome.Committed {
+		t.Fatalf("apply: %+v, %v", outcome, err)
+	}
+	ctx := context.Background()
+	backend.readErr = errors.New("native read unavailable")
+	engine.enableCounterTelemetry(ctx)
+	backend.readErr = nil
+	backend.packets = 10
+	engine.sampleNativeCounters(ctx)
+	backend.packets = 15
+	engine.sampleNativeCounters(ctx)
+	engine.disableCounterTelemetry()
+	backend.packets = 10000
+	backend.readErr = errors.New("native read unavailable")
+	engine.enableCounterTelemetry(ctx)
+	backend.hook([]firewall.CounterSnapshot{{
+		Backend: outcome.Active.Target.Backend(), Rule: "retired",
+		Family: policy.IPv4, Direction: policy.Ingress, ProcessedPackets: 20000,
+	}}, nil)
+	backend.readErr = nil
+	backend.packets = 10010
+	engine.sampleNativeCounters(ctx)
+	backend.packets = 10013
+	engine.sampleNativeCounters(ctx)
+
+	response := httptest.NewRecorder()
+	collector.Handler(nil, nil, nil).ServeHTTP(response, httptest.NewRequest("GET", "/metrics", nil))
+	if response.Code != 200 || !strings.Contains(response.Body.String(),
+		"perimeterd_firewall_processed_packets_total{backend=\"nftables\",direction=\"ingress\",family=\"ipv4\"} 8") {
+		t.Fatalf("reactivated counter includes disabled-window traffic: status=%d metrics=%s", response.Code, response.Body.String())
 	}
 }

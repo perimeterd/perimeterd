@@ -45,9 +45,10 @@ type Client struct {
 	endpoint  string
 	transport http.RoundTripper
 
-	mu     sync.Mutex
-	closed bool
-	close  chan struct{}
+	mu             sync.Mutex
+	closed         bool
+	close          chan struct{}
+	observeRequest func(success bool)
 }
 
 // NewClient constructs an authenticated client for cfg. The API key is read
@@ -121,6 +122,18 @@ func (c *Client) Endpoint() string {
 	return c.endpoint
 }
 
+// SetRequestObserver installs an optional callback for completed LAPI polls.
+// The observer receives only whether the stream was accepted, never response
+// contents or error text.
+func (c *Client) SetRequestObserver(observer func(success bool)) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.observeRequest = observer
+	c.mu.Unlock()
+}
+
 // Close cancels an in-flight request and releases idle transport connections.
 // It is safe to call repeatedly.
 func (c *Client) Close() {
@@ -149,9 +162,15 @@ func (c *Client) Poll(ctx context.Context, startup bool) (Batch, error) {
 	}
 	c.mu.Lock()
 	closed := c.closed
+	observer := c.observeRequest
 	c.mu.Unlock()
 	if closed {
 		return Batch{}, errClientClosed
+	}
+
+	success := false
+	if observer != nil {
+		defer func() { observer(success) }()
 	}
 
 	started := time.Now()
@@ -178,6 +197,7 @@ func (c *Client) Poll(ctx context.Context, startup bool) (Batch, error) {
 	if err != nil {
 		return Batch{}, err
 	}
+	success = true
 	return batch, nil
 }
 

@@ -113,6 +113,42 @@ func TestActualCountryAndASNResponses(t *testing.T) {
 	}
 }
 
+func TestRequestObserverUsesBoundedSourceAndOutcome(t *testing.T) {
+	type observation struct {
+		source  string
+		success bool
+	}
+
+	var successful []observation
+	body := fixture(t, "country_li.json")
+	_, resolver := resolverFor(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	})
+	resolver = resolver.WithRequestObserver(func(source string, success bool) {
+		successful = append(successful, observation{source: source, success: success})
+	})
+	if _, err := resolver.Resolve(context.Background(), sourceConfig([]string{"LI"}, nil), "", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(successful) != 1 || successful[0] != (observation{source: "ripestat", success: true}) {
+		t.Fatalf("successful request observations = %#v", successful)
+	}
+
+	var failed []observation
+	_, resolver = resolverFor(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusBadGateway)
+	})
+	resolver = resolver.WithRequestObserver(func(source string, success bool) {
+		failed = append(failed, observation{source: source, success: success})
+	})
+	if _, err := resolver.Resolve(context.Background(), sourceConfig([]string{"LI"}, nil), "", false); err == nil {
+		t.Fatal("failed source request was accepted")
+	}
+	if len(failed) != 1 || failed[0] != (observation{source: "ripestat", success: false}) {
+		t.Fatalf("failed request observations = %#v", failed)
+	}
+}
+
 func mutateFixture(t *testing.T, body []byte, mutate func(map[string]any)) []byte {
 	t.Helper()
 	var value map[string]any

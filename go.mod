@@ -8,6 +8,7 @@ require (
 	github.com/go-openapi/runtime v0.33.2
 	github.com/openziti/identity v1.0.143
 	github.com/openziti/sdk-golang v1.8.2
+	github.com/prometheus/client_golang v1.24.1
 	github.com/sirupsen/logrus v1.10.2
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/sys v0.48.0
@@ -212,7 +213,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_golang v1.24.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect

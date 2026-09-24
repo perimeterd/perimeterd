@@ -98,12 +98,14 @@ The most useful file boundaries when changing an existing path are:
   acceptance scenarios and fixture machinery (`openziti_test.go`,
   `openziti_harness_test.go`), and failure injection (`crash_test.go`).
 
-### Planned additions
+### Operational delivery
 
-Installed systemd/tmpfiles payloads, package lifecycle scripts, and
-GoReleaser/release workflows belong to later milestones. Their eventual package
-layout should follow the real integration boundaries; these directories and files are not
-present scaffolding.
+- `internal/metrics/`: bounded-label Prometheus instrumentation and native
+  counter accumulation.
+- `packaging/`: installed systemd/tmpfiles payloads and package lifecycle scripts.
+- `tests/packaging/` and `tests/systemd/`: real package and installed-service gates.
+- `.goreleaser.yaml`, `scripts/release-*.py`, and reusable GitHub workflows:
+  tested artifact construction, version admission, checksums, and publication.
 
 No `pkg/` tree exists until a real supported public Go API exists. Future
 container/Helm delivery adds `build/package/` and `charts/perimeterd/` only
@@ -349,11 +351,32 @@ The executable target inventory is:
 | `bench-scale-large` | Run large-100k/large-250k control-plane/serialization benchmarks with `-benchmem` |
 | `bench-native-scale-small` | Run the isolated small native scale profile |
 | `bench-native-scale-large` | Run the isolated large native scale profile |
+| `release-tools` | Install checksum-pinned GoReleaser and Syft into `bin/release-tools` |
+| `package` | Build local snapshot packages, binary/source archives, SBOMs, and checksums in `dist` |
+| `package-fixtures` | Build an older package set in `dist-upgrade` and the candidate in `dist` |
+| `test-package` | Exercise DEB/RPM installation, upgrade, validation, failed removal, and removal |
+| `test-systemd` | Run the installed package in the pinned Ubuntu QEMU VM, including the real startup deadline |
+| `test-release` | Exercise signed-tag admission and main prerelease versioning with temporary Git/GPG repositories |
 
-`verify` intentionally does not run `test-race`, `test-e2e`, `test-docker`, or
-`test-crowdsec`; those are separate gates. `package` is a planned
-GoReleaser/nFPM snapshot-packaging command, not an implemented target or a
-successful no-op.
+`verify` intentionally excludes race, privileged integration, package, and
+systemd gates; those run separately. Local package verification on an amd64
+Linux build host:
+
+```sh
+make package-fixtures
+make test-package PACKAGE_ARCH=amd64 PACKAGE_CONTAINER_RUNTIME=podman
+make test-package PACKAGE_ARCH=arm64 PACKAGE_CONTAINER_RUNTIME=podman
+make test-systemd SYSTEMD_PACKAGE=dist
+make test-release
+```
+
+The arm64 container requires QEMU/binfmt on an amd64 host; CI pins both the
+setup action and binfmt image. The systemd gate boots a SHA-256-pinned Ubuntu
+26.04 cloud image and requires QEMU, `qemu-img`, `cloud-localds`, SSH, and KVM
+when available. CI runs `tests/systemd/run.sh --fast dist`, covering real
+activation beyond 90 seconds without waiting for the 75-minute deadline. Run
+`make test-systemd SYSTEMD_PACKAGE=dist` to exercise the full deadline locally.
+`package-fixtures` refuses to overwrite an existing `dist-upgrade` fixture.
 
 Tool dependencies and exact versions are pinned in the `tool` and module
 requirements in [`go.mod`](../go.mod). Make targets invoke them with `go tool`,
@@ -461,13 +484,10 @@ implicit timing or throughput targets.
 
 ## Version 1 verification and delivery requirements
 
-The remaining sections are the complete first-release contract, not a list of
-currently passing tests. The local commands above describe what can run now.
-Static source-backed policy, including HTTP(S) IP lists and direct dynamic
-provider selectors, CrowdSec, both native backend paths, and Docker's iptables
-bridge integration are implemented; package/systemd integration and release
-workflows remain planned. The
-[implementation plan](implementation-plan.md) tracks milestone status.
+The following matrix is the complete release acceptance contract, not a claim
+that a local source build or individual test qualifies a release. The runtime,
+package/service integration, and release workflows implement these gates.
+The [implementation plan](implementation-plan.md) tracks delivery status.
 
 ## Verification matrix
 
@@ -635,7 +655,7 @@ passing.
 | Package smoke | RPM/DEB smoke installation checks installed paths and modes, package dependency alternatives, configuration preservation across upgrade, tmpfiles and systemd payloads, and `perimeterd validate`. | Matching-architecture package containers |
 | Systemd sandbox | A disposable systemd VM boots with no pre-existing xtables lock and proves the installed service reconciles both supported iptables tool variants under its actual filesystem and capability sandbox. Container payload inspection alone is not evidence that the service sandbox works. | Disposable systemd VM |
 | Boot and restart lifecycle | The VM covers install-after-boot tmpfiles provisioning, lifecycle-lock exclusion, retained runtime-directory inode across restart, ongoing degraded enforcement health, and removal failure preserving recovery state. | Disposable systemd VM |
-| Startup timeout protocol | A cold-start fixture taking more than `90s` remains activating through `EXTEND_TIMEOUT_USEC` and becomes ready only after commit; a stalled initializer terminates at the overall startup bound without discarding recovery evidence. A fake clock is used for exhaustive deadline boundaries, not to replace the real systemd activation scenario. | Disposable systemd VM; unit fake-clock boundary fixtures |
+| Startup timeout protocol | CI's cold-start fixture takes more than `90s`, remains activating through `EXTEND_TIMEOUT_USEC`, and becomes ready only after commit. Fake-clock tests cover the overall deadline; the opt-in full VM gate verifies real 75-minute termination without losing recovery evidence. | CI fast systemd VM; unit fake-clock fixtures; opt-in full systemd VM |
 | Release artifacts | GoReleaser v2 creates static Linux binaries for `amd64` (`GOAMD64=v1`) and `arm64`, one DEB and one RPM per architecture, checksums, SBOMs, a source archive, and GitHub artifact attestations only after all gates pass. | Release workflow; matching-architecture package containers; systemd VM |
 | Architecture coverage | Each package is installed in a matching-architecture distribution container; pinned QEMU/binfmt runs non-native architecture containers. | Package smoke |
 | Version provenance | Signed tag-derived version, commit, and build time are injected into `perimeterd version` and `perimeterd_build_info`. Untagged branch builds may produce snapshot artifacts for CI but can never publish a release. | Release workflow; package smoke |
@@ -676,8 +696,8 @@ and packaging matrix](#service-and-packaging).
 
 ## Pull-request and branch CI
 
-The existing `.github/workflows/ci.yml` triggers for pull requests targeting
-`main` and pushes to `main`. It has six current jobs:
+`.github/workflows/ci.yml` runs for pull requests targeting `main` and as a
+reusable gate of the release workflow on main pushes and stable tags:
 
 - `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
   `coverage.out`.
@@ -694,57 +714,74 @@ The existing `.github/workflows/ci.yml` triggers for pull requests targeting
   2.0.4 and CrowdSec 1.8.1 binaries and runs `E2E_SUDO=sudo make test-openziti`
   with explicit fixture paths, covering all three native backend variants.
 
-The separate `.github/workflows/codeql.yml` scans Go for the same pull-request
-and `main` push events plus its weekly schedule. Renovate tracks Go modules
-and GitHub Actions, including the pinned development tools; it does not track
-a nonexistent GoReleaser workflow. Actions updates must retain immutable
-commit SHAs and refresh their human-readable release comments. These are the
-current executable CI gates; the [verification matrix](#verification-matrix)
-remains the full first-release contract. Scale targets are opt-in, not CI gates.
+- `packages` builds DEBs/RPMs for amd64 and arm64, checks their real lifecycle
+  in matching-architecture Debian/Fedora containers, and exercises the installed
+  service in a systemd VM.
 
-Before version 1, CI and release orchestration must additionally implement the
-matrix's package installation/upgrade and systemd-VM gates. The pinned Docker
-and CrowdSec compatibility gates already exist in branch CI but must also be
-included in the release workflow. Listing planned jobs as requirements does not
-mean those jobs exist.
+The separate `.github/workflows/codeql.yml` scans Go for pull requests, its
+weekly schedule, and release-workflow invocations. Renovate tracks Go modules
+and GitHub Actions, including pinned development tools. Actions updates must
+retain immutable commit SHAs and refresh their human-readable release comments.
+Scale targets are opt-in, not CI gates.
 
 Workflow permissions are read-only by default and elevated only for a job's
-required security or artifact operation. Superseded CI runs for the same
-branch or pull request use concurrency cancellation. The planned release
-workflow must never cancel an earlier release because a later tag arrived.
+required security or artifact operation. Superseded pull-request CI and CodeQL
+runs are cancelled. Release runs and their reusable CI and CodeQL checks use the
+caller run ID in their concurrency groups, so queued checks for different
+releases do not replace one another.
 
 ## Release workflow
 
-**Planned:** `.github/workflows/release.yml` and GoReleaser configuration do not
-exist yet. The following is the release acceptance contract.
+`.github/workflows/release.yml` has two publication channels:
 
-The workflow must trigger only on signed SemVer tags matching
-`vMAJOR.MINOR.PATCH`. Tag signature and exact pattern validation must precede
-build. It must run the complete static-analysis, unit, race, privileged E2E,
-Docker, CrowdSec compatibility, and package gates from the
-[matrix](#verification-matrix), then invoke GoReleaser v2.
+- A signed, canonical **bare SemVer** tag such as `0.0.1` or `0.0.2` publishes
+  a stable release. `v0.0.1`, leading zeroes, and prerelease/build suffixes are
+  rejected. The tagged commit must be reachable from `origin/main`.
+- Every push to `main` publishes a development prerelease after the same gates.
+  Its version is the next patch after the latest reachable stable tag, followed
+  by `-dev.RUN.gSHORTCOMMIT`; without a stable tag the base is `0.0.1`.
+  Prereleases never become GitHub's latest release.
+
+Configure repository variable `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
+ASCII-armored OpenPGP public keys before publishing stable tags. Admission uses
+an isolated keyring, disables automatic key retrieval, checks the triggering
+commit and main ancestry, and verifies the annotated tag signature. For example:
+
+```sh
+git tag -s 0.0.1 -m 'Release 0.0.1'
+git push origin 0.0.1
+```
+
+Both channels run static analysis, unit and race tests, CodeQL, privileged
+native E2E, real Docker/CrowdSec/OpenZiti compatibility, package lifecycle, and
+the fast systemd VM gate before publication. GoReleaser and Syft are
+checksum-pinned by `scripts/install-release-tools.sh`.
 
 The release gate executes the release-artifact, architecture-coverage,
-package-smoke, systemd-sandbox, boot-and-restart, startup-timeout, and
-version-provenance rows in the [service and packaging
-matrix](#service-and-packaging). Those rows are the authoritative checks for
+package-smoke, systemd-sandbox, boot-and-restart, >90-second startup-activation,
+fake-clock deadline, and version-provenance checks in the
+[service and packaging matrix](#service-and-packaging). Those checks cover
 GoReleaser v2 outputs, matching-architecture containers and pinned QEMU/binfmt,
 installed paths and modes, dependency alternatives, configuration preservation,
 tmpfiles/systemd payloads, `perimeterd validate`, the real systemd
 filesystem/capability sandbox, pending-apply recovery, `EXTEND_TIMEOUT_USEC`,
-fake-clock boundaries, and version metadata.
+and version metadata. The real 75-minute stalled-startup scenario remains
+available through the opt-in full VM gate; it does not block CI publication.
 
-Only after those checks, the workflow publishes a GitHub Release with:
+The tested artifacts—not a rebuild—are checksum-verified, attested with GitHub's
+OIDC-backed signing identity, uploaded to a draft, and then published:
 
 - two DEBs and two RPMs;
-- checksums;
-- SBOMs;
+- binary archives and SHA-256 checksums;
+- SPDX SBOMs;
 - a source archive; and
-- GitHub artifact attestations.
+- GitHub artifact attestations with `provenance.sigstore.json`.
 
-The signed tag-derived version, commit, and build time are injected into
-`perimeterd version` and `perimeterd_build_info`. An untagged branch build may
-produce snapshot artifacts for CI but can never publish a release.
+The admitted version, commit, and build time are injected into
+`perimeterd version` and `perimeterd_build_info`. Local snapshot builds never
+publish. Publishing requires the workflow's `contents: write`, `id-token:
+write`, and `attestations: write` permissions; no signing private key is stored
+in the repository.
 
 ## License discipline
 

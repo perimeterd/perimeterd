@@ -220,6 +220,7 @@ func parseIPTablesSave(family policy.Family, data []byte) (*iptInventory, error)
 			continue
 		}
 		var packets, byteCount uint64
+		hasCounters := false
 		if strings.HasPrefix(line, "[") {
 			end := strings.IndexByte(line, ']')
 			if end < 0 {
@@ -238,6 +239,7 @@ func parseIPTablesSave(family policy.Family, data []byte) (*iptInventory, error)
 			if err != nil {
 				return nil, err
 			}
+			hasCounters = true
 			line = strings.TrimSpace(line[end+1:])
 		}
 		tokens, literals, err := splitIPTLine(line)
@@ -252,7 +254,7 @@ func parseIPTablesSave(family policy.Family, data []byte) (*iptInventory, error)
 		if !exists {
 			return nil, errors.New("rule references undeclared chain")
 		}
-		rule := iptObservedRule{iptChainKey: key, Args: tokens[2:], Packets: packets, Bytes: byteCount}
+		rule := iptObservedRule{iptChainKey: key, Args: tokens[2:], Packets: packets, Bytes: byteCount, HasCounters: hasCounters}
 		rule.References = iptRuleReferences(tokens[2:], literals[2:])
 		chain.Rules = append(chain.Rules, rule)
 		result.Chains[key] = chain

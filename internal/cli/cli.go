@@ -119,6 +119,9 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	if err := app.Run(context.Background(), app.Options{
 		ConfigPath: *configPath,
 		Stderr:     stderr,
+		Version:    Version,
+		Commit:     Commit,
+		BuildTime:  BuildTime,
 	}); err != nil {
 		return commandError(stderr, fmt.Errorf("run: %w", err))
 	}

@@ -188,10 +188,11 @@ type Resolution struct {
 // Resolver fetches RIPEstat, provider, and custom-list data and stages complete
 // immutable cache manifests.
 type Resolver struct {
-	cache   *Cache
-	client  *http.Client
-	slots   chan struct{}
-	session *upstream.Session
+	cache          *Cache
+	client         *http.Client
+	slots          chan struct{}
+	session        *upstream.Session
+	observeRequest func(source string, success bool)
 }
 
 // WithTransports returns an immutable resolver view using the captured
@@ -203,6 +204,18 @@ func (r *Resolver) WithTransports(session *upstream.Session) *Resolver {
 	}
 	view := *r
 	view.session = session
+	return &view
+}
+
+// WithRequestObserver returns an immutable resolver view that reports each
+// selector fetch with a fixed source kind and success outcome. Observer values
+// never include selector IDs, URLs, or error text.
+func (r *Resolver) WithRequestObserver(observer func(source string, success bool)) *Resolver {
+	if r == nil {
+		return nil
+	}
+	view := *r
+	view.observeRequest = observer
 	return &view
 }
 

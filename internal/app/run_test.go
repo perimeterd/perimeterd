@@ -82,6 +82,18 @@ func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 		t.Fatalf("metrics status = %d, want 200", response.StatusCode)
 	}
 	_ = response.Body.Close()
+	request, err := http.NewRequest(http.MethodPost, "http://"+metrics.ln.Addr().String()+"/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	methodResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = methodResponse.Body.Close()
+	if methodResponse.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("metrics POST status = %d, want 405", methodResponse.StatusCode)
+	}
 	health.Store(false)
 	response = mustGet(t, "http://"+metrics.ln.Addr().String()+"/metrics")
 	body, err := io.ReadAll(response.Body)
@@ -91,6 +103,9 @@ func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "perimeterd_enforcement_health 0") {
 		t.Fatalf("metrics body = %q", body)
+	}
+	if !strings.Contains(string(body), "perimeterd_build_info{") {
+		t.Fatalf("metrics body omits build metadata: %q", body)
 	}
 
 	other, err := bindMetrics("127.0.0.1:0", health.Load, nil)
@@ -599,11 +614,11 @@ func runMetricTimestamp(t *testing.T, address string) int64 {
 		if len(fields) != 2 {
 			t.Fatalf("malformed timestamp metric line %q", line)
 		}
-		value, err := strconv.ParseInt(fields[1], 10, 64)
+		value, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil {
 			t.Fatalf("timestamp metric %q: %v", line, err)
 		}
-		return value
+		return int64(value)
 	}
 	t.Fatalf("metrics body has no source timestamp: %q", body)
 	return 0

@@ -18,6 +18,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/lookup"
+	"github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
@@ -46,6 +47,9 @@ type Options struct {
 	Signals        <-chan os.Signal
 	Notify         func(string) error
 	StartupTimeout time.Duration
+	Version        string
+	Commit         string
+	BuildTime      string
 }
 
 func normalizeOptions(opts Options) Options {
@@ -78,6 +82,7 @@ func Run(ctx context.Context, options Options) error {
 		ctx = context.Background()
 	}
 	opts := normalizeOptions(options)
+	collector := metrics.New(opts.Version, opts.Commit, opts.BuildTime)
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	signalInput, stopSignals := runtimeSignals(opts.Signals)
@@ -127,6 +132,7 @@ func Run(ctx context.Context, options Options) error {
 		return errors.Join(err, stopNotifier())
 	}
 	engine := NewEngine(store, opts.Backend, opts.Checkpoint)
+	engine.setTelemetry(collector)
 	engine.ConfigureCrowdSecTransport(opts.SourceClient)
 	defer engine.Close()
 	lookupPath := filepath.Join(filepath.Dir(opts.LockPath), "lookup.sock")
@@ -157,6 +163,7 @@ func Run(ctx context.Context, options Options) error {
 		return errors.Join(fmt.Errorf("collect unused prefix cache: %w", err), stopNotifier())
 	}
 	sources := newSourceRuntime(store.Prefixes(), opts.SourceClient)
+	sources.resolver = sources.resolver.WithRequestObserver(collector.SourceRequest)
 	defer sources.close()
 	if err := sources.selectRevision(recovered, nil); err != nil {
 		return errors.Join(err, stopNotifier())
@@ -181,7 +188,7 @@ func Run(ctx context.Context, options Options) error {
 		return errors.Join(fmt.Errorf("load upstream identities: %w", err), stopNotifier())
 	}
 	resolver := sources.resolver.WithTransports(session)
-	publication := newRuntimePublication(engine, sources, newLogger(cfg, opts.Stderr))
+	publication := newRuntimePublication(engine, sources, newLogger(cfg, opts.Stderr), collector)
 	defer func() { _ = publication.close() }()
 
 	initial := stageSource(startupCtx, opts, resolver, epoch, 0, cfg, sources.manifest(), session)
@@ -189,7 +196,7 @@ func Run(ctx context.Context, options Options) error {
 		initial.candidate.close()
 		return errors.Join(initial.err, stopNotifier())
 	}
-	if err := publication.reserve(initial); err != nil {
+	if err := publication.reserve(initial, startupCtx); err != nil {
 		initial.candidate.close()
 		return errors.Join(err, stopNotifier())
 	}
@@ -344,6 +351,7 @@ func Run(ctx context.Context, options Options) error {
 			case syscall.SIGHUP:
 				requestEpoch, admitErr := engine.Admit()
 				if admitErr != nil {
+					collector.ConfigReload("error")
 					publication.logger.Warn("reload admission failed", "error", admitErr)
 					continue
 				}
@@ -372,6 +380,16 @@ func Run(ctx context.Context, options Options) error {
 				return errors.Join(metricsErr, stopService())
 			}
 		case result := <-results:
+			recordReload := func(success bool) {
+				if result.candidate.refresh != 0 {
+					return
+				}
+				result := "error"
+				if success {
+					result = "success"
+				}
+				collector.ConfigReload(result)
+			}
 			if result.candidate.refresh == 0 &&
 				result.candidate.epoch == sources.reloadEpoch &&
 				sources.reloadCancel != nil {
@@ -389,25 +407,30 @@ func Run(ctx context.Context, options Options) error {
 				sources.schedule()
 			}
 			if !engine.current(result.candidate.Candidate) {
+				recordReload(false)
 				result.candidate.close()
 				continue
 			}
 			if result.err != nil {
+				recordReload(false)
 				result.candidate.close()
 				publication.logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
 				continue
 			}
 			if recovering || publication.pending() {
+				recordReload(false)
 				result.candidate.close()
 				continue
 			}
-			if err := publication.reserve(result); err != nil {
+			if err := publication.reserve(result, runCtx); err != nil {
+				recordReload(false)
 				result.candidate.close()
 				publication.logger.Warn("reload failed", "error", err)
 				continue
 			}
 			outcome, applyErr := engine.applyStaged(runCtx, result.candidate)
 			if applyErr != nil && !outcome.Committed {
+				recordReload(false)
 				if outcome.Degraded && outcome.Transaction != "" {
 					if err := publication.retain(outcome.Transaction); err != nil {
 						_ = publication.discard()
@@ -425,13 +448,16 @@ func Run(ctx context.Context, options Options) error {
 				continue
 			}
 			if !outcome.Committed {
+				recordReload(false)
 				_ = publication.discard()
 				publication.logger.Warn("reload produced no committed revision")
 				continue
 			}
 			if err := publication.publish(outcome.Active); err != nil {
+				recordReload(false)
 				return errors.Join(err, stopService())
 			}
+			recordReload(true)
 			if outcome.Degraded || !engine.Healthy() {
 				scheduleRecovery()
 			}

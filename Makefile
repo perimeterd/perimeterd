@@ -24,8 +24,15 @@ CROWDSEC_CONTAINER_RUNTIME ?= docker
 DOCKER_TEST_BINDIR ?=
 ZITI_TEST_BINARY ?=
 CROWDSEC_TEST_BINDIR ?=
+RELEASE_TOOLS := $(abspath bin/release-tools)
+PACKAGE_DIST ?= dist
+PACKAGE_UPGRADE_FROM ?= dist-upgrade
+PACKAGE_ARCH ?= $(GOARCH)
+PACKAGE_CONTAINER_RUNTIME ?= docker
+SYSTEMD_PACKAGE ?=
 
 .PHONY: fmt fmt-check lint test test-race vuln build build-e2e test-e2e test-crowdsec test-openziti test-docker verify bench-scale-small bench-scale-large bench-native-scale-small bench-native-scale-large
+.PHONY: release-tools package package-fixtures test-package test-systemd test-release
 
 fmt:
 	@files="$$($(GO_SOURCES))" || exit $$?; \
@@ -106,6 +113,32 @@ bench-native-scale-small: build-e2e
 
 bench-native-scale-large: build-e2e
 	$(E2E_SUDO) env PERIMETERD_E2E=1 PERIMETERD_NATIVE_MEASURE=1 PERIMETERD_NATIVE_PROFILE=large E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.run '^TestE2ECrowdSecNativeMeasurement$$' -test.count=1
+
+release-tools: $(RELEASE_TOOLS)/goreleaser $(RELEASE_TOOLS)/syft
+
+$(RELEASE_TOOLS)/goreleaser $(RELEASE_TOOLS)/syft &: scripts/install-release-tools.sh
+	scripts/install-release-tools.sh "$(RELEASE_TOOLS)"
+
+package: release-tools
+	PATH="$(RELEASE_TOOLS):$$PATH" goreleaser check
+	PATH="$(RELEASE_TOOLS):$$PATH" goreleaser release --snapshot --clean --skip=publish
+
+# The baseline is deliberately below every publishable version; these artifacts
+# exercise actual package-manager upgrade behavior, not a same-version reinstall.
+package-fixtures: release-tools
+	test ! -e dist-upgrade
+	PATH="$(RELEASE_TOOLS):$$PATH" SNAPSHOT_VERSION=0.0.0-0 goreleaser release --snapshot --clean --skip=publish,sbom
+	mv dist dist-upgrade
+	$(MAKE) --no-print-directory package
+
+test-package:
+	PACKAGE_CONTAINER_RUNTIME="$(PACKAGE_CONTAINER_RUNTIME)" tests/packaging/run.sh "$(PACKAGE_DIST)" "$(PACKAGE_ARCH)" "$(PACKAGE_UPGRADE_FROM)"
+
+test-systemd:
+	tests/systemd/run.sh "$(SYSTEMD_PACKAGE)"
+
+test-release:
+	python3 tests/release/test_metadata.py
 
 verify:
 	$(GO) mod verify

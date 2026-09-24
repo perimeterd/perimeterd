@@ -153,6 +153,24 @@ func TestStoreDecisionsIsImmutableAndDeterministic(t *testing.T) {
 	}
 }
 
+func TestStoreCountFamiliesExcludesExpiredDecisions(t *testing.T) {
+	now := time.Now()
+	store := NewStore("lapi", 1)
+	if err := store.Apply(Batch{Startup: true, New: []Decision{
+		{ID: 1, Prefix: netip.MustParsePrefix("192.0.2.0/24"), Deadline: now.Add(time.Minute)},
+		{ID: 2, Prefix: netip.MustParsePrefix("198.51.100.0/24"), Deadline: now.Add(time.Hour)},
+		{ID: 3, Prefix: netip.MustParsePrefix("2001:db8::/32"), Deadline: now.Add(time.Hour)},
+	}}, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	if ipv4, ipv6 := store.CountFamilies(now); ipv4 != 2 || ipv6 != 1 {
+		t.Fatalf("active counts = (%d,%d), want (2,1)", ipv4, ipv6)
+	}
+	if ipv4, ipv6 := store.CountFamilies(now.Add(2 * time.Minute)); ipv4 != 1 || ipv6 != 1 {
+		t.Fatalf("counts after expiry = (%d,%d), want (1,1)", ipv4, ipv6)
+	}
+}
+
 func TestStoreFailsClosedWhenRevisionExhausted(t *testing.T) {
 	now := time.Now()
 	store := NewStore("lapi", 1)

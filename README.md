@@ -7,8 +7,8 @@ ingress bans, and IP/CIDR allow/block overrides to an existing Linux firewall.
 It filters unwanted ingress and egress traffic; the parent firewall remains
 responsible for permitting services and ports.
 
-> **Pre-release:** build and run from source. Installed service/package artifacts
-> and production releases remain planned.
+> **Pre-release:** source builds and local DEB/RPM packages are available.
+> Publication requires the complete operational and release gates.
 > **This is not yet a production-ready security control.**
 
 The [implementation plan](docs/implementation-plan.md) tracks completed
@@ -40,8 +40,9 @@ resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
 coexistence, IP/CIDR lookup with source explanations, and
 [optional OpenZiti transport](docs/architecture.md#optional-openziti-upstream-transport)
 for selected CrowdSec/custom-list upstreams are implemented. Direct HTTP(S)
-remains the default, with no Ziti prerequisite. Complete observability, systemd
-packaging, and signed RPM/DEB releases remain planned.
+remains the default, with no Ziti prerequisite. Prometheus observability,
+systemd/tmpfiles integration, amd64/arm64 DEB/RPM packaging, and signed release
+automation are implemented.
 
 The documents below own the detailed contracts. The implementation plan records
 which parts are implemented; source-build commands do not imply installed

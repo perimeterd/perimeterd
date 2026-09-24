@@ -1,10 +1,8 @@
 name: CI
 
 on:
+  workflow_call:
   pull_request:
-    branches:
-      - main
-  push:
     branches:
       - main
 
@@ -12,8 +10,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.workflow == 'Release' && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.workflow == 'CI' }}
 
 env:
   GO_VERSION: "1.27.1"
@@ -190,3 +188,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/docker-engine.tgz" -C "$RUNNER_TEMP/docker-engine"
       - name: Run real isolated Docker packet-path gate
         run: E2E_SUDO=sudo DOCKER_TEST_BINDIR="$RUNNER_TEMP/docker-engine/docker" make test-docker
+
+  packages:
+    if: github.workflow == 'CI'
+    uses: ./.github/workflows/packages.yml

@@ -7,12 +7,11 @@ durable commit, and recovery; [firewall backends](firewall-backends.md) owns
 native kernel behavior. The [implementation plan](implementation-plan.md) is
 authoritative for delivery status.
 
-> **Status boundary.** The source-build instructions in this document describe
-> what runs today, including custom HTTP(S) text IP lists, direct named-provider
-> selectors, Docker's iptables bridge integration, and daemon-backed IP/CIDR
-> lookup, plus optional OpenZiti upstream transport. Installed packages, systemd
-> payloads, and release artifacts remain planned.
-> A full-schema configuration is not a capability list.
+> **Status boundary.** Source builds and packaged installations support the
+> documented runtime features. Building from source does not install the systemd
+> unit or tmpfiles payload. Release publication is gated by the executable
+> checks described in [development](development.md#release-workflow); a local
+> package build alone is not release qualification.
 
 ## Contents
 
@@ -46,8 +45,8 @@ The current binary implements:
 - CrowdSec ingress bans with authoritative synchronization, expiry, renewable
   kernel leases, and staged credential/endpoint replacement;
 - explicit Docker `DOCKER-USER` bridge attachments with pre-DNAT port matching;
-- backend-owned native processed and terminal-denial counter objects; and
-- enforcement-health, CrowdSec connection, and committed-prefix timestamp gauges.
+- backend-owned native processed and terminal-denial counters; and
+- the [Prometheus metrics](#prometheus-metrics) surface, collected in memory.
 
 Docker coexistence is verified for Docker Engine 29.8.1's iptables bridge
 backend with both iptables tool families and IPv4/IPv6. Docker's native nftables
@@ -450,12 +449,10 @@ The current endpoint emits `perimeterd_enforcement_health`,
 `perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The latter
 is the oldest required selector retrieval time, not manifest publication time.
 The CrowdSec gauge is zero when disabled or awaiting valid synchronization;
-LAPI unavailability does not extend retained decisions. The selected backend's
-native counter objects are not collected or exported by this endpoint; their
-semantics and inspection paths are in
-[Packet and byte accounting](firewall-backends.md#packet-and-byte-accounting).
-The broader Prometheus metric surface remains planned (see
-[Prometheus metrics](#prometheus-metrics)).
+LAPI unavailability does not extend retained decisions. The endpoint also exports
+the full [Prometheus metrics](#prometheus-metrics) surface, including sampled
+native packet/byte accounting. Native traversal semantics and inspection paths
+are in [Packet and byte accounting](firewall-backends.md#packet-and-byte-accounting).
 
 ### Reload, recover, and cleanup
 
@@ -523,8 +520,8 @@ procedures.
 
 ## Installed layout
 
-**Planned package artifact.** A source build does not install these paths or
-create a service. The eventual package contract is:
+DEB/RPM packages install the following layout. A source build alone does not
+install these paths or create a service:
 
 - `/usr/bin/perimeterd`: root-owned static executable;
 - `/etc/perimeterd/perimeterd.yaml`: `root:root`, mode `0600`;
@@ -544,12 +541,11 @@ The package must preserve the lifecycle-lock inode across service stop/restart,
 create the state/runtime directories, and provision the shared xtables lock
 without unlinking or replacing an existing lock. There is deliberately no
 service user in that contract: the process remains UID 0 and is constrained to
-`CAP_NET_ADMIN` and `CAP_NET_RAW` by the planned unit.
+`CAP_NET_ADMIN` and `CAP_NET_RAW` by the installed unit.
 
 ## systemd service contract
 
-**Planned integration; not runnable from the repository's source build.** The
-installed unit is expected to use this shape:
+The packaged `packaging/perimeterd.service` uses the following contract:
 
 ```systemd
 [Unit]
@@ -608,7 +604,7 @@ generally writable. The service never uses a private lock path.
 
 ### Recovery before validation
 
-The planned unit must not use `ExecStartPre=validate`: `run` must recover
+The unit deliberately does not use `ExecStartPre=validate`: `run` must recover
 persisted state before reading current YAML. It must extend the activation
 window while bounded startup proceeds and send `READY=1` only after recovery,
 source resolution, backend validation, initial reconcile, durable commit, and
@@ -624,9 +620,9 @@ publication. Startup contexts and child-command deadlines are bounded by the
 remaining time; request timeouts cannot extend it. Known fatal errors exit
 immediately.
 
-The planned unit's [`TimeoutStartSec=90s`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#TimeoutStartSec=)
-is the initial activation window, not the total startup budget. The notification
-protocol below is implemented, but a source build does not install a unit.
+The installed unit's [`TimeoutStartSec=90s`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#TimeoutStartSec=)
+is the initial activation window, not the total startup budget. A source build
+implements the same notification protocol but does not install the unit.
 
 While initialization is in progress, the main process sends
 `EXTEND_TIMEOUT_USEC` immediately and every 20s, requesting the smaller of
@@ -652,8 +648,8 @@ runtime watchdog and does not change reload semantics.
 
 ## Prometheus metrics
 
-**Current source-build surface.** If `metrics.listen` is configured, `GET
-/metrics` emits:
+If `metrics.listen` is configured, `GET /metrics` emits the following runtime
+gauges alongside the accounting and outcome metrics below:
 
 - `perimeterd_enforcement_health` (unlabeled gauge): `1` only when the selected
   enforcement is healthy; it becomes `0` during degraded recovery. A listener
@@ -685,15 +681,12 @@ Metrics are unauthenticated and must not be exposed beyond a trusted network
 boundary.
 
 The selected backends create native processed-path and terminal-denial
-packet/byte counter objects independently of this listener. The current source
-build does not collect or export those counters over HTTP; disabling metrics
-exposition does not change enforcement. See
+packet/byte counters independently of the listener. Disabling exposition stops
+native collection without changing enforcement. See
 [firewall accounting](firewall-backends.md#packet-and-byte-accounting) for
 traversal and denial semantics.
 
-**Planned release metric surface.** The following names and labels remain the
-version-1 observability contract, not a claim that the source build currently
-exports them:
+The endpoint also exports:
 
 - `perimeterd_build_info` (gauge): constant `1` with bounded build metadata.
 - `perimeterd_config_reload_total{result}` (counter): reload outcomes.
@@ -719,13 +712,17 @@ custom-list prefixes through fixed `source` and `type` label values;
 custom lists use `source="ip_list"` and `type="ip_list"`.
 Provider data uses the fixed `source="provider"` and
 `type="provider"` values, not per-provider label values.
+
+Each scrape sees one complete prefix snapshot, including when a reconcile
+re-publishes unchanged counts.
+
 Allowed label values remain bounded: firewall `reason` is `global_blocklist`, `crowdsec`, or
 `geo_policy` (including list-based policies); `action` is `drop` or `reject`;
 and counter-read `result` is `success` or `error`. No metric label may contain
 an address, ASN, country, policy/list/provider name, URL, raw error, or unbounded remote
 revision.
 
-The planned fixed 15-second background sampler reads native counters through the
+The fixed 15-second background sampler reads native counters through the
 serialized backend path and serves last in-memory values without querying the
 firewall from the Prometheus handler. When a reconcile replaces raw counters,
 it attempts a final read of the retired generation after dispatch switches
@@ -733,6 +730,13 @@ away from it and before removal, then establishes the replacement baseline. A
 failed final read records an accounting gap and never rolls back enforcement.
 Exported process-lifetime totals remain monotonic across reconciles; a daemon
 restart is an ordinary Prometheus counter reset.
+Baselines are established on the first successful complete read after collection
+starts or restarts, so values accumulated before the active metrics window are
+not imported. A failed initial read leaves baseline initialization pending;
+retirement reads before that first complete read report read outcomes but do not
+import pre-activation traffic. Pending recovery suspends complete snapshots;
+retirement baselines survive failed removal and retries after initialization,
+preventing the same cumulative native values from being counted twice.
 
 A failed periodic read retains prior values, increments the `error` result, and
 leaves the last-success timestamp unchanged. Counter collection never changes
@@ -756,8 +760,8 @@ reach logs.
 
 ## Packages
 
-**Planned release artifact.** The intended release produces one `perimeterd`
-package as RPM and DEB through GoReleaser v2's nFPM integration. Builds are
+The release builds one `perimeterd` package as RPM and DEB through GoReleaser
+v2's nFPM integration. Builds are
 static Linux binaries (`CGO_ENABLED=0`) for amd64 (`GOAMD64=v1`) and arm64.
 Each package contains the binary, systemd unit, packaged
 `/usr/lib/tmpfiles.d/perimeterd.conf` (or the distribution equivalent),
@@ -775,12 +779,22 @@ iptables/ipset stack, without selecting a backend implicitly:
 When iptables is selected, the daemon validates the matched legacy or
 nf_tables IPv4/IPv6 tools and shared xtables lock; it never silently changes
 variants. Release workflows and provenance checks are owned by
-[development](development.md) and remain planned.
+[development](development.md#release-workflow). Packages also depend on
+`ca-certificates` for HTTPS upstreams.
+
+Verify downloaded artifacts before installing:
+
+```sh
+sha256sum --check checksums.txt
+gh attestation verify perimeterd_0.0.1-1_amd64.deb --repo perimeterd/perimeterd
+```
+
+The release includes the signed provenance bundle for offline retention.
+Development prereleases are built from main and are not stable releases.
 
 ## Package lifecycle
 
-**Planned release artifact.** Package scripts must never mutate firewall policy
-as a side effect:
+Package lifecycle scripts preserve enforcement except for explicit final removal:
 
 - post-install installs the unit and tmpfiles payload, runs
   `systemd-tmpfiles --create` against the installed perimeterd tmpfiles file
@@ -797,7 +811,10 @@ as a side effect:
   reloads systemd. If stop or cleanup fails, it reports the error and preserves
   active rules, recovery metadata, ownership metadata, state, and locks.
 
-Purge may remove configuration, credentials, cache, and state only after owned
-firewall cleanup succeeds. Scripts must not flush global netfilter state,
-create Docker-owned chains, infer ownership from names alone, or remove the
-host-wide xtables lock.
+Even after successful removal or DEB purge, package scripts retain credentials,
+cache, state, and both lock inodes. Dpkg may remove its managed configuration
+file on purge; RPM preserves an edited configuration as `.rpmsave`. Operators
+may remove retained private data manually only after successful cleanup and
+after confirming no perimeterd process remains. Scripts never flush global
+netfilter state, create Docker-owned chains, infer ownership from names alone,
+or remove the host-wide xtables lock.

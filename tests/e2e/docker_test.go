@@ -74,8 +74,32 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	// requested original host port and returns all other traffic to Docker.
 	fixture.peerProbe(t, "tcp4", fixtureIPv4Host+":18080", "reject")
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18080", "reject")
+	forwardEntry := iptablesManagedEntry(t, "FORWARD")
+	dockerEntry := iptablesManagedEntry(t, "DOCKER-USER")
+	beforeAllowed := iptablesNativeRoleCounters(t, "v4", "ingress", `entry_v4_ingress/processed"`)
 	fixture.peerProbe(t, "tcp4", fixtureIPv4Host+":18081", "success")
+	afterAllowed := iptablesNativeRoleCounters(t, "v4", "ingress", `entry_v4_ingress/processed"`)
+	assertIPTablesDoubleTraversal(t, beforeAllowed, afterAllowed, forwardEntry, dockerEntry)
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18081", "success")
+	processed := iptablesNativeRoleCounters(t, "v4", "ingress", `entry_v4_ingress/processed"`)
+	denied := iptablesNativeRoleCounters(t, "v4", "ingress", `/denied/geo_policy/reject"`)
+	if len(processed) != 2 || len(denied) == 0 {
+		t.Fatalf("missing native Docker accounting rules: processed=%+v denied=%+v", processed, denied)
+	}
+	processedPackets, processedBytes := sumIPTablesNativeCounters(processed)
+	deniedPackets, deniedBytes := sumIPTablesNativeCounters(denied)
+	metricLabels := map[string]string{"backend": "iptables", "family": "ipv4", "direction": "ingress"}
+	deniedLabels := map[string]string{"backend": "iptables", "family": "ipv4", "direction": "ingress", "reason": "geo_policy", "action": "reject"}
+	metricsBody := waitForE2EMetrics(t, "http://127.0.0.1:19095/metrics", []e2eMetricExpectation{
+		{name: "perimeterd_firewall_processed_packets_total", labels: metricLabels, value: processedPackets},
+		{name: "perimeterd_firewall_processed_bytes_total", labels: metricLabels, value: processedBytes},
+		{name: "perimeterd_firewall_denied_packets_total", labels: deniedLabels, value: deniedPackets},
+		{name: "perimeterd_firewall_denied_bytes_total", labels: deniedLabels, value: deniedBytes},
+		{name: "perimeterd_firewall_counter_read_total", labels: map[string]string{"backend": "iptables", "result": "success"}, value: 1, minimum: true},
+	})
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_processed_packets_total", "backend", "direction", "family")
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_denied_packets_total", "action", "backend", "direction", "family", "reason")
+	assertE2EMetricLabelNames(t, metricsBody, "perimeterd_firewall_counter_read_total", "backend", "result")
 	if got := dockerForeignSnapshot(t); !bytes.Equal(got, dockerOnlyBaseline) {
 		t.Fatalf("Docker rules changed during perimeterd apply:\n%s", got)
 	}
@@ -94,9 +118,13 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	}
 	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
 		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(18080)), "blocked")
-		outcome, ok := lookupOutcome(response, "blocked", "policy")
-		if !ok || outcome.Attachment.PortBasis != "original_destination" {
-			t.Fatalf("Docker original-destination lookup for %s omitted managed policy/port basis: %+v", address, response.Outcomes)
+		if len(response.Outcomes) != 2 {
+			t.Fatalf("Docker blocked lookup omitted managed attachment outcomes for %s: %+v", address, response.Outcomes)
+		}
+		for _, outcome := range response.Outcomes {
+			if outcome.Attachment.PortBasis != "original_destination" {
+				t.Fatalf("Docker original-destination lookup for %s omitted managed policy/port basis: %+v", address, response.Outcomes)
+			}
 		}
 	}
 
@@ -110,8 +138,13 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18081", "reject")
 	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
 		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(18081)), "not_blocked")
-		if len(response.Outcomes) != 1 || response.Outcomes[0].Attachment.PortBasis != "original_destination" {
-			t.Fatalf("foreign Docker denial was attributed to perimeterd for %s: %+v", address, response.Outcomes)
+		if len(response.Outcomes) != 2 {
+			t.Fatalf("foreign Docker denial lookup omitted managed attachment outcomes for %s: %+v", address, response.Outcomes)
+		}
+		for _, outcome := range response.Outcomes {
+			if outcome.Attachment.PortBasis != "original_destination" {
+				t.Fatalf("foreign Docker denial was attributed to perimeterd for %s: %+v", address, response.Outcomes)
+			}
 		}
 	}
 	baseline := dockerForeignSnapshot(t)
@@ -125,8 +158,13 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18080", "success")
 	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
 		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(8080)), "not_blocked")
-		if len(response.Outcomes) != 1 || response.Outcomes[0].Attachment.PortBasis != "current_destination" {
-			t.Fatalf("Docker current-destination lookup for %s retained original-port denial: %+v", address, response.Outcomes)
+		if len(response.Outcomes) != 2 {
+			t.Fatalf("Docker lookup omitted managed attachment outcomes for %s: %+v", address, response.Outcomes)
+		}
+		for _, outcome := range response.Outcomes {
+			if outcome.Attachment.PortBasis != "current_destination" {
+				t.Fatalf("Docker current-destination lookup for %s retained original-port denial: %+v", address, response.Outcomes)
+			}
 		}
 	}
 	if got := dockerForeignSnapshot(t); !bytes.Equal(got, baseline) {
@@ -143,8 +181,13 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	fixture.peerProbe(t, "tcp6", "["+fixtureIPv6Host+"]:18080", "reject")
 	for _, address := range []string{fixtureIPv4Peer, fixtureIPv6Peer} {
 		response := waitForLookupVerdict(t, address, "ingress", "tcp", new(uint16(18080)), "blocked")
-		if outcome, ok := lookupOutcome(response, "blocked", "policy"); !ok || outcome.Attachment.PortBasis != "original_destination" {
-			t.Fatalf("rejected Docker reload changed lookup authority for %s: %+v", address, response.Outcomes)
+		if len(response.Outcomes) != 2 {
+			t.Fatalf("rejected Docker lookup omitted managed attachment outcomes for %s: %+v", address, response.Outcomes)
+		}
+		for _, outcome := range response.Outcomes {
+			if outcome.Attachment.PortBasis != "original_destination" {
+				t.Fatalf("rejected Docker reload changed lookup authority for %s: %+v", address, response.Outcomes)
+			}
 		}
 	}
 	if got := dockerForeignSnapshot(t); !bytes.Equal(got, baseline) {
@@ -183,12 +226,12 @@ func TestE2EDockerCoexistence(t *testing.T) {
 }
 
 type dockerPreflightObserver struct {
-	firewall.Backend
+	*firewall.Native
 	rejected chan error
 }
 
 func (b *dockerPreflightObserver) Preflight(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
-	err := b.Backend.Preflight(ctx, previous, candidate, dynamic)
+	err := b.Native.Preflight(ctx, previous, candidate, dynamic)
 	if err != nil {
 		b.rejected <- err
 	}
@@ -211,7 +254,7 @@ func startDockerPolicyDaemon(t *testing.T, configPath string, geo *geoFixtureTra
 	done := make(chan error, 1)
 	ready := make(chan struct{}, 1)
 	output := new(lockedBuffer)
-	backend := &dockerPreflightObserver{Backend: firewall.NewNative(nil), rejected: make(chan error, 1)}
+	backend := &dockerPreflightObserver{Native: firewall.NewNative(nil), rejected: make(chan error, 1)}
 	d := &dockerDaemon{cancel: cancel, signals: signals, done: done, rejected: backend.rejected, output: output}
 	go func() {
 		done <- app.Run(ctx, app.Options{
@@ -333,11 +376,15 @@ func dockerContainerIPs(t *testing.T, fixture *dockerFixture) []string {
 func writeDockerCoexistenceConfig(t *testing.T, path, action string, originalDestination bool, block []string, chain string) {
 	t.Helper()
 	var yaml strings.Builder
-	yaml.WriteString("version: 1\nlogging:\n  level: warn\n  format: text\nmetrics:\n  listen: \"\"\nglobal:\n  allowlist: []\n  blocklist:\n")
+	yaml.WriteString("version: 1\nlogging:\n  level: warn\n  format: text\nmetrics:\n  listen: \"127.0.0.1:19095\"\nglobal:\n  allowlist: []\n  blocklist:\n")
 	for _, prefix := range block {
 		fmt.Fprintf(&yaml, "    - %q\n", prefix)
 	}
-	fmt.Fprintf(&yaml, "firewall:\n  backend: iptables\n  deny_action: %s\n  ipv4: true\n  ipv6: true\n  iptables:\n    attachments:\n      - chain: %q\n        direction: ingress\n        input_interfaces: [\"e2h0\"]\n", action, chain)
+	fmt.Fprintf(&yaml, "firewall:\n  backend: iptables\n  deny_action: %s\n  ipv4: true\n  ipv6: true\n  iptables:\n    attachments:\n      - chain: FORWARD\n        direction: ingress\n        input_interfaces: [\"e2h0\"]\n", action)
+	if originalDestination {
+		yaml.WriteString("        original_destination: true\n")
+	}
+	fmt.Fprintf(&yaml, "      - chain: %q\n        direction: ingress\n        input_interfaces: [\"e2h0\"]\n", chain)
 	if originalDestination {
 		yaml.WriteString("        original_destination: true\n")
 	}
@@ -405,12 +452,13 @@ func dockerForeignSnapshot(t *testing.T) []byte {
 		lines := strings.Split(string(data), "\n")
 		ownedChains := make(map[string]bool)
 		for _, line := range lines {
-			if !strings.Contains(line, "perimeterd owner=") {
+			// Attachment rules belong to perimeterd, but their parent chains do not.
+			if !strings.Contains(line, "perimeterd owner=") || strings.Contains(line, "role=attachment/") {
 				continue
 			}
 			fields := strings.Fields(line)
 			for index, field := range fields {
-				if field == "-A" && index+1 < len(fields) && fields[index+1] != "DOCKER-USER" {
+				if field == "-A" && index+1 < len(fields) {
 					ownedChains[fields[index+1]] = true
 					break
 				}

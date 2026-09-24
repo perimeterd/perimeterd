@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/config"
 	crowd "github.com/perimeterd/perimeterd/internal/crowdsec"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
@@ -135,6 +137,33 @@ func crowdEngineFixture(t *testing.T, checkpoint func(string) error) (*Engine, *
 		t.Fatalf("startup apply: %#v, %v", outcome, err)
 	}
 	return engine, backend, cfg
+}
+
+func TestCrowdDecisionMetricsExpireWhileEngineDegraded(t *testing.T) {
+	engine, backend, _ := crowdEngineFixture(t, nil)
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	collector := metricspkg.New("test", "commit", "time")
+	engine.telemetry = collector
+	now := time.Now()
+	engine.crowd.publishDecisionCountsLocked(now)
+	scrape := func() string {
+		response := httptest.NewRecorder()
+		collector.Handler(nil, nil, nil).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		return response.Body.String()
+	}
+	if body := scrape(); !strings.Contains(body, `perimeterd_crowdsec_decisions{family="ipv4"} 1`) {
+		t.Fatalf("active decision is absent before expiry: %s", body)
+	}
+	engine.healthy.Store(false)
+	writes := backend.writeCount()
+	engine.crowd.maintainLocked(context.Background(), engine.crowd.active, now.Add(50*time.Hour))
+	if body := scrape(); !strings.Contains(body, `perimeterd_crowdsec_decisions{family="ipv4"} 0`) {
+		t.Fatalf("expired decision remains exposed during degraded recovery: %s", body)
+	}
+	if backend.writeCount() != writes {
+		t.Fatal("expiry bypassed degraded writer admission")
+	}
 }
 
 func TestCrowdReloadFailureRetainsCredentialAndAuthority(t *testing.T) {

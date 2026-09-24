@@ -93,7 +93,7 @@ func normalize(raw rawConfig) (Config, error) {
 		return Config{}, err
 	}
 	// Built-in local ranges are part of the effective allowlist and cannot be removed.
-	locals := builtinLocalRanges()
+	locals := BuiltinLocalRanges()
 	allowPrefixes := make([]netip.Prefix, 0, len(cfg.Global.Allowlist)+len(locals))
 	allowPrefixes = append(allowPrefixes, cfg.Global.Allowlist...)
 	allowPrefixes = append(allowPrefixes, locals...)
@@ -282,7 +282,8 @@ func normalizePrefixes(values []string, field string) ([]netip.Prefix, error) {
 	return normalized, nil
 }
 
-func builtinLocalRanges() []netip.Prefix {
+// BuiltinLocalRanges returns the immutable-policy local allow ranges as a fresh slice.
+func BuiltinLocalRanges() []netip.Prefix {
 	values := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fe80::/10", "fc00::/7"}
 	prefixes := make([]netip.Prefix, 0, len(values))
 	for _, value := range values {
