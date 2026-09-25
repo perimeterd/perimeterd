@@ -29,10 +29,23 @@ def stage(source, destination):
         shutil.copyfile(artifact, destination / name)
     if sum(name.endswith(".deb") for name in names) != 2 or sum(name.endswith(".rpm") for name in names) != 2:
         raise ValueError("release must contain two DEBs and two RPMs")
-    if not any("source" in name and name.endswith(".tar.gz") for name in names):
+    source_archives = [
+        name
+        for name in names
+        if name.startswith("perimeterd-source-") and name.endswith(".tar.gz")
+    ]
+    if not source_archives:
         raise ValueError("release source archive missing")
-    if sum(name.endswith(".sbom.json") for name in names) < 2:
-        raise ValueError("architecture SBOMs missing")
+    required_artifacts = sorted(
+        name for name in names if name.endswith((".deb", ".rpm"))
+    ) + sorted(source_archives)
+    missing_sboms = [
+        f"{name}.spdx.sbom.json"
+        for name in required_artifacts
+        if f"{name}.spdx.sbom.json" not in names
+    ]
+    if missing_sboms:
+        raise ValueError(f"missing required SBOMs: {', '.join(missing_sboms)}")
     shutil.copyfile(checksums, destination / checksums.name)
 
 

@@ -16,6 +16,10 @@ concurrency:
 jobs:
   metadata:
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
     outputs:
       version: ${{ steps.release.outputs.version }}
       prerelease: ${{ steps.release.outputs.prerelease }}
@@ -25,11 +29,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate main ancestry, SemVer and stable tag signature
-        id: release
+      - name: Select or recover and re-admit the release identity
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_SIGNING_PUBLIC_KEYS: ${{ vars.RELEASE_SIGNING_PUBLIC_KEYS }}
-        run: python3 scripts/release-metadata.py
+        run: python3 scripts/release-metadata.py --prepare "$RUNNER_TEMP/release-metadata.json"
+      - name: Persist release identity for this run
+        if: github.run_attempt == '1'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-metadata-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-metadata.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Expose only the durable release identity
+        id: release
+        run: python3 scripts/release-metadata.py --emit "$RUNNER_TEMP/release-metadata.json"
 
   checks:
     needs: metadata
@@ -54,6 +69,7 @@ jobs:
   publish:
     needs: [metadata, checks, codeql, packages]
     runs-on: ubuntu-26.04
+    timeout-minutes: 30
     permissions:
       contents: write
       id-token: write
@@ -64,7 +80,7 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: release-dist
+          name: ${{ needs.packages.outputs.candidate-artifact-name }}
           path: dist
       - name: Verify and select the tested release assets
         run: python3 scripts/release-assets.py dist release-assets
@@ -73,7 +89,7 @@ jobs:
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: release-assets/*
-      - name: Publish tested artifacts without rebuilding
+      - name: Recover or publish the immutable tested release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -83,13 +99,5 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp "$BUNDLE" release-assets/provenance.sigstore.json
-          args=(--target "$COMMIT" --title "$VERSION" --generate-notes --draft)
-          if [[ "$PRERELEASE" == true ]]; then
-            args+=(--prerelease --latest=false)
-          else
-            args+=(--verify-tag --latest)
-          fi
-          gh release create "$VERSION" "${args[@]}" release-assets/*
-          # An upload failure leaves a draft, never a partially published release.
-          gh release edit "$VERSION" --draft=false
+          cp -- "$BUNDLE" release-assets/provenance.sigstore.json
+          python3 scripts/release-publish.py release-assets

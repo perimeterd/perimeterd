@@ -25,6 +25,7 @@ DOCKER_TEST_BINDIR ?=
 ZITI_TEST_BINARY ?=
 CROWDSEC_TEST_BINDIR ?=
 RELEASE_TOOLS := $(abspath bin/release-tools)
+SUPPORT_TOOLS ?= $(abspath bin/support-tools)
 PACKAGE_DIST ?= dist
 PACKAGE_UPGRADE_FROM ?= dist-upgrade
 PACKAGE_ARCH ?= $(GOARCH)
@@ -32,7 +33,7 @@ PACKAGE_CONTAINER_RUNTIME ?= docker
 SYSTEMD_PACKAGE ?=
 
 .PHONY: fmt fmt-check lint test test-race vuln build build-e2e test-e2e test-crowdsec test-openziti test-docker verify bench-scale-small bench-scale-large bench-native-scale-small bench-native-scale-large
-.PHONY: release-tools package package-fixtures test-package test-systemd test-release
+.PHONY: release-tools support-tools support-check package package-fixtures test-package test-systemd test-release
 
 fmt:
 	@files="$$($(GO_SOURCES))" || exit $$?; \
@@ -118,6 +119,17 @@ release-tools: $(RELEASE_TOOLS)/goreleaser $(RELEASE_TOOLS)/syft
 
 $(RELEASE_TOOLS)/goreleaser $(RELEASE_TOOLS)/syft &: scripts/install-release-tools.sh
 	scripts/install-release-tools.sh "$(RELEASE_TOOLS)"
+
+support-tools: $(SUPPORT_TOOLS)/actionlint $(SUPPORT_TOOLS)/shellcheck
+
+$(SUPPORT_TOOLS)/actionlint $(SUPPORT_TOOLS)/shellcheck &: scripts/install-support-tools.sh
+	scripts/install-support-tools.sh "$(SUPPORT_TOOLS)"
+
+support-check: support-tools release-tools
+	"$(SUPPORT_TOOLS)/shellcheck" scripts/install-release-tools.sh scripts/install-support-tools.sh packaging/scripts/*.sh
+	"$(SUPPORT_TOOLS)/actionlint" -shellcheck="$(SUPPORT_TOOLS)/shellcheck" .github/workflows/*.yml
+	"$(RELEASE_TOOLS)/goreleaser" check
+	$(MAKE) --no-print-directory test-release
 
 package: release-tools
 	PATH="$(RELEASE_TOOLS):$$PATH" goreleaser check

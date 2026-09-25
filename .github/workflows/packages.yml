@@ -13,14 +13,24 @@ on:
         type: string
         default: package-dist
 
+    outputs:
+      candidate-artifact-name:
+        description: Exact artifact name containing the built and tested candidate assets.
+        value: ${{ jobs.build.outputs.candidate-artifact-name }}
+      upgrade-artifact-name:
+        description: Exact artifact name containing the paired upgrade fixture.
+        value: ${{ jobs.build.outputs.upgrade-artifact-name }}
 permissions:
   contents: read
 
 jobs:
   build:
     runs-on: ubuntu-26.04
+    timeout-minutes: 90
     outputs:
       version: ${{ steps.candidate.outputs.version }}
+      candidate-artifact-name: ${{ steps.candidate.outputs.candidate-artifact-name }}
+      upgrade-artifact-name: ${{ steps.candidate.outputs.upgrade-artifact-name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,7 +38,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.27.1'
+          go-version-file: go.mod
           check-latest: false
       - name: Install checksum-pinned GoReleaser and Syft
         run: |
@@ -50,6 +60,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           PRERELEASE: ${{ inputs.prerelease }}
           GORELEASER_CURRENT_TAG: ${{ inputs.version }}
+          ARTIFACT_PREFIX: ${{ inputs.artifact-name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -58,20 +69,24 @@ jobs:
             goreleaser release --snapshot --clean --skip=publish
           else
             if [[ "$PRERELEASE" == true ]]; then
-              git tag "$VERSION" "$GITHUB_SHA"
+              python3 scripts/release-metadata.py --ensure-candidate-tag "$VERSION" "$GITHUB_SHA"
             fi
             goreleaser release --clean --skip=publish
           fi
           python3 scripts/release-assets.py dist release-assets
-          echo "version=$(jq -er .version dist/metadata.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$(jq -er .version dist/metadata.json)"
+            echo "candidate-artifact-name=${ARTIFACT_PREFIX}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "upgrade-artifact-name=${ARTIFACT_PREFIX}-upgrade-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ inputs.artifact-name }}
+          name: ${{ steps.candidate.outputs.candidate-artifact-name }}
           path: release-assets/
           if-no-files-found: error
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ inputs.artifact-name }}-upgrade
+          name: ${{ steps.candidate.outputs.upgrade-artifact-name }}
           path: |
             dist-upgrade/*.deb
             dist-upgrade/*.rpm
@@ -80,6 +95,7 @@ jobs:
   smoke:
     needs: build
     runs-on: ubuntu-26.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -90,11 +106,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: ${{ inputs.artifact-name }}
+          name: ${{ needs.build.outputs.candidate-artifact-name }}
           path: dist
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
-          name: ${{ inputs.artifact-name }}-upgrade
+          name: ${{ needs.build.outputs.upgrade-artifact-name }}
           path: dist-upgrade
       - name: Install pinned non-native architecture emulation
         if: matrix.arch == 'arm64'
@@ -112,4 +128,4 @@ jobs:
     needs: build
     uses: ./.github/workflows/systemd.yml
     with:
-      artifact-name: ${{ inputs.artifact-name }}
+      artifact-name: ${{ needs.build.outputs.candidate-artifact-name }}

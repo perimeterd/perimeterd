@@ -541,12 +541,8 @@ func openZitiRequireBinary(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat ZITI_TEST_BINARY: %v", err)
-	}
-	if info.Mode()&0o111 == 0 {
-		t.Fatalf("ZITI_TEST_BINARY is not executable: %s", path)
+	if _, err := exec.LookPath(path); err != nil {
+		t.Fatalf("ZITI_TEST_BINARY is not executable: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

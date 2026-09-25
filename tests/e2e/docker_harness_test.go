@@ -155,12 +155,8 @@ func currentTestBinary(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("resolve current E2E test binary: %v", err)
 	}
-	info, err := os.Stat(binary)
-	if err != nil {
-		t.Fatalf("stat current E2E test binary: %v", err)
-	}
-	if info.Mode()&0o111 == 0 {
-		t.Fatalf("current E2E test binary is not executable: %s", binary)
+	if _, err := exec.LookPath(binary); err != nil {
+		t.Fatalf("current E2E test binary is not executable: %v", err)
 	}
 	return binary
 }

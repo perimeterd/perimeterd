@@ -211,15 +211,18 @@ owns acceptance and fixture requirements.
   sandboxing, restart, degraded recovery, lock preservation, and safe package
   removal. The real 75-minute startup deadline check remains opt-in.
 - Static amd64/arm64 RPM/DEB artifacts, real installation/upgrade/removal checks
-  in matching-architecture Debian/Fedora containers, SBOMs, and checksums.
+  in matching-architecture Debian/Fedora containers, checksums, and a required
+  checksum-covered SBOM for each package and the source archive.
 - Signed bare-SemVer stable-tag admission (`0.0.1`, `0.0.2`, …), automatic main
-  prereleases, and GitHub-signed provenance for the same artifacts that passed
-  the required release gates.
+  prereleases with run-scoped durable version identity, attempt-specific tested
+  artifacts, draft recovery and immutable published-release verification.
+  GitHub-signed provenance covers the artifacts that passed the required gates.
 
-The [development](development.md#version-1-verification-and-delivery-requirements)
-and [operations](operations.md) contracts own acceptance. Stable publication
-requires configured trusted public keys; actual publication and attestation
-run in GitHub Actions, not during local package builds.
+The [development](development.md#release-workflow) contract owns release
+recovery and supporting-file verification; [operations](operations.md) owns
+service acceptance. Stable publication requires configured trusted public keys;
+actual publication, attestation, and hosted rerun/provenance acceptance run in
+GitHub Actions, not during local package builds.
 
 ## Immediate next task
 

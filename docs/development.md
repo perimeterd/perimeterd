@@ -136,9 +136,9 @@ isolated packet interpreter is test-only.
 The `Makefile` is the source of truth for executable local gates and scale
 profiles. It provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`,
 `build`, `build-e2e`, `test-e2e`, `test-crowdsec`, `test-openziti`, `test-docker`,
-`verify`, and the four opt-in scale targets. Use Go 1.27.1, or enable automatic
-toolchain selection when the installed Go is older. The race target requires a
-native C compiler and enables CGO for that command.
+`support-check`, `verify`, and the four opt-in scale targets. Use the Go version
+declared in `go.mod`, or enable automatic toolchain selection when the installed
+Go is older. The race target requires a native C compiler and enables CGO.
 
 ### Correctness and build gates
 
@@ -354,11 +354,13 @@ The executable target inventory is:
 | `bench-native-scale-small` | Run the isolated small native scale profile |
 | `bench-native-scale-large` | Run the isolated large native scale profile |
 | `release-tools` | Install checksum-pinned GoReleaser and Syft into `bin/release-tools` |
+| `support-tools` | Install checksum-pinned ShellCheck and build the pinned Ubuntu-26.04-aware actionlint into `bin/support-tools` |
+| `support-check` | Run ShellCheck, actionlint (including embedded shell), `goreleaser check`, and `test-release` without formatting, package builds, VMs, or secrets |
 | `package` | Build local snapshot packages, binary/source archives, SBOMs, and checksums in `dist` |
 | `package-fixtures` | Build an older package set in `dist-upgrade` and the candidate in `dist` |
 | `test-package` | Exercise DEB/RPM installation, upgrade, validation, failed removal, and removal |
 | `test-systemd` | Run the installed package in the pinned Ubuntu QEMU VM, including the real startup deadline |
-| `test-release` | Exercise signed-tag/prerelease admission and checksum-validated asset staging with temporary Git/GPG and filesystem fixtures |
+| `test-release` | Exercise signed-tag/prerelease admission, durable metadata/tag recovery, immutable publication against an isolated API, and checksum/SBOM staging |
 
 `verify` intentionally excludes race, privileged integration, package, and
 systemd gates; those run separately. Local package verification on an amd64
@@ -371,6 +373,15 @@ make test-package PACKAGE_ARCH=arm64 PACKAGE_CONTAINER_RUNTIME=podman
 make test-systemd SYSTEMD_PACKAGE=dist
 make test-release
 ```
+
+Run `make support-check` on Linux amd64 for the lightweight supporting-file
+gate; the first invocation downloads checksum-verified tools and may need
+network access. `GOTOOLCHAIN=auto make support-check` selects the module's
+Go toolchain if the host Go is older. The installer keeps these binaries in
+`bin/`, outside the application dependency graph. To check staged real
+outputs, run `python3 scripts/release-assets.py dist /tmp/perimeterd-staged`
+with an absent destination, then compare its inventory and checksum manifest
+to `dist/`. This gate does not build packages or start VMs.
 
 The arm64 container requires QEMU/binfmt on an amd64 host; CI pins both the
 setup action and binfmt image. The systemd gate boots a SHA-256-pinned Ubuntu
@@ -397,6 +408,32 @@ enables the `gci` import-order formatter for its diff check. The pinned
 golangci-lint policy enables `govet`, `staticcheck`, `errcheck`, `revive`,
 `gosec`, and US spelling checks. `make verify` also runs module verification
 and `govulncheck`.
+
+The **release maintainer** owns atomic updates of downloaded binaries; Renovate
+updates Go modules (including `go tool` dependencies) and GitHub Actions only,
+not the downloaded binary pins below. The current manual-pin inventory is:
+
+| Download | Version/pin location | Real consumer after update |
+| --- | --- | --- |
+| GoReleaser | `scripts/install-release-tools.sh` | Fresh installer, `goreleaser check`, real package/SBOM build |
+| Syft | `scripts/install-release-tools.sh` | Fresh installer and all required real package/source SBOMs |
+| OpenZiti | `.github/workflows/ci.yml` | Verify archive layout; existing real OpenZiti gate |
+| CrowdSec binary | `.github/workflows/ci.yml` | Verify archive layout; existing integration consumer; inspect paired CrowdSec fixture version |
+| Docker Engine | `.github/workflows/ci.yml` | Verify archive layout; existing isolated Docker gate |
+| ShellCheck | `scripts/install-support-tools.sh` | Fresh installer, reported version, `make support-check` |
+| actionlint | pinned Ubuntu-26.04 PR commit and source archive SHA-256 in `scripts/install-support-tools.sh` | Fresh source build, reported version, `make support-check` |
+
+For each update, select a specific upstream version and correct Linux build
+asset; obtain upstream verification material where available. Verify
+publisher provenance or a publisher checksum using the upstream-supported
+mechanism; record the exact archive SHA-256, then update version, URL, and
+checksum **together**. Install into a fresh temporary directory and run the
+real consumer above before submitting one reviewed change. Hashing an
+unauthenticated download alone does not authenticate its publisher. Do not
+raise a version while leaving a stale checksum. The supporting actionlint
+pin tracks [upstream runner-label PR #683](https://github.com/rhysd/actionlint/pull/683)
+until an upstream release includes Ubuntu 26.04; it leaves label diagnostics
+enabled. Future checksum-aware automation is not part of this workflow.
 
 ## Opt-in scale measurements
 
@@ -701,6 +738,10 @@ and packaging matrix](#service-and-packaging).
 `.github/workflows/ci.yml` runs for pull requests targeting `main` and as a
 reusable gate of the release workflow on main pushes and stable tags:
 
+- `supporting-file gate` runs `make support-check` on pull requests and reusable
+  release CI calls. It checks package lifecycle/install shell, all workflows
+  (including embedded shell and Ubuntu 26.04 runner labels), GoReleaser config,
+  and release regressions.
 - `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
   `coverage.out`.
 - `build` runs `make build` for both `GOARCH=amd64` and `GOARCH=arm64`.
@@ -721,10 +762,13 @@ reusable gate of the release workflow on main pushes and stable tags:
   service in a systemd VM.
 
 The separate `.github/workflows/codeql.yml` scans Go for pull requests, its
-weekly schedule, and release-workflow invocations. Renovate tracks Go modules
-and GitHub Actions, including pinned development tools. Actions updates must
-retain immutable commit SHAs and refresh their human-readable release comments.
-Scale targets are opt-in, not CI gates.
+weekly schedule, and release-workflow invocations. CI, CodeQL, and package jobs
+read the Go version from `go.mod` after checkout; all executable workflow jobs
+have explicit deadlines (including the retained 120-minute systemd VM limit).
+Renovate tracks Go modules and GitHub Actions, including pinned development
+tools. Actions updates must retain immutable commit SHAs and refresh their
+human-readable release comments. Downloaded binary pins use the manual
+procedure above. Scale targets are opt-in, not CI gates.
 
 Workflow permissions are read-only by default and elevated only for a job's
 required security or artifact operation. Superseded pull-request CI and CodeQL
@@ -744,6 +788,18 @@ releases do not replace one another.
   by `-dev.RUN.gSHORTCOMMIT`; without a stable tag the base is `0.0.1`.
   Prereleases never become GitHub's latest release.
 
+The metadata job admits the ref, selects the version once, and uploads the
+immutable `release-metadata-<run_id>` Actions artifact with 90-day retention
+**before** it exposes downstream outputs. On later attempts it retrieves the
+same run's decision and checks run/repository/ref/commit/run number, then
+repeats main ancestry and stable-tag signature admission. New reachable tags
+cannot change a saved prerelease version. Missing, expired, ambiguous, invalid,
+or inaccessible metadata fails closed; an initial upload failure has not
+admitted downstream builds. After expiry/deletion or an initial failure before
+upload, use a separately admitted new release run under the normal triggers;
+neither a guessed version nor an arbitrary override recovers that run. The
+repository's Actions retention policy must permit the configured 90 days.
+
 Configure repository variable `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
 ASCII-armored OpenPGP public keys before publishing stable tags. Admission uses
 an isolated keyring, disables automatic key retrieval, checks the triggering
@@ -759,6 +815,15 @@ native E2E, real Docker/CrowdSec/OpenZiti compatibility, package lifecycle, and
 the fast systemd VM gate before publication. GoReleaser and Syft are
 checksum-pinned by `scripts/install-release-tools.sh`.
 
+Every package build attempt uploads the candidate and its paired upgrade
+fixture under names unique to the **producer's** run attempt. Architecture
+smoke, systemd, and publication consume the successful producer's exported
+artifact name; they never derive it from the consumer's attempt. A full rerun
+can rebuild different bytes without colliding with earlier uploads. A
+failed-jobs-only rerun reuses the successful producer's artifact output.
+These names and bytes must be inspected in the hosted workflow before treating
+rerun integration as verified.
+
 The release gate executes the release-artifact, architecture-coverage,
 package-smoke, systemd-sandbox, boot-and-restart, >90-second startup-activation,
 fake-clock deadline, and version-provenance checks in the
@@ -773,11 +838,36 @@ available through the opt-in full VM gate; it does not block CI publication.
 The tested artifacts—not a rebuild—are checksum-verified, attested with GitHub's
 OIDC-backed signing identity, uploaded to a draft, and then published:
 
-- two DEBs and two RPMs;
-- binary archives and SHA-256 checksums;
-- SPDX SBOMs;
-- a source archive; and
-- GitHub artifact attestations with `provenance.sigstore.json`.
+- two DEBs and two RPMs, each with an exact checksum-covered
+  `<package-name>.spdx.sbom.json`;
+- binary archives and SHA-256 `checksums.txt`;
+- the configured source archive and its exact checksum-covered
+  `<source-name>.spdx.sbom.json`; and
+- GitHub artifact attestations for every checksum-covered subject **including**
+  `checksums.txt`, in `provenance.sigstore.json` (the bundle itself is outside
+  the checksum manifest).
+
+Before publishing, the workflow stages the same checksum-covered inventory
+again. It looks up releases through the paginated authenticated release listing
+(which includes pending drafts), rejects duplicate version matches, and fetches
+the selected release by ID. A draft's tag may not yet exist remotely: for an
+admitted prerelease, the workflow checks the pending draft's exact target commit
+and existing asset bytes/provenance before creating the missing tag ref at that
+commit without force. A concurrent matching ref is reused; a different target
+fails. Stable releases still require their pre-existing signed tag, and a
+published release without a matching ref is never repaired.
+
+A rerun checks the remote tag's peeled commit and release channel, downloads
+and compares every existing checksum-covered asset byte-for-byte, and verifies
+the remote provenance against the repository, release workflow, source
+ref/commit and subject digests with `gh attestation verify`. A matching draft
+only gains missing assets and, if necessary, its prerelease ref; it stays
+private until complete. A matching published release is a verification-only
+success and does not reset an older release as latest. Wrong tags, channels,
+bytes, unexpected assets, invalid provenance, ambiguous drafts, or an
+incomplete published release fail without overwriting or deleting remote
+assets. A valid pre-existing provenance bundle is retained even when a new
+attestation uses different timestamps or serialization.
 
 The admitted version, commit, and build time are injected into
 `perimeterd version` and `perimeterd_build_info`. Local snapshot builds never

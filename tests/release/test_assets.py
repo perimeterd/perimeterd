@@ -2,6 +2,7 @@
 """Real filesystem regressions for the release asset staging boundary."""
 import hashlib
 import importlib.util
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,14 +12,26 @@ spec = importlib.util.spec_from_file_location("release_assets", SCRIPT)
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
-REQUIRED_ARTIFACTS = (
+PACKAGE_ARTIFACTS = (
     "perimeterd_1_amd64.deb",
     "perimeterd_1_arm64.deb",
     "perimeterd-1.x86_64.rpm",
     "perimeterd-1.aarch64.rpm",
-    "perimeterd_1_source.tar.gz",
-    "perimeterd_1_linux_amd64.sbom.json",
-    "perimeterd_1_linux_arm64.sbom.json",
+)
+SOURCE_ARCHIVE = "perimeterd-source-1.tar.gz"
+REQUIRED_SUBJECTS = (*PACKAGE_ARTIFACTS, SOURCE_ARCHIVE)
+REQUIRED_SBOMS = tuple(f"{name}.spdx.sbom.json" for name in REQUIRED_SUBJECTS)
+REQUIRED_ARTIFACTS = (*REQUIRED_SUBJECTS, *REQUIRED_SBOMS)
+UNRELATED_SBOMS = (
+    f"{PACKAGE_ARTIFACTS[0]}.sbom.json",
+    "unrelated-one.spdx.sbom.json",
+    "unrelated-two.spdx.sbom.json",
+    "unrelated-three.spdx.sbom.json",
+    "unrelated-four.spdx.sbom.json",
+)
+BINARY_ARCHIVES = (
+    "perimeterd_1_linux_amd64.tar.gz",
+    "perimeterd_1_linux_arm64.tar.gz",
 )
 
 
@@ -31,8 +44,14 @@ class ReleaseAssetStaging(unittest.TestCase):
         self.source.mkdir()
         self.destination = self.root / "release-assets"
 
-    def create_fixture(self, omit=()):
-        names = [name for name in REQUIRED_ARTIFACTS if name not in omit]
+    def create_fixture(self, omit=(), additional=()):
+        for path in self.source.iterdir():
+            path.unlink()
+        names = [
+            name
+            for name in (*REQUIRED_ARTIFACTS, *additional)
+            if name not in omit
+        ]
         for name in names:
             (self.source / name).write_bytes(f"synthetic artifact: {name}\n".encode())
         return names
@@ -50,7 +69,7 @@ class ReleaseAssetStaging(unittest.TestCase):
             release.stage(self.source, self.destination)
 
     def test_stages_exact_manifest_assets_and_excludes_intermediates(self):
-        names = self.create_fixture()
+        names = self.create_fixture(additional=BINARY_ARCHIVES)
         self.write_manifest(names)
         (self.source / "metadata.json").write_text("build metadata", encoding="utf-8")
         (self.source / "perimeterd").write_bytes(b"unpackaged build binary")
@@ -118,16 +137,47 @@ class ReleaseAssetStaging(unittest.TestCase):
         self.assert_rejected_by("release must contain two DEBs and two RPMs")
 
     def test_missing_source_archive_reaches_source_guard(self):
-        names = self.create_fixture(omit=("perimeterd_1_source.tar.gz",))
+        names = self.create_fixture(
+            omit=(SOURCE_ARCHIVE,),
+            additional=(
+                "other-source-archive.tar.gz",
+                "other-source-archive.tar.gz.spdx.sbom.json",
+            ),
+        )
         self.write_manifest(names)
 
         self.assert_rejected_by("release source archive missing")
 
-    def test_insufficient_sbom_coverage_reaches_sbom_guard(self):
-        names = self.create_fixture(omit=("perimeterd_1_linux_arm64.sbom.json",))
-        self.write_manifest(names)
+    def test_each_required_sbom_is_rejected_even_with_unrelated_sboms(self):
+        for index, missing in enumerate(REQUIRED_SBOMS):
+            with self.subTest(sbom=missing):
+                names = self.create_fixture(
+                    omit=(missing,),
+                    additional=UNRELATED_SBOMS,
+                )
+                self.write_manifest(names)
+                self.assertGreater(
+                    sum(name.endswith(".sbom.json") for name in names),
+                    5,
+                )
+                self.destination = self.root / f"release-assets-{index}"
 
-        self.assert_rejected_by("architecture SBOMs missing")
+                self.assert_rejected_by(
+                    re.escape(f"missing required SBOMs: {missing}")
+                )
+
+    def test_unmanifested_required_sbom_does_not_count(self):
+        missing = REQUIRED_SBOMS[0]
+        names = self.create_fixture(
+            omit=(missing,),
+            additional=UNRELATED_SBOMS,
+        )
+        self.write_manifest(names)
+        (self.source / missing).write_bytes(b"present but not checksum-covered")
+
+        self.assert_rejected_by(
+            re.escape(f"missing required SBOMs: {missing}")
+        )
 
 
 if __name__ == "__main__":

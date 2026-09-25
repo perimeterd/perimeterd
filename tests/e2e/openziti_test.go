@@ -199,12 +199,8 @@ func openZitiCrowdSecLifecycle(t *testing.T, fixture *openZitiFixture, peer *pee
 	crowdsec := filepath.Join(bindir, "crowdsec")
 	cscli := filepath.Join(bindir, "cscli")
 	for _, path := range []string{crowdsec, cscli} {
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			t.Fatalf("%s must contain %s: %v", openZitiCrowdBindirEnv, path, statErr)
-		}
-		if info.Mode()&0o111 == 0 {
-			t.Fatalf("CrowdSec prerequisite is not executable: %s", path)
+		if _, err := exec.LookPath(path); err != nil {
+			t.Fatalf("%s requires an executable at %s: %v", openZitiCrowdBindirEnv, path, err)
 		}
 	}
 	versionCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

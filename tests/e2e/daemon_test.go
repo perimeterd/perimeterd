@@ -330,12 +330,8 @@ func e2eBinary(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("resolve E2E_BINARY: %v", err)
 	}
-	info, err := os.Stat(absolute)
-	if err != nil {
-		t.Fatalf("stat E2E_BINARY: %v", err)
-	}
-	if info.Mode()&0o111 == 0 {
-		t.Fatalf("E2E_BINARY is not executable: %s", absolute)
+	if _, err := exec.LookPath(absolute); err != nil {
+		t.Fatalf("E2E_BINARY is not executable: %v", err)
 	}
 	return absolute
 }
