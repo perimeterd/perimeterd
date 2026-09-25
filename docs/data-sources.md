@@ -1,30 +1,22 @@
 # Data Sources
 
-> **Implemented status.** The RIPEstat resolver and immutable cache provide
-> static country/ASN snapshots, including release-pinned country-based RIR and
-> group expansion. Source-backed policy is implemented on both nftables and
-> iptables/ipset (legacy and nf_tables tool families). Refresh, cache, and
-> durable-recovery behavior are implemented; backend realization is specified
-> in [firewall backends](firewall-backends.md).
->
-> CrowdSec dynamic bans are also implemented on both backends, with
-> authoritative synchronization, timed overlap projection, staged reloads, and
-> renewable finite kernel leases. The supported LAPI deployment prerequisite
-> below remains mandatory. The [implementation plan](implementation-plan.md)
-> owns delivery status; [operations](operations.md#current-source-build-runtime)
-> describes source-build use and its production-security limitations.
->
-> Custom HTTP(S) text IP lists extend static snapshots without changing CrowdSec
-> authority or leases.
->
-> Named provider selectors reuse this static-source pipeline with dynamic
-> provider resolution through jsDelivr; no embedded provider catalog is required.
->
-> [Lookup source attribution](#lookup-source-attribution) explains this committed
-> evidence without initiating source requests or using desired-but-unapplied decisions.
->
-> [OpenZiti upstream transport](#openziti-upstream-transport) optionally connects
-> LAPI and custom-list clients to private services without host-wide tunneling.
+This document owns source validation, transport, cache identity, refresh, and
+fallback, plus CrowdSec synchronization, decision authority, and finite leases.
+RIPEstat, custom HTTP(S) IP lists, and dynamic named-provider feeds contribute
+static snapshots; CrowdSec supplies independent dynamic ingress bans. Both
+native backends consume these contracts.
+
+[Lookup attribution](#lookup-source-attribution) explains committed source
+evidence without fetching or treating desired-but-unapplied decisions as active.
+[Optional OpenZiti transport](#openziti-upstream-transport) changes selected
+LAPI/custom-list connections, not their authority or policy semantics.
+
+Use [configuration](configuration.md) for source settings,
+[operations](operations.md#runtime-capabilities) for deployment procedures, and
+[firewall backends](firewall-backends.md) for native realization. The
+[supported LAPI prerequisite](#supported-lapi-contract) and
+[SDK cancellation limitation](#sdk-cancellation-limitation) remain part of the
+deployment contract.
 
 ## Contents
 
@@ -393,9 +385,12 @@ secret-storage mechanism.
 
 Version-2 selector objects and manifest entries identify custom lists with
 `source_kind: "ip_list"` and `source_name` equal to the configured list name.
-Their `endpoint` is the configured URL and `api_version` is text-parser format
-`"1"`. `parameters` is empty and query-time fields are empty strings: a text
-source does not fabricate RIPEstat metadata. All-RIPEstat manifests retain
+For direct HTTP(S), version-3 records retain those identity fields and add an
+explicit `type: "direct"` transport binding; OpenZiti-bound records carry their
+private-route identity instead. See [transport identity](#transport-identity-and-saved-evidence).
+The `endpoint` is the configured URL and `api_version` is text-parser format `"1"`.
+`parameters` is empty and query-time fields are empty strings: a text source
+does not fabricate RIPEstat metadata. All-RIPEstat manifests retain
 `source: "ripestat"`; manifests containing lists use `source: "static"`. Use the
 configured URL with scheme and DNS host normalized to lowercase, preserving
 path and query bytes; redirect destinations do not replace that identity.
@@ -1161,10 +1156,9 @@ Logs omit complete prefix lists and metrics use bounded source/result labels.
 CrowdSec decisions are not persisted as secrets or authority across restart:
 startup performs a new authoritative snapshot and reconciliation.
 
-
 ## Source failure matrix
 
-The following failure behavior is implemented for both static source kinds.
+The following failure behavior applies to all implemented static source adapters.
 
 ### RIPEstat and cache (implemented)
 

@@ -1,21 +1,23 @@
 # Configuration
 
-> **Schema and policy reference.** Offline validation and the source-build
-> runtime support the fields below, including `ip_lists`, dynamic `providers`,
-> and [optional OpenZiti transport](#optional-openziti-configuration). Check the
-> [implementation plan](implementation-plan.md) and
-> [current runtime instructions](operations.md#current-source-build-runtime)
-> before using a configuration for enforcement.
+> **Schema and policy reference.** This is the version 1 YAML schema and policy
+> contract. Offline validation accepts the local document; it does not establish
+> source availability, credential usability, or runtime readiness. Release
+> qualification is described in the [README](../README.md) and
+> [development release workflow](development.md#release-workflow). For runtime
+> use, see [operations](operations.md#runtime-capabilities).
 
 This document owns the version 1 YAML schema, defaults, local validation, and
 policy semantics. Start with the annotated configuration and field table;
 policy rules, evaluation, and examples follow. [Data sources](data-sources.md)
-owns external resolution and compatibility; [firewall backends](firewall-backends.md)
-owns the kernel realization.
+owns upstream wire, resolution, cache/fallback, and transport contracts;
+[firewall backends](firewall-backends.md) owns kernel realization.
 
 The CLI default configuration path is `/etc/perimeterd/perimeterd.yaml`;
-`--config PATH` overrides it for `run` and `validate`. A source build does not
-install that path. The planned package uses it as its configuration location.
+`--config PATH` overrides it for `run` and `validate`. DEB/RPM packages install
+an example at this path; source builds do not install it. See the
+[installed layout](operations.md#installed-layout).
+
 The runtime defaults state and prefix caches to `/var/lib/perimeterd` and
 creates missing directories when invoked as root. Parsing accepts exactly one
 YAML document. Each schema-defined mapping rejects unknown and duplicate

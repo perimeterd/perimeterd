@@ -1,38 +1,48 @@
 # Operations
 
 This document owns operator procedures, process startup/shutdown, service
-integration, and observability. [Configuration](configuration.md) owns fields
-and policy semantics; [architecture](architecture.md) owns revision admission,
-durable commit, and recovery; [firewall backends](firewall-backends.md) owns
-native kernel behavior. The [implementation plan](implementation-plan.md) is
-authoritative for delivery status.
+integration, observability, and package lifecycle. [Configuration](configuration.md)
+owns YAML fields and policy semantics; [data sources](data-sources.md) owns
+upstream wire, cache/fallback, and transport contracts; [architecture](architecture.md)
+owns revision admission, durable commit, and recovery; [firewall backends](firewall-backends.md)
+owns native kernel behavior.
 
-> **Status boundary.** Source builds and packaged installations support the
-> documented runtime features. Building from source does not install the systemd
-> unit or tmpfiles payload. Release publication is gated by the executable
-> checks described in [development](development.md#release-workflow); a local
+> **Status boundary.** The runtime capabilities below are available to source
+> builds and packaged installations. Building from source does not install the
+> systemd unit or tmpfiles payload. Feature availability is separate from release
+> qualification; see the [README](../README.md) and
+> [development release workflow](development.md#release-workflow). A local
 > package build alone is not release qualification.
 
 ## Contents
 
-- [Current source-build runtime](#current-source-build-runtime)
-- [Custom IP list operations](#custom-ip-list-operations)
-- [Named provider operations](#named-provider-operations)
-- [OpenZiti operations](#openziti-operations)
+- Runtime and service
+  - [Runtime capabilities](#runtime-capabilities)
+  - [Source-build prerequisites](#source-build-prerequisites)
+  - [Build, validate, and run from source](#build-validate-and-run-from-source)
+  - [Operator sequence](#operator-sequence)
+    - [Prerequisites](#prerequisites)
+    - [Configure and validate](#configure-and-validate)
+    - [Start and check health](#start-and-check-health)
+    - [Reload, recover, and cleanup](#reload-recover-and-cleanup)
+  - [Supported CrowdSec LAPI prerequisite](#supported-crowdsec-lapi-prerequisite)
+  - [Lifecycle lock and recovery](#lifecycle-lock-and-recovery)
+- Upstream operations
+  - [Custom IP list operations](#custom-ip-list-operations)
+  - [Named provider operations](#named-provider-operations)
+  - [OpenZiti operations](#openziti-operations)
 - [IP/CIDR lookup](#ipcidr-lookup)
-- [Operator sequence](#operator-sequence)
-- [Supported CrowdSec LAPI prerequisite](#supported-crowdsec-lapi-prerequisite)
-- [Lifecycle lock and recovery](#lifecycle-lock-and-recovery)
-- [Installed layout](#installed-layout)
-- [systemd service contract](#systemd-service-contract)
-- [Prometheus metrics](#prometheus-metrics)
-- [Logging](#logging)
+- Installed service and observability
+  - [Installed layout](#installed-layout)
+  - [systemd service contract](#systemd-service-contract)
+  - [Prometheus metrics](#prometheus-metrics)
+  - [Logging](#logging)
 - [Packages](#packages)
-- [Package lifecycle](#package-lifecycle)
+  - [Package lifecycle](#package-lifecycle)
 
-## Current source-build runtime
+## Runtime capabilities
 
-The current binary implements:
+The runtime supports:
 
 - strict offline `validate` and `version` commands;
 - `run` and `cleanup` under one process-lifetime ownership lock;
@@ -40,11 +50,15 @@ The current binary implements:
   nf_tables iptables tool families;
 - direct global address lists and RIPEstat country/ASN snapshots, with local
   RIR and built-in/custom group expansion;
-- immutable source snapshots, refresh, cache fallback, durable revision/journal
-  recovery, backend and target migration, and custom iptables attachments;
+- reusable HTTP(S) custom IP-list sources and dynamically resolved named-provider
+  feeds, with immutable snapshots, refresh, and cache fallback;
+- selected per-upstream OpenZiti transport for custom lists and CrowdSec;
+- durable revision/journal recovery, backend and target migration, and custom
+  iptables attachments;
 - CrowdSec ingress bans with authoritative synchronization, expiry, renewable
   kernel leases, and staged credential/endpoint replacement;
 - explicit Docker `DOCKER-USER` bridge attachments with pre-DNAT port matching;
+- read-only IP/CIDR lookup with source explanations;
 - backend-owned native processed and terminal-denial counters; and
 - the [Prometheus metrics](#prometheus-metrics) surface, collected in memory.
 
@@ -52,15 +66,15 @@ Docker coexistence is verified for Docker Engine 29.8.1's iptables bridge
 backend with both iptables tool families and IPv4/IPv6. Docker's native nftables
 backend, rootless networking, and Swarm are outside that verified scope.
 See the [Docker attachment contract](firewall-backends.md#docker-docker-user-attachment).
-Offline validation accepts `ip_lists` definitions and include/exclude selectors.
-`configs/perimeterd.yaml` includes an unreferenced example source, which causes
-no network access until an enabled policy references it.
+`configs/perimeterd.yaml` includes an unreferenced custom-list source, which
+causes no request until an enabled policy references it. Provider feeds likewise
+resolve only for enabled policy references; see the [source contracts](data-sources.md).
 
 ### Source-build prerequisites
 
-Build with Go `1.27.1` (the version declared by `go.mod`) and run on Linux as
-root. Use a disposable VM or isolated network namespace; never test policy
-against the development host's firewall.
+Build with the Go version declared in [`go.mod`](../go.mod), then run the daemon
+on Linux as root. Use a disposable VM or isolated network namespace; never test
+policy against the development host's firewall.
 
 Install the native tools for the selected backend before `run`:
 
@@ -89,12 +103,15 @@ ports. Perimeterd does not create Docker chains, permit services on behalf of
 Docker, or watch Docker lifecycle events. Preserve its tagged jumps when another
 manager edits the parent chain.
 
-A source-backed policy needs network access to the fixed RIPEstat endpoints on
-its first resolution unless an acceptable committed snapshot covers every
-required selector. Configurations with neither geo selectors nor CrowdSec make
-no source requests.
+Enabled policies using countries, RIRs, groups, or ASNs need access to RIPEstat
+on first resolution unless an acceptable committed snapshot covers each
+required selector. Enabled references to custom lists or providers need access
+to their source endpoints unless acceptable matching committed snapshots cover
+the required sources.
+Installations with no enabled source-backed selectors and
+`crowdsec.enabled: false` make no source requests.
 
-### Build, validate, and run
+### Build, validate, and run from source
 
 Build the source tree, then validate and run the same complete configuration.
 `run` and `validate` accept `--config PATH`; when omitted, both use
@@ -103,17 +120,18 @@ Build the source tree, then validate and run the same complete configuration.
 ```sh
 make build
 CONFIG=/etc/perimeterd/perimeterd.yaml
-bin/perimeterd validate --config "$CONFIG"
+sudo bin/perimeterd validate --config "$CONFIG"
 sudo bin/perimeterd run --config "$CONFIG"
 ```
 
-`validate` is local-only: it parses one YAML document and performs schema and
-semantic checks without reading credentials, resolving selectors, contacting
-RIPEstat or CrowdSec, binding the metrics listener, or touching firewall state.
-It does not require root, but the selected file must be readable. A successful
-validation therefore does not prove that source data, credentials, LAPI
-compatibility, or native backend tools are available. Only `run` synchronizes
-and enforces source-backed or CrowdSec decisions.
+`validate` is local-only and does not require root; this example uses `sudo`
+because the configuration is kept root-readable only. It does not resolve
+selectors, read credentials, contact RIPEstat or CrowdSec, bind the metrics
+listener, or touch firewall state. Success establishes local schema and
+semantic validity, not runtime readiness. See
+[configuration validation phases](configuration.md#validation-phases) for the
+complete validation/runtime boundary. Only `run` synchronizes and enforces
+source-backed or CrowdSec decisions.
 
 The default persistent paths are `/var/lib/perimeterd` for revisions, journals,
 and immutable prefix snapshots, and `/run/perimeterd/owner.lock` for the
@@ -298,8 +316,8 @@ owns coherent state publication, transport, security, and resource bounds.
 
 ### Query input and scope
 
-**Implemented source-build command.** `lookup` queries the running daemon; it
-does not compile the current YAML or contact sources itself.
+`lookup` is available in packaged and source-built binaries. It queries the
+running daemon; it does not compile the current YAML or contact sources itself.
 
 ```text
 perimeterd lookup IP_OR_CIDR
@@ -410,19 +428,23 @@ permits a saved configuration or manifest to impersonate live authority.
 
 ## Operator sequence
 
-This is the current source-build runbook. It does not assume a package,
-installed systemd unit, tmpfiles payload, or automatic service startup.
+This runbook covers both source-built and packaged installations. Source-build
+commands assume no installed systemd unit or tmpfiles payload; package installs
+use the service instructions below.
 
 ### Prerequisites
 
-1. Build the binary and install the selected backend tools listed in
-   [Source-build prerequisites](#source-build-prerequisites).
+1. For a source build, build the binary and install selected backend tools
+   listed in [Source-build prerequisites](#source-build-prerequisites).
+   Packages declare their backend alternatives.
 2. Use a disposable VM or isolated network namespace. Verify that configured
    iptables parent chains already exist.
 3. Write the complete configuration as root with mode `0600`. Keep credentials
    outside the YAML in root-owned files with mode `0600`.
-4. Run the `validate` command from [Build, validate, and run](#build-validate-and-run).
-   It checks only the local document and does not attest runtime prerequisites.
+4. Run the local `validate` command using the built or installed binary. The
+   process must be able to read the private configuration; `validate` itself
+   does not require root and does not attest runtime prerequisites. See
+   [Build, validate, and run from source](#build-validate-and-run-from-source).
 
 ### Configure and validate
 
@@ -445,17 +467,36 @@ active enforcement.
 
 ### Start and check health
 
-Start with the `run` command shown in
-[Build, validate, and run](#build-validate-and-run), in the foreground, and
-watch its stdout/stderr. If `metrics.listen` is non-empty, the listener binds
-before the first firewall commit; its default is loopback-only `127.0.0.1:2112`.
-A bind failure prevents startup readiness. `GET /metrics` is unauthenticated,
-so expose a non-loopback address only behind suitable network access control.
+For a source build, start with the `run` command in
+[Build, validate, and run from source](#build-validate-and-run-from-source), in
+the foreground, and watch stdout/stderr.
+
+For a packaged installation, first validate the configured file, then start
+and inspect the service:
+
+```sh
+sudo /usr/bin/perimeterd validate --config /etc/perimeterd/perimeterd.yaml
+sudo systemctl start perimeterd.service
+sudo systemctl status perimeterd.service
+sudo journalctl -u perimeterd.service -f
+```
+
+Package installation does not enable or start the service. To start it at boot,
+run `sudo systemctl enable perimeterd.service` after reviewing the configuration
+and runtime prerequisites.
+With either installation, if `metrics.listen` is non-empty, the listener binds
+before the first firewall commit; its default is loopback-only
+`127.0.0.1:2112`. A bind failure prevents startup readiness. `GET /metrics` is
+unauthenticated, so expose a non-loopback address only behind suitable network
+access control.
 
 The current endpoint emits `perimeterd_enforcement_health`,
-`perimeterd_crowdsec_connected`, and, for an active source-backed revision,
-`perimeterd_prefix_snapshot_timestamp_seconds{source="ripestat"}`. The latter
-is the oldest required selector retrieval time, not manifest publication time.
+`perimeterd_crowdsec_connected`, and
+`perimeterd_prefix_snapshot_timestamp_seconds{source}` for each required static
+source kind. Each timestamp is the oldest retrieval time for that kind, not
+manifest publication time; see the [Prometheus metrics](#prometheus-metrics)
+contract for all series and labels.
+
 The CrowdSec gauge is zero when disabled or awaiting valid synchronization;
 LAPI unavailability does not extend retained decisions. The endpoint also exports
 the full [Prometheus metrics](#prometheus-metrics) surface, including sampled
@@ -464,17 +505,22 @@ are in [Packet and byte accounting](firewall-backends.md#packet-and-byte-account
 
 ### Reload, recover, and cleanup
 
-1. Edit a complete configuration and send `SIGHUP` to the foreground process.
+1. Edit a complete configuration and send `SIGHUP` to a foreground
+   source-built process, or run `sudo systemctl reload perimeterd.service` for
+   a package installation. The packaged unit sends `SIGHUP`.
 2. If resolution, compilation, preflight, apply, or durable publication fails,
    keep the active revision and inspect structured logs. Do not delete state to
    force a reload.
 3. If enforcement becomes unhealthy, stop ordinary changes. Preserve the
    journal, active record, revisions, source manifests, and ownership metadata;
-   restart `run` and let recovery proceed, or invoke explicit cleanup only
-   after stopping the daemon.
-4. For intentional decommissioning, stop the process, confirm it is inactive,
-   run `sudo bin/perimeterd cleanup`, and purge state only after cleanup reports
-   success.
+   restart the source-built `run` process or the packaged service and let
+   recovery proceed, or invoke explicit cleanup only after stopping the daemon.
+4. For intentional decommissioning, stop the process or service, confirm it is
+   inactive, and run `cleanup` with the source-built or installed binary
+   (`sudo bin/perimeterd cleanup` or `sudo /usr/bin/perimeterd cleanup`). Package
+   removal performs this cleanup through its
+   [lifecycle procedure](#package-lifecycle). Purge state only after cleanup
+   reports success.
 
 Backend-specific mixed-family windows, migration overlap, retained ownership,
 and degraded recovery are defined in
@@ -483,11 +529,10 @@ and degraded recovery are defined in
 
 ## Supported CrowdSec LAPI prerequisite
 
-**Implemented source-build integration.** CrowdSec LAPI v1.8.1 is the
-supported baseline and uses its normal chunked decision stream; no feature-flag
-change or older-server pin is required. The wire protocol, synchronization,
-expiry, and lease details belong to the [supported LAPI
-contract](data-sources.md#supported-lapi-contract).
+CrowdSec LAPI v1.8.1 is the supported baseline and uses its normal chunked
+decision stream; no feature-flag change or older-server pin is required. The
+wire protocol, synchronization, expiry, and lease details belong to the
+[supported LAPI contract](data-sources.md#supported-lapi-contract).
 
 Register a bouncer in that LAPI deployment and store its API key in a
 root-readable file with mode `0600`. Configure `crowdsec.enabled: true`,
@@ -798,7 +843,6 @@ gh attestation verify perimeterd_0.0.1-1_amd64.deb --repo perimeterd/perimeterd
 ```
 
 The release includes the signed provenance bundle for offline retention.
-Development prereleases are built from main and are not stable releases.
 
 ## Package lifecycle
 

@@ -11,12 +11,13 @@ responsible for permitting services and ports.
 > Publication requires the complete operational and release gates.
 > **This is not yet a production-ready security control.**
 
-The [implementation plan](docs/implementation-plan.md) tracks completed
-milestones and remaining release gates.
+Release qualification is defined by the [verification matrix](docs/development.md#verification-matrix)
+and [release workflow](docs/development.md#release-workflow), not by feature completion.
 
 ## Try the configuration validator
 
-Build with Go 1.27.1; automatic toolchain selection also works with an older Go:
+Use the Go version declared in [`go.mod`](go.mod); automatic toolchain selection
+also works with an older Go:
 
 ```sh
 GOTOOLCHAIN=auto make build
@@ -27,13 +28,13 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 Validation requires neither root nor network access. It checks local syntax and
 semantics, not source availability or kernel enforcement. Root-only `run`,
 `cleanup`, and daemon-backed [lookup](docs/operations.md#ipcidr-lookup) are
-available for the [current runtime](docs/operations.md#current-source-build-runtime).
+available for the [runtime capabilities](docs/operations.md#runtime-capabilities).
 Try enforcement only in a disposable VM or isolated network namespace. See
 [development](docs/development.md#local-commands) for verification commands.
 
-## First-release contract
+## Capabilities
 
-Version 1 targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
+The runtime targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
 RIPEstat-derived geographic/ASN policy, custom HTTP(S) text IP lists in policy
 include/exclude selectors with per-list refresh intervals, direct provider IDs
 resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
@@ -44,19 +45,19 @@ remains the default, with no Ziti prerequisite. Prometheus observability,
 systemd/tmpfiles integration, amd64/arm64 DEB/RPM packaging, and signed release
 automation are implemented.
 
-The documents below own the detailed contracts. The implementation plan records
-which parts are implemented; source-build commands do not imply installed
-services or release artifacts.
+The documents below own the detailed contracts. Source-build commands do not
+install services or packages; see the [installed layout](docs/operations.md#installed-layout)
+for package contents and [release workflow](docs/development.md#release-workflow)
+for publication requirements.
 
 ## Documentation
 
-Start with [operations](docs/operations.md#current-source-build-runtime) to try
+Start with [operations](docs/operations.md#runtime-capabilities) to try
 enforcement, or [development](docs/development.md#local-commands) to build and
 verify changes.
 
 | Document | Canonical scope |
 | --- | --- |
-| [Implementation plan](docs/implementation-plan.md) | Milestone status, remaining gates, and next work |
 | [Architecture](docs/architecture.md) | Component boundaries, writer ownership, revision admission, commit, recovery, and applied-state lookup |
 | [Configuration](docs/configuration.md) | YAML schema, defaults, validation, policy semantics, and examples |
 | [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
@@ -69,11 +70,8 @@ rather than define a second algorithm.
 
 ## Design lineage and licensing
 
-The existing [MIT license](LICENSE) is authoritative. The project takes
-behavior-level inspiration from
-[geoip-shell](https://github.com/friendly-bits/geoip-shell), whose GPL-3.0
-source must not be copied into this MIT-licensed repository. The MIT-licensed
-[CrowdSec firewall bouncer](https://github.com/crowdsecurity/cs-firewall-bouncer)
-and [Go CrowdSec bouncer client](https://github.com/crowdsecurity/go-cs-bouncer)
-may be reused subject to dependency review and preservation of required
-copyright and license notices.
+The project is [MIT-licensed](LICENSE). It takes behavior-level inspiration from
+[geoip-shell](https://github.com/friendly-bits/geoip-shell), whose GPL-3.0 source
+must not be copied into this repository. See
+[license discipline](docs/development.md#license-discipline) for dependency reuse
+and notice requirements.

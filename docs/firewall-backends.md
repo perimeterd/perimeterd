@@ -6,12 +6,6 @@ and policy evaluation; [architecture](architecture.md) owns admission, durable
 publication, recovery, and the cross-target migration algorithm;
 [operations](operations.md) owns procedures and observability.
 
-> **Status boundary.** Static source-backed policy, CrowdSec dynamic bans, both
-> native backends, target migration, custom attachments, Docker iptables bridge
-> coexistence, and native accounting objects are implemented. Aggregated counter
-> collection/export remains planned. The Docker support boundary is defined
-> [below](#docker-docker-user-attachment).
-
 ## Contents
 
 - [Common invariants](#common-invariants)
@@ -124,16 +118,13 @@ executed on that traversal. It is classified by `global_blocklist`,
 `crowdsec`, or `geo_policy`, and by `drop` or `reject`. Intermediate
 match/jump counters and terminal rules that were not executed are not included;
 a generated rejection response is not another denied packet.
-Backends retain raw native counters for ownership inspection; iptables inventory
-reads machine-oriented `iptables-save --counters`/
-`ip6tables-save --counters`, while nftables validates counter objects and
-ownership. The source build does not aggregate or export the planned
-Prometheus counter names and does not run the planned 15-second sampler.
-Operators may inspect native counters using the ownership rules below. A future
-sampler must preserve generation deltas, monotonic process totals, and
-last-good values on failed reads. Counter gaps after a crash, external rule
-replacement, or external counter reset are operational telemetry loss, not an
-audit result.
+Backends retain raw native counters for ownership inspection; nftables validates
+counter objects and ownership. [Operations](operations.md#prometheus-metrics)
+owns counter collection, aggregation, exported names, cadence, generation
+handling, and failure semantics. This includes preserving generation deltas,
+monotonic process totals, and last-good values after failed reads. Counter gaps
+after a crash, external rule replacement, or external counter reset are
+operational telemetry loss, not an audit result.
 
 ## nftables
 

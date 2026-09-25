@@ -6,12 +6,9 @@ and direct named-provider feeds through the static-source boundary. The
 [lookup boundary](#read-only-lookup-and-explanation) explains applied state
 without joining the writer or contacting sources.
 [Optional OpenZiti upstream transport](#optional-openziti-upstream-transport)
-connects selected LAPI/custom-list clients to private services. Service packaging
-and [future deployment boundaries](#future-deployment-boundaries) remain unimplemented.
-
-The [implementation plan](implementation-plan.md) owns milestone status.
-[Operations](operations.md#current-source-build-runtime) describes what can run
-from a source build today.
+connects selected LAPI/custom-list clients to private services. [Operations](operations.md#runtime-capabilities)
+documents supported runtime capabilities; [future deployment boundaries](#future-deployment-boundaries)
+are uncommitted directions.
 
 Related contracts live in [configuration](configuration.md),
 [data sources](data-sources.md), [firewall backends](firewall-backends.md),
@@ -84,7 +81,7 @@ Direct invocations create the root-owned runtime directory and lock with modes
 `0700` and `0600` when absent.
 
 The lock file is never unlinked or replaced: a new inode would allow another
-owner. Children finish before the owner releases it. The planned service/package
+owner. Children finish before the owner releases it. Any service/package
 lifecycle must preserve this boundary across stops. This lock neither replaces
 the host xtables lock nor coordinates unrelated firewall managers.
 
@@ -119,11 +116,7 @@ view for both active-target selection and prepared-journal checks. Views are not
 retained across dispatches or failure retries; durable and source-cache
 validation remain trust boundaries.
 
-Kernel packet/byte accounting is implemented; periodic collection and Prometheus
-export are planned. The collector must observe through the writer outside the
-HTTP request path, never mutate policy, and never change readiness.
-[Operations](operations.md#prometheus-metrics) owns collection cadence, failure
-handling, and process-lifetime counter semantics.
+Native accounting objects and their meanings are specified by [firewall backends](firewall-backends.md#packet-and-byte-accounting); [operations](operations.md#prometheus-metrics) owns collection, export, failure handling, and process-lifetime counter semantics. Sampling is observational: it must not mutate policy or change readiness.
 
 ### Custom IP list integration
 
@@ -681,9 +674,8 @@ The last-known-good revision remains authoritative when a candidate is unsafe:
 - A rejected reload leaves the prior revision running; apply/recovery failures
   follow the backend-specific guarantees rather than claiming universal atomicity.
 - Refresh failure retains cached prefixes and active rules. Current logs report
-  errors and the timestamp gauge reports the oldest retrieval time in the
-  committed snapshot. Richer source health metrics remain planned. The normal
-  schedule retries.
+  errors; the timestamp gauge reports the oldest retrieval time in the
+  committed snapshot. The normal schedule retries.
 
 The [CrowdSec contract](data-sources.md#crowdsec-stream) additionally
 retains failed deltas in the authoritative in-memory store and retries them
@@ -702,10 +694,11 @@ using HTTP also trusts the network path. Prefer HTTPS with normal certificate
 verification. The text-list adapter accepts addresses only, never scripts,
 includes, or remote configuration.
 
-`run` and `cleanup` require UID 0. The planned installed service adds the
-capability restrictions and systemd hardening in [operations](operations.md);
-a source build does not install that unit. Metrics are unauthenticated,
-loopback-only by default, and contain no secrets or unbounded identifiers.
+`run` and `cleanup` require UID 0. The installed service's capability
+restrictions and systemd hardening are documented in
+[operations](operations.md#systemd-service-contract); a source build does not
+install the unit. Metrics are unauthenticated, loopback-only by default, and
+contain no secrets or unbounded identifiers.
 
 ## Future deployment boundaries
 
@@ -724,5 +717,4 @@ cluster operator.
 That is not a committed backend or deployment topology. Before implementation,
 define ownership, revision switching, CrowdSec representation, required Cilium
 capabilities, chart values, and Kubernetes RBAC. A cluster controller versus
-node-local DaemonSet is a later requirements decision. Add `build/package/` and
-`charts/perimeterd/` only with working artifacts, not placeholder directories.
+node-local DaemonSet is a later requirements decision.

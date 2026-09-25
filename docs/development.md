@@ -1,12 +1,13 @@
 # Development
 
-This document maps the current implementation and executable verification gates,
-then defines the full version-1 verification and delivery requirements. The
-[implementation plan](implementation-plan.md) is authoritative for milestone
-status; a requirement below does not imply that its integration or CI job exists.
+This document owns contributor commands, verification requirements, CI, and
+release qualification. Runtime procedures belong to [operations](operations.md);
+configuration, source, and backend contracts belong to their reference documents.
+Feature completion alone does not establish production readiness.
 
-The Go module pins Go 1.27.1; see the official
-[Go release history](https://go.dev/doc/devel/release).
+Use the Go version declared in [`go.mod`](../go.mod), with automatic toolchain
+selection if needed. Track new work in issues with acceptance criteria linked
+to the owning reference document rather than a separate implementation plan.
 
 ## Contents
 
@@ -18,11 +19,13 @@ The Go module pins Go 1.27.1; see the official
   - [Real-LAPI gate](#real-lapi-compatibility-gate)
   - [OpenZiti gate](#real-openziti-transport-gate)
 - [Opt-in scale measurements](#opt-in-scale-measurements)
-- [Version 1 verification and delivery requirements](#version-1-verification-and-delivery-requirements)
 - [Verification matrix](#verification-matrix)
-- [Privileged end-to-end suite](#privileged-end-to-end-suite)
 - [Pull-request and branch CI](#pull-request-and-branch-ci)
 - [Release workflow](#release-workflow)
+  - [Channels and signing](#channels-and-signing)
+  - [Durable identity and reruns](#durable-identity-and-reruns)
+  - [Required gates and release assets](#required-gates-and-release-assets)
+  - [Publication and recovery](#publication-and-recovery)
 - [License discipline](#license-discipline)
 
 ## Current repository layout
@@ -36,6 +39,7 @@ internal/config/catalog/      checked-in country/group/RIR catalogs and ASN vali
 internal/crowdsec/            bounded LAPI adapter, authoritative store and timed projection
 internal/lookup/              pure applied-state evaluation, attribution and private query transport
 internal/policy/              immutable snapshots and backend-neutral compiler
+internal/metrics/             bounded-label instrumentation and native counter accumulation
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
 internal/source/              RIPEstat, text-list/provider resolution and immutable cache
@@ -44,9 +48,18 @@ internal/upstream/            identity capture, bounded SDK admission and servic
 configs/perimeterd.yaml       annotated complete configuration example
 .github/workflows/ci.yml      quality, build, unit/race, native firewall, Docker, LAPI and Ziti gates
 .github/workflows/codeql.yml  Go security analysis
-tests/e2e/                   native namespace fixtures and runtime/recovery scenarios
-tests/crowdsec/              pinned real-LAPI streaming compatibility gate
-docs/                         design contracts, current operations and implementation plan
+.github/workflows/packages.yml package builds, architecture smoke and reusable systemd gate
+.github/workflows/systemd.yml installed-service VM gate
+.github/workflows/release.yml version admission, gated publication and rerun recovery
+.goreleaser.yaml              binary, package, archive, checksum and SBOM definitions
+packaging/                   systemd/tmpfiles payloads and package lifecycle scripts
+scripts/                     pinned tool installation and release admission/publication helpers
+tests/e2e/                    native namespace, Docker, OpenZiti and runtime/recovery scenarios
+tests/crowdsec/               pinned real-LAPI streaming compatibility gate
+tests/packaging/              matching-architecture package lifecycle checks
+tests/systemd/                installed-service acceptance in a disposable VM
+tests/release/                release identity, publication and asset-admission regressions
+docs/                         design contracts, operations and contributor guidance
 .golangci.yml                 lint/format policy
 Makefile                      local and CI entry points
 ```
@@ -100,19 +113,6 @@ The most useful file boundaries when changing an existing path are:
   acceptance scenarios and fixture machinery (`openziti_test.go`,
   `openziti_harness_test.go`), and failure injection (`crash_test.go`).
 
-### Operational delivery
-
-- `internal/metrics/`: bounded-label Prometheus instrumentation and native
-  counter accumulation.
-- `packaging/`: installed systemd/tmpfiles payloads and package lifecycle scripts.
-- `tests/packaging/` and `tests/systemd/`: real package and installed-service gates.
-- `.goreleaser.yaml`, `scripts/release-*.py`, and reusable GitHub workflows:
-  tested artifact construction, version admission, checksums, and publication.
-
-No `pkg/` tree exists until a real supported public Go API exists. Future
-container/Helm delivery adds `build/package/` and `charts/perimeterd/` only
-when those artifacts are implemented, not as empty placeholders.
-
 ## Pure compiler API
 
 `internal/policy` is the backend-neutral compiler seam. It consumes normalized
@@ -133,10 +133,9 @@ isolated packet interpreter is test-only.
 
 ## Local commands
 
-The `Makefile` is the source of truth for executable local gates and scale
-profiles. It provides `fmt`, `fmt-check`, `lint`, `vuln`, `test`, `test-race`,
-`build`, `build-e2e`, `test-e2e`, `test-crowdsec`, `test-openziti`, `test-docker`,
-`support-check`, `verify`, and the four opt-in scale targets. Use the Go version
+The [`Makefile`](../Makefile) is the source of truth for executable local gates
+and scale profiles; the [target inventory](#target-inventory-and-pinned-tools)
+summarizes their scope. Use the Go version
 declared in `go.mod`, or enable automatic toolchain selection when the installed
 Go is older. The race target requires a native C compiler and enables CGO.
 
@@ -146,6 +145,7 @@ Go is older. The race target requires a native C compiler and enables CGO.
 export GOTOOLCHAIN=auto
 make fmt
 make verify
+make support-check
 make test-race
 bin/perimeterd validate --config configs/perimeterd.yaml
 ```
@@ -170,8 +170,8 @@ defaults to `dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and
 
 `perimeterd validate` is an offline local check. It does not fetch sources or
 touch the firewall. `make verify` runs `go mod verify`, `fmt-check`, `lint`,
-`vuln`, `build`, and `test`; it intentionally excludes the race, native, Docker,
-and real-LAPI gates below.
+`vuln`, `build`, and `test`; supporting-file checks, race tests, privileged
+integration, package, and systemd gates run separately.
 
 ### Native namespace gate
 
@@ -219,6 +219,12 @@ explicit deadlines. Configuration files and readiness sockets use private,
 unique temporary directories, and table-deletion assertions require successful
 ruleset inspection plus explicit absence; command failures, timeouts, and
 malformed inspection output fail the assertion.
+
+Use the [verification matrix](#verification-matrix) for required behavior and
+the [service and packaging matrix](#service-and-packaging) for shared isolation
+requirements. Unit and source-integration tests use local HTTP servers and
+checked-in official RIPEstat responses with provenance metadata. Large synthetic
+workloads belong to the opt-in [scale measurements](#opt-in-scale-measurements).
 
 ### Real Docker coexistence gate
 
@@ -305,7 +311,7 @@ the real fixture pins OpenZiti controller/router/CLI **2.0.4** and CrowdSec
 credential is required to run a direct-only deployment. Static `linux/amd64`
 and `linux/arm64` builds remain supported.
 
-With the [native prerequisites](#privileged-end-to-end-suite) installed, provide
+With the [native prerequisites](#native-namespace-gate) installed, provide
 the pinned `ziti` executable and a directory containing the real `crowdsec` and
 `cscli` binaries (symlinks into the release archive are sufficient):
 
@@ -362,9 +368,10 @@ The executable target inventory is:
 | `test-systemd` | Run the installed package in the pinned Ubuntu QEMU VM, including the real startup deadline |
 | `test-release` | Exercise signed-tag/prerelease admission, durable metadata/tag recovery, immutable publication against an isolated API, and checksum/SBOM staging |
 
-`verify` intentionally excludes race, privileged integration, package, and
-systemd gates; those run separately. Local package verification on an amd64
-Linux build host:
+#### Package and systemd gates
+
+These gates run separately from `verify` and `support-check`.
+Local package verification on an amd64 Linux build host:
 
 ```sh
 make package-fixtures
@@ -373,6 +380,16 @@ make test-package PACKAGE_ARCH=arm64 PACKAGE_CONTAINER_RUNTIME=podman
 make test-systemd SYSTEMD_PACKAGE=dist
 make test-release
 ```
+
+The arm64 container requires QEMU/binfmt on an amd64 host; CI pins both the
+setup action and binfmt image. The systemd gate boots a SHA-256-pinned Ubuntu
+26.04 cloud image and requires QEMU, `qemu-img`, `cloud-localds`, SSH, and KVM
+when available. CI runs `tests/systemd/run.sh --fast dist`, covering real
+activation beyond 90 seconds without waiting for the 75-minute deadline. Run
+`make test-systemd SYSTEMD_PACKAGE=dist` to exercise the full deadline locally.
+`package-fixtures` refuses to overwrite an existing `dist-upgrade` fixture.
+
+#### Supporting-file gate
 
 Run `make support-check` on Linux amd64 for the lightweight supporting-file
 gate; the first invocation downloads checksum-verified tools and may need
@@ -383,13 +400,7 @@ outputs, run `python3 scripts/release-assets.py dist /tmp/perimeterd-staged`
 with an absent destination, then compare its inventory and checksum manifest
 to `dist/`. This gate does not build packages or start VMs.
 
-The arm64 container requires QEMU/binfmt on an amd64 host; CI pins both the
-setup action and binfmt image. The systemd gate boots a SHA-256-pinned Ubuntu
-26.04 cloud image and requires QEMU, `qemu-img`, `cloud-localds`, SSH, and KVM
-when available. CI runs `tests/systemd/run.sh --fast dist`, covering real
-activation beyond 90 seconds without waiting for the 75-minute deadline. Run
-`make test-systemd SYSTEMD_PACKAGE=dist` to exercise the full deadline locally.
-`package-fixtures` refuses to overwrite an existing `dist-upgrade` fixture.
+#### Tool pin maintenance
 
 Tool dependencies and exact versions are pinned in the `tool` and module
 requirements in [`go.mod`](../go.mod). Make targets invoke them with `go tool`,
@@ -521,21 +532,14 @@ exercised. Native phase timings have no performance assertions. The native
 input/inspection budgets and capacity errors are correctness boundaries, not
 implicit timing or throughput targets.
 
-## Version 1 verification and delivery requirements
-
-The following matrix is the complete release acceptance contract, not a claim
-that a local source build or individual test qualifies a release. The runtime,
-package/service integration, and release workflows implement these gates.
-The [implementation plan](implementation-plan.md) tracks delivery status.
-
 ## Verification matrix
 
-The tables below are the canonical requirements matrix, not an inventory of
-currently passing tests. Every row names a contract, a concrete behavior or
-failure boundary, and the required verification layer. Unit and fixture tests
-assert behavior or typed/model output, not
-shell-source substrings, incidental log prose, implementation call counts, or
-a specific internal function decomposition. A row may be exercised by more
+The tables below define release acceptance, not an inventory of currently passing
+tests. A source build or individual check does not qualify a release. Each row
+names a contract, a concrete behavior or failure boundary, and the required
+verification layer. Unit and fixture tests assert behavior or typed/model output,
+not shell-source substrings, incidental log prose, implementation call counts,
+or a specific internal function decomposition. A row may be exercised by more
 than one layer when the real boundary matters.
 
 ### Configuration and compiler
@@ -695,43 +699,9 @@ passing.
 | Systemd sandbox | A disposable systemd VM boots with no pre-existing xtables lock and proves the installed service reconciles both supported iptables tool variants under its actual filesystem and capability sandbox. Container payload inspection alone is not evidence that the service sandbox works. | Disposable systemd VM |
 | Boot and restart lifecycle | The VM covers install-after-boot tmpfiles provisioning, lifecycle-lock exclusion, retained runtime-directory inode across restart, ongoing degraded enforcement health, and removal failure preserving recovery state. | Disposable systemd VM |
 | Startup timeout protocol | CI's cold-start fixture takes more than `90s`, remains activating through `EXTEND_TIMEOUT_USEC`, and becomes ready only after commit. Fake-clock tests cover the overall deadline; the opt-in full VM gate verifies real 75-minute termination without losing recovery evidence. | CI fast systemd VM; unit fake-clock fixtures; opt-in full systemd VM |
-| Release artifacts | GoReleaser v2 creates static Linux binaries for `amd64` (`GOAMD64=v1`) and `arm64`, one DEB and one RPM per architecture, checksums, SBOMs, a source archive, and GitHub artifact attestations only after all gates pass. | Release workflow; matching-architecture package containers; systemd VM |
+| Release artifacts | GoReleaser v2 builds static Linux binaries for `amd64` (`GOAMD64=v1`) and `arm64`, one DEB and one RPM per architecture, checksums, required package/source SBOMs, and a source archive. Only the artifacts that pass all gates are attested and published. | Release workflow; matching-architecture package containers; systemd VM |
 | Architecture coverage | Each package is installed in a matching-architecture distribution container; pinned QEMU/binfmt runs non-native architecture containers. | Package smoke |
-| Version provenance | Signed tag-derived version, commit, and build time are injected into `perimeterd version` and `perimeterd_build_info`. Untagged branch builds may produce snapshot artifacts for CI but can never publish a release. | Release workflow; package smoke |
-
-## Privileged end-to-end suite
-
-The current `tests/e2e/` suite is the executable native boundary for direct
-global and source-backed geo policy on nftables and both iptables tool
-families. Its shared packet scenarios cover country/RIR/group/ASN selectors,
-exclusions, priority, family-empty behavior, and retained policy after source
-failure. Backend-specific scenarios cover iptables family compensation,
-crash recovery, migration, custom attachment/interface and
-original-destination matching, foreign-object preservation, nftables
-capacity, and runtime refresh/lease boundaries. CrowdSec scenarios cover
-startup synchronization, reload/restart handover, finite leases, overlap,
-native expiry, and ingress precedence.
-
-Run prerequisites and isolation through the [local commands](#local-commands);
-the verification matrix remains the authoritative list of required behavior.
-Unit and source-integration tests use local HTTP servers and checked-in
-official RIPEstat responses with provenance metadata. The opt-in native scale
-profiles own the large synthetic measurements described in
-[scale measurements](#opt-in-scale-measurements), rather than this section
-repeating their phase inventory.
-
-The real-LAPI compatibility job uses the pinned supported LAPI rather than
-fixtures, with deployment and server-source review as specified in the
-[sources and compatibility matrix](#sources-and-compatibility). It verifies
-normal chunked streaming, duplicate-prefix IDs, mapped IPv4 authority,
-incremental updates, overlap deletion, reconnect, and authoritative
-emptiness. The separate real Docker job executes the
-[Docker coexistence row](#kernel-backend-and-coexistence) through
-[`make test-docker`](#real-docker-coexistence-gate).
-
-Shared namespace, mount, fixture, cleanup, host-isolation, availability, and
-iptables-family prerequisites are the [test-isolation contract in the service
-and packaging matrix](#service-and-packaging).
+| Version provenance | Stable releases use a verified signed tag; main prereleases use their durably admitted development version. Both inject version, commit, and build time into `perimeterd version` and `perimeterd_build_info`. Local and PR snapshots do not publish releases. | Release workflow; package smoke |
 
 ## Pull-request and branch CI
 
@@ -756,7 +726,6 @@ reusable gate of the release workflow on main pushes and stable tags:
 - `real OpenZiti list and LAPI transports` provisions checksum-pinned OpenZiti
   2.0.4 and CrowdSec 1.8.1 binaries and runs `E2E_SUDO=sudo make test-openziti`
   with explicit fixture paths, covering all three native backend variants.
-
 - `packages` builds DEBs/RPMs for amd64 and arm64, checks their real lifecycle
   in matching-architecture Debian/Fedora containers, and exercises the installed
   service in a systemd VM.
@@ -778,15 +747,29 @@ releases do not replace one another.
 
 ## Release workflow
 
+### Channels and signing
+
 `.github/workflows/release.yml` has two publication channels:
 
 - A signed, canonical **bare SemVer** tag such as `0.0.1` or `0.0.2` publishes
   a stable release. `v0.0.1`, leading zeroes, and prerelease/build suffixes are
   rejected. The tagged commit must be reachable from `origin/main`.
 - Every push to `main` publishes a development prerelease after the same gates.
-  Its version is the next patch after the latest reachable stable tag, followed
+  Its version is the next patch after the highest reachable stable SemVer tag, followed
   by `-dev.RUN.gSHORTCOMMIT`; without a stable tag the base is `0.0.1`.
   Prereleases never become GitHub's latest release.
+
+Configure repository variable `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
+ASCII-armored OpenPGP public keys before publishing stable tags. Admission uses
+an isolated keyring, disables automatic key retrieval, checks the triggering
+commit and main ancestry, and verifies the annotated tag signature. For example:
+
+```sh
+git tag -s 0.0.1 -m 'Release 0.0.1'
+git push origin 0.0.1
+```
+
+### Durable identity and reruns
 
 The metadata job admits the ref, selects the version once, and uploads the
 immutable `release-metadata-<run_id>` Actions artifact with 90-day retention
@@ -800,21 +783,6 @@ upload, use a separately admitted new release run under the normal triggers;
 neither a guessed version nor an arbitrary override recovers that run. The
 repository's Actions retention policy must permit the configured 90 days.
 
-Configure repository variable `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
-ASCII-armored OpenPGP public keys before publishing stable tags. Admission uses
-an isolated keyring, disables automatic key retrieval, checks the triggering
-commit and main ancestry, and verifies the annotated tag signature. For example:
-
-```sh
-git tag -s 0.0.1 -m 'Release 0.0.1'
-git push origin 0.0.1
-```
-
-Both channels run static analysis, unit and race tests, CodeQL, privileged
-native E2E, real Docker/CrowdSec/OpenZiti compatibility, package lifecycle, and
-the fast systemd VM gate before publication. GoReleaser and Syft are
-checksum-pinned by `scripts/install-release-tools.sh`.
-
 Every package build attempt uploads the candidate and its paired upgrade
 fixture under names unique to the **producer's** run attempt. Architecture
 smoke, systemd, and publication consume the successful producer's exported
@@ -824,16 +792,18 @@ failed-jobs-only rerun reuses the successful producer's artifact output.
 These names and bytes must be inspected in the hosted workflow before treating
 rerun integration as verified.
 
-The release gate executes the release-artifact, architecture-coverage,
-package-smoke, systemd-sandbox, boot-and-restart, >90-second startup-activation,
-fake-clock deadline, and version-provenance checks in the
-[service and packaging matrix](#service-and-packaging). Those checks cover
-GoReleaser v2 outputs, matching-architecture containers and pinned QEMU/binfmt,
-installed paths and modes, dependency alternatives, configuration preservation,
-tmpfiles/systemd payloads, `perimeterd validate`, the real systemd
-filesystem/capability sandbox, pending-apply recovery, `EXTEND_TIMEOUT_USEC`,
-and version metadata. The real 75-minute stalled-startup scenario remains
-available through the opt-in full VM gate; it does not block CI publication.
+### Required gates and release assets
+
+Both channels run static analysis, unit and race tests, CodeQL, privileged
+native E2E, real Docker/CrowdSec/OpenZiti compatibility, package lifecycle, and
+the fast systemd VM gate before publication. GoReleaser and Syft are
+checksum-pinned by `scripts/install-release-tools.sh`.
+
+The [service and packaging matrix](#service-and-packaging) defines package
+installation, architecture, sandbox, restart, recovery, and version-metadata
+acceptance. The fast systemd gate verifies startup activation beyond 90 seconds
+with `EXTEND_TIMEOUT_USEC`; the real 75-minute stalled-startup scenario remains
+an explicit [full VM check](#package-and-systemd-gates), not a CI publication gate.
 
 The tested artifacts—not a rebuild—are checksum-verified, attested with GitHub's
 OIDC-backed signing identity, uploaded to a draft, and then published:
@@ -843,9 +813,11 @@ OIDC-backed signing identity, uploaded to a draft, and then published:
 - binary archives and SHA-256 `checksums.txt`;
 - the configured source archive and its exact checksum-covered
   `<source-name>.spdx.sbom.json`; and
-- GitHub artifact attestations for every checksum-covered subject **including**
+- GitHub artifact attestations for every checksum-covered file **and**
   `checksums.txt`, in `provenance.sigstore.json` (the bundle itself is outside
   the checksum manifest).
+
+### Publication and recovery
 
 Before publishing, the workflow stages the same checksum-covered inventory
 again. It looks up releases through the paginated authenticated release listing
