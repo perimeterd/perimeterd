@@ -45,11 +45,8 @@ type runtimeReservation struct {
 	prefixes    []metricspkg.PrefixCount
 }
 
-func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger, collectors ...*metricspkg.Collector) *runtimePublication {
-	publication := &runtimePublication{engine: engine, source: source, logger: logger}
-	if len(collectors) != 0 {
-		publication.collector = collectors[0]
-	}
+func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger, collector *metricspkg.Collector) *runtimePublication {
+	publication := &runtimePublication{engine: engine, source: source, logger: logger, collector: collector}
 	publication.health.Store(true)
 	return publication
 }
@@ -58,13 +55,9 @@ func (p *runtimePublication) metricsHealthy() bool {
 	return p.engine.Healthy() && p.health.Load()
 }
 
-func (p *runtimePublication) reserve(result stageResult, contexts ...context.Context) error {
+func (p *runtimePublication) reserve(result stageResult, ctx context.Context) error {
 	if p.reservation != nil {
 		return errors.New("runtime publication already has a reservation")
-	}
-	ctx := context.Background()
-	if len(contexts) != 0 && contexts[0] != nil {
-		ctx = contexts[0]
 	}
 	replace := p.active == nil || p.active.listen != result.candidate.cfg.Metrics.Listen
 	var staged *metricsServer

@@ -21,10 +21,6 @@ type metricsServer struct {
 	crowdConnected func() bool
 }
 
-func bindMetrics(listen string, health func() bool, snapshotTimestamps func() sourceTimestamps) (*metricsServer, error) {
-	return bindMetricsWithCollector(listen, health, snapshotTimestamps, metricspkg.New("dev", "unknown", "unknown"))
-}
-
 func bindMetricsWithCollector(listen string, health func() bool, snapshotTimestamps func() sourceTimestamps, collector *metricspkg.Collector) (*metricsServer, error) {
 	if listen == "" {
 		return nil, nil
@@ -35,9 +31,6 @@ func bindMetricsWithCollector(listen string, health func() bool, snapshotTimesta
 	ln, err := net.Listen("tcp", listen) // #nosec G102 -- the endpoint is explicit operator configuration.
 	if err != nil {
 		return nil, fmt.Errorf("bind metrics %q: %w", listen, err)
-	}
-	if collector == nil {
-		collector = metricspkg.New("dev", "unknown", "unknown")
 	}
 	var metrics *metricsServer
 	var timestamps func() metricspkg.PrefixTimestamps

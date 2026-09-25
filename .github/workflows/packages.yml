@@ -37,7 +37,7 @@ jobs:
       - name: Check release configuration and admission regressions
         run: |
           goreleaser check
-          python3 tests/release/test_metadata.py
+          python3 -m unittest discover -s tests/release -p 'test_*.py'
       - name: Build lower-version upgrade fixture
         env:
           SNAPSHOT_VERSION: 0.0.0-0

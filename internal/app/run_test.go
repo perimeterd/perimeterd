@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/state"
 )
 
@@ -71,7 +72,7 @@ func TestSystemdNotifyUsesUnixDatagram(t *testing.T) {
 func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 	var health atomic.Bool
 	health.Store(true)
-	metrics, err := bindMetrics("127.0.0.1:0", health.Load, nil)
+	metrics, err := bindMetricsWithCollector("127.0.0.1:0", health.Load, nil, metricspkg.New("dev", "unknown", "unknown"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 		t.Fatalf("metrics body omits build metadata: %q", body)
 	}
 
-	other, err := bindMetrics("127.0.0.1:0", health.Load, nil)
+	other, err := bindMetricsWithCollector("127.0.0.1:0", health.Load, nil, metricspkg.New("dev", "unknown", "unknown"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +126,7 @@ func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 func TestMetricsCloseAfterServeIgnoresExpectedClosedListener(t *testing.T) {
 	var health atomic.Bool
 	health.Store(true)
-	metrics, err := bindMetrics("127.0.0.1:0", health.Load, nil)
+	metrics, err := bindMetricsWithCollector("127.0.0.1:0", health.Load, nil, metricspkg.New("dev", "unknown", "unknown"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +137,7 @@ func TestMetricsCloseAfterServeIgnoresExpectedClosedListener(t *testing.T) {
 }
 
 func TestMetricsClosesRequestsWithWithheldBodies(t *testing.T) {
-	metrics, err := bindMetrics("127.0.0.1:0", func() bool { return true }, nil)
+	metrics, err := bindMetricsWithCollector("127.0.0.1:0", func() bool { return true }, nil, metricspkg.New("dev", "unknown", "unknown"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +164,7 @@ func TestMetricsClosesRequestsWithWithheldBodies(t *testing.T) {
 }
 
 func TestMetricsForcedRetirementClosesActiveRequests(t *testing.T) {
-	metrics, err := bindMetrics("127.0.0.1:0", func() bool { return true }, nil)
+	metrics, err := bindMetricsWithCollector("127.0.0.1:0", func() bool { return true }, nil, metricspkg.New("dev", "unknown", "unknown"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,14 +208,23 @@ func TestMetricsForcedRetirementClosesActiveRequests(t *testing.T) {
 
 func mustGet(t *testing.T, url string) *http.Response {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	// A returned response must remain readable until its caller is finished.
+	t.Cleanup(cancel)
 	for {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			t.Fatalf("prepare GET %s: %v", url, err)
+		}
 		// #nosec G107 -- URL comes only from this test's loopback listener.
-		response, err := http.Get(url)
+		response, err := http.DefaultClient.Do(request)
 		if err == nil {
 			return response
 		}
-		if time.Now().After(deadline) {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		if ctx.Err() != nil {
 			t.Fatalf("GET %s: %v", url, err)
 		}
 		time.Sleep(5 * time.Millisecond)

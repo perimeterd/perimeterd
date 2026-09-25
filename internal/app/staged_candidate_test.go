@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 
+	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/upstream"
 )
@@ -55,13 +56,13 @@ func TestStagedSessionSurvivesPublicationSelection(t *testing.T) {
 			sources := newSourceRuntime(store.Prefixes(), nil)
 			defer sources.close()
 			logger := newLogger(cfg, io.Discard)
-			publication := newRuntimePublication(engine, sources, logger)
+			publication := newRuntimePublication(engine, sources, logger, metricspkg.New("dev", "unknown", "unknown"))
 			defer func() {
 				if err := publication.close(); err != nil {
 					t.Error(err)
 				}
 			}()
-			if err := publication.reserve(stageResult{candidate: staged, logger: logger}); err != nil {
+			if err := publication.reserve(stageResult{candidate: staged, logger: logger}, context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			outcome, applyErr := engine.applyStaged(context.Background(), staged)

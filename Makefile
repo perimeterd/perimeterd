@@ -138,7 +138,7 @@ test-systemd:
 	tests/systemd/run.sh "$(SYSTEMD_PACKAGE)"
 
 test-release:
-	python3 tests/release/test_metadata.py
+	python3 -m unittest discover -s tests/release -p 'test_*.py'
 
 verify:
 	$(GO) mod verify

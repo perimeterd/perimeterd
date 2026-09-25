@@ -11,8 +11,48 @@ func TestStateZeroIsCanonicalEmpty(t *testing.T) {
 	if !state.Empty() {
 		t.Fatal("zero State should be empty")
 	}
-	if families := state.Families(); len(families) != 0 {
-		t.Fatalf("zero State has %d family plans", len(families))
+	if families := state.Families(); families != nil {
+		t.Fatalf("zero State Families() = %#v, want nil", families)
+	}
+	emptyState := State{families: make([]FamilyPlan, 0)}
+	if families := emptyState.Families(); families != nil {
+		t.Fatalf("empty State Families() = %#v, want nil", families)
+	}
+}
+
+func TestCloneFamiliesPreservesNilAndEmptySlices(t *testing.T) {
+	if got := CloneFamilies(nil); got != nil {
+		t.Fatalf("CloneFamilies(nil) = %#v, want nil", got)
+	}
+	if got := CloneFamilies(make([]FamilyPlan, 0)); got == nil {
+		t.Fatal("CloneFamilies(non-nil empty) returned nil")
+	}
+
+	values := []FamilyPlan{
+		{Sets: make([]PrefixSet, 0), Paths: make([]Path, 0)},
+		{Paths: []Path{{Rules: make([]Rule, 0)}}},
+		{
+			Sets: []PrefixSet{{Prefixes: make([]netip.Prefix, 0)}},
+			Paths: []Path{{Rules: []Rule{{
+				Match: Match{Traffic: Scope{
+					TCP: make([]PortRange, 0),
+					UDP: make([]PortRange, 0),
+				}},
+			}}}},
+		},
+		{},
+	}
+	cloned := CloneFamilies(values)
+	if cloned[0].Sets == nil || cloned[0].Paths == nil || cloned[1].Paths[0].Rules == nil {
+		t.Fatal("CloneFamilies collapsed non-nil empty nested slices")
+	}
+	if cloned[2].Sets[0].Prefixes == nil ||
+		cloned[2].Paths[0].Rules[0].Match.Traffic.TCP == nil ||
+		cloned[2].Paths[0].Rules[0].Match.Traffic.UDP == nil {
+		t.Fatal("CloneFamilies collapsed non-nil empty leaf slices")
+	}
+	if cloned[3].Sets != nil || cloned[3].Paths != nil {
+		t.Fatalf("CloneFamilies changed absent nested slices: %#v", cloned[3])
 	}
 }
 

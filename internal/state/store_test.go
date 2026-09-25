@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -202,38 +203,132 @@ func TestStoreRejectsMalformedVersionedMetadataAndBrokenReferences(t *testing.T)
 }
 
 func TestStorePrepareCheckpointFailuresRetainConservativeEvidence(t *testing.T) {
-	checkpoints := []string{
-		"revision:before-file-sync",
-		"revision:before-rename",
-		"revision:after-rename",
-		"revision:after-dir-sync",
-		"journal:before-file-sync",
-		"journal:before-rename",
-		"journal:after-rename",
-		"journal:after-dir-sync",
+	// Prepare publishes the immutable revision before publishing its journal.
+	// A journal becomes visible at rename; its directory-sync checkpoint only
+	// distinguishes whether that already-visible rename has been synced.
+	checkpoints := []struct {
+		name              string
+		revisionPublished bool
+		journalPublished  bool
+	}{
+		{name: "revision:before-file-sync"},
+		{name: "revision:before-rename"},
+		{name: "revision:after-rename", revisionPublished: true},
+		{name: "revision:after-dir-sync", revisionPublished: true},
+		{name: "journal:before-file-sync", revisionPublished: true},
+		{name: "journal:before-rename", revisionPublished: true},
+		{name: "journal:after-rename", revisionPublished: true, journalPublished: true},
+		{name: "journal:after-dir-sync", revisionPublished: true, journalPublished: true},
 	}
 	for _, checkpoint := range checkpoints {
-		t.Run(checkpoint, func(t *testing.T) {
-			var fired bool
+		t.Run(checkpoint.name, func(t *testing.T) {
+			injectedFailure := errors.New("injected durability uncertainty")
+			fired := 0
 			store, dir := openTestStore(t, func(name string) error {
-				if name == checkpoint && !fired {
-					fired = true
-					return errors.New("injected durability uncertainty")
+				if name == checkpoint.name {
+					fired++
+					return injectedFailure
 				}
 				return nil
 			})
 			revision := storeTestRevision(t, store, "0123456789abcdef0123456789abcdef")
-			if err := store.Prepare(nil, revision); err == nil {
-				t.Fatal("prepare succeeded through injected durability failure")
+			expectedRecord, err := encodeRecord(*revision)
+			if err != nil {
+				t.Fatalf("encode expected revision: %v", err)
 			}
-			// Failed barriers never publish an active selection. A later reader must
-			// either see the old complete state or retain evidence for recovery.
-			view, readErr := store.Read()
-			if readErr == nil && view.Active != nil {
-				t.Fatalf("failed prepare published active revision %#v", view.Active)
+			prepareErr := store.Prepare(nil, revision)
+			if !errors.Is(prepareErr, injectedFailure) {
+				t.Fatalf("prepare error = %v, want injected checkpoint failure", prepareErr)
 			}
-			if _, statErr := os.Stat(filepath.Join(dir, "owner.json")); statErr != nil {
-				t.Fatalf("owner evidence disappeared after %s: %v", checkpoint, statErr)
+			if fired != 1 {
+				t.Fatalf("checkpoint %q fired %d times, want exactly once", checkpoint.name, fired)
+			}
+
+			// JSON decoding may normalize in-memory nil/empty slices. Compare the
+			// full durable record instead of requiring struct identity.
+			assertRevision := func(source string, got *Revision) {
+				t.Helper()
+				if got == nil {
+					t.Fatalf("%s omitted the complete candidate revision", source)
+				}
+				encoded, err := encodeRecord(*got)
+				if err != nil || !bytes.Equal(encoded, expectedRecord) {
+					t.Fatalf("%s changed the candidate record: encode error %v", source, err)
+				}
+			}
+
+			expectedOwner := store.Owner()
+			assertObservedState := func(source string, observed View, observedStore *Store) {
+				t.Helper()
+				if observed.Owner != expectedOwner || observedStore.Owner() != expectedOwner {
+					t.Fatalf("%s owner evidence = view %q, store %q; want %q", source, observed.Owner, observedStore.Owner(), expectedOwner)
+				}
+				if observed.Active != nil {
+					t.Fatalf("%s selected active revision %#v after failed prepare", source, observed.Active)
+				}
+				if checkpoint.journalPublished {
+					expectedJournal := &Journal{
+						Version:           recordVersion,
+						ID:                revision.ID,
+						Operation:         "apply",
+						Phase:             "prepared",
+						Candidate:         revision.ID,
+						CandidateManifest: revision.Manifest,
+						Revisions:         []string{revision.ID},
+					}
+					if !reflect.DeepEqual(observed.Journal, expectedJournal) {
+						t.Fatalf("%s journal = %#v, want %#v", source, observed.Journal, expectedJournal)
+					}
+					if len(observed.Revisions) != 1 {
+						t.Fatalf("%s exposed %d revisions, want only the journal candidate", source, len(observed.Revisions))
+					}
+					got, ok := observed.Revisions[revision.ID]
+					if !ok {
+						t.Fatalf("%s journal does not reference candidate revision %s", source, revision.ID)
+					}
+					assertRevision(source+" journal candidate", got)
+				} else {
+					if observed.Journal != nil {
+						t.Fatalf("%s exposed journal %#v before journal publication", source, observed.Journal)
+					}
+					if len(observed.Revisions) != 0 {
+						t.Fatalf("%s exposed unreferenced revisions %#v without a journal", source, observed.Revisions)
+					}
+				}
+			}
+
+			view, err := store.Read()
+			if err != nil {
+				t.Fatalf("read after %s: %v", checkpoint.name, err)
+			}
+			assertObservedState("live read", view, store)
+
+			reopened, err := Open(dir, nil)
+			if err != nil {
+				t.Fatalf("reopen after %s with checkpoint injection disabled: %v", checkpoint.name, err)
+			}
+			reopenedView, err := reopened.Read()
+			if err != nil {
+				t.Fatalf("read reopened state after %s: %v", checkpoint.name, err)
+			}
+			assertObservedState("reopened read", reopenedView, reopened)
+
+			revisionPath := filepath.Join(dir, "revisions", revision.ID+".json")
+			if checkpoint.revisionPublished {
+				for _, observedStore := range []*Store{store, reopened} {
+					got, err := observedStore.readRevision(revision.ID)
+					if err != nil {
+						t.Fatalf("read published revision after %s: %v", checkpoint.name, err)
+					}
+					assertRevision("published candidate after "+checkpoint.name, got)
+				}
+			} else if _, err := os.Stat(revisionPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("revision file after %s: stat error = %v, want absent", checkpoint.name, err)
+			}
+			if !checkpoint.journalPublished {
+				if _, err := os.Stat(filepath.Join(dir, "journal.json")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("journal file after %s: stat error = %v, want absent", checkpoint.name, err)
+				}
 			}
 		})
 	}

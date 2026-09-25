@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/netip"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -51,9 +52,23 @@ func TestTargetSerializationAndStableCounters(t *testing.T) {
 	if err := ValidateTarget(&decoded); err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded.Counters) == 0 || len(decoded.Families) != 2 {
-		t.Fatalf("decoded target lost model: %+v", decoded)
+	if !reflect.DeepEqual(decoded.Families, first.Families) {
+		t.Fatalf("target family serialization changed model:\n got: %#v\nwant: %#v", decoded.Families, first.Families)
 	}
+
+	owner := testOwner
+	wantCounters := []CounterSpec{
+		{Name: "pd_" + owner + "_counter_v4_egress_denied_global_blocklist_drop", Family: policy.IPv4, Direction: policy.Egress, Role: policy.CounterRole{Kind: policy.Denied, Reason: policy.GlobalBlocklist, Action: policy.Drop}},
+		{Name: "pd_" + owner + "_counter_v4_egress_processed", Family: policy.IPv4, Direction: policy.Egress, Role: policy.CounterRole{Kind: policy.Processed}},
+		{Name: "pd_" + owner + "_counter_v4_ingress_denied_global_blocklist_drop", Family: policy.IPv4, Direction: policy.Ingress, Role: policy.CounterRole{Kind: policy.Denied, Reason: policy.GlobalBlocklist, Action: policy.Drop}},
+		{Name: "pd_" + owner + "_counter_v4_ingress_processed", Family: policy.IPv4, Direction: policy.Ingress, Role: policy.CounterRole{Kind: policy.Processed}},
+		{Name: "pd_" + owner + "_counter_v6_egress_processed", Family: policy.IPv6, Direction: policy.Egress, Role: policy.CounterRole{Kind: policy.Processed}},
+		{Name: "pd_" + owner + "_counter_v6_ingress_processed", Family: policy.IPv6, Direction: policy.Ingress, Role: policy.CounterRole{Kind: policy.Processed}},
+	}
+	if !reflect.DeepEqual(decoded.Counters, wantCounters) {
+		t.Fatalf("serialized target accounting identities changed:\n got: %#v\nwant: %#v", decoded.Counters, wantCounters)
+	}
+
 	cfg := config.Config{Version: 1, Global: config.GlobalConfig{Blocklist: []netip.Prefix{netip.MustParsePrefix("198.51.100.0/24")}}, Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", IPv4: true, IPv6: true, Nftables: config.NftablesConfig{Table: first.Table, Priority: -20}}}
 	model, err := policy.Compile(cfg, policy.Snapshot{})
 	if err != nil {
@@ -64,39 +79,67 @@ func TestTargetSerializationAndStableCounters(t *testing.T) {
 		t.Fatal(err)
 	}
 	if second.Generation != testGenB {
-		t.Fatalf("static model changed without generation replacement: %s", second.Generation)
+		t.Fatalf("changed static model retained generation %s", second.Generation)
 	}
-	if len(second.Counters) < len(first.Counters) {
-		t.Fatal("stable counters were discarded")
+	if !reflect.DeepEqual(second.Counters, wantCounters) {
+		t.Fatalf("static target transition changed accounting identities:\n got: %#v\nwant: %#v", second.Counters, wantCounters)
 	}
 }
 
 func TestPriorityOnlyKeepsGenerationAndBaseReplacement(t *testing.T) {
 	first := testTarget(t, testGenA)
-	candidate := *first
-	candidate.Priority = -199
-	if !sameFamilies(first.Families, candidate.Families) {
-		t.Fatal("family comparison is not deterministic")
+	cfg := config.Config{
+		Version:  1,
+		Global:   config.GlobalConfig{Blocklist: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}},
+		Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", IPv4: true, IPv6: true, Nftables: config.NftablesConfig{Table: first.Table, Priority: -199}},
+	}
+	model, err := policy.Compile(cfg, policy.Snapshot{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := BuildTarget(testOwner, testGenB, cfg, model, first)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if candidate.Generation != first.Generation {
-		t.Fatal("priority-only target changed generation")
+		t.Fatalf("priority-only target changed generation from %s to %s", first.Generation, candidate.Generation)
 	}
+	if !reflect.DeepEqual(candidate.Families, first.Families) {
+		t.Fatalf("priority-only target changed policy families:\n got: %#v\nwant: %#v", candidate.Families, first.Families)
+	}
+	if candidate.Priority != -199 {
+		t.Fatalf("candidate priority = %d, want -199", candidate.Priority)
+	}
+
 	inventory := newNFTInventory()
 	inventory.present = true
 	inventory.table = nftObject{Kind: "table", Family: "inet", Name: first.Table, Comment: tableComment(first.Owner)}
 	name := baseChainName(first, policy.Ingress)
 	inventory.chains[name] = nftObject{Kind: "chain", Family: "inet", Table: first.Table, Name: name, Comment: ownershipComment(first.Owner, stableToken, baseRole(policy.Ingress), true), Prio: first.Priority, HasPrio: true}
-	batch, err := commandBatch(&candidate, inventory, nil)
+	batch, err := commandBatch(candidate, inventory, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ := json.Marshal(batch)
-	text := string(data)
-	if !strings.Contains(text, `"delete":{"chain"`) {
-		t.Fatalf("priority replacement did not delete base chain: %s", text)
+	var deletedBase, addedBaseAtNewPriority bool
+	for _, command := range batch.Nftables {
+		if deletion, ok := command.Delete.(map[string]any); ok {
+			if chain, ok := deletion["chain"].(map[string]any); ok && chain["name"] == name {
+				deletedBase = true
+			}
+		}
+		if addition, ok := command.Add.(map[string]any); ok {
+			if chain, ok := addition["chain"].(map[string]any); ok && chain["name"] == name {
+				priority, ok := chain["prio"].(int32)
+				addedBaseAtNewPriority = ok && priority == candidate.Priority
+			}
+		}
 	}
-	if strings.Contains(text, testGenB) {
-		t.Fatal("priority replacement staged unrelated generation")
+	if !deletedBase || !addedBaseAtNewPriority {
+		t.Fatalf("priority change did not replace base chain at %d: %+v", candidate.Priority, batch)
+	}
+	data, _ := json.Marshal(batch)
+	if strings.Contains(string(data), testGenB) {
+		t.Fatal("priority replacement staged an unrelated generation")
 	}
 }
 
@@ -282,7 +325,7 @@ func TestLongGeoSetNamesAreBoundedAndSuffixSensitive(t *testing.T) {
 
 func TestGeoPolicyEligibleSetNameDoesNotAliasReservedSet(t *testing.T) {
 	target := testTarget(t, testGenA)
-	target.Families = cloneFamilies(target.Families)
+	target.Families = policy.CloneFamilies(target.Families)
 	target.Families[0].Sets = append(target.Families[0].Sets,
 		policy.PrefixSet{ID: "geo_eligible", Kind: policy.StaticSet},
 		policy.PrefixSet{ID: "geo/eligible", Kind: policy.StaticSet},
@@ -458,7 +501,7 @@ func TestRetireFlushesEntryBeforeGeneration(t *testing.T) {
 	previous := testTarget(t, testGenA)
 	candidate := *previous
 	candidate.Generation = testGenB
-	candidate.Families = []policy.FamilyPlan{cloneFamilies(previous.Families)[1]}
+	candidate.Families = []policy.FamilyPlan{policy.CloneFamilies(previous.Families)[1]}
 	candidate.Counters = desiredCounters(&candidate, nil)
 	var payload []byte
 	backend := &NFT{exec: func(_ context.Context, args []string, input []byte) ([]byte, error) {
@@ -493,7 +536,7 @@ func TestRetireDeletesCandidateOnlyCountersOnRollback(t *testing.T) {
 	previous := testTarget(t, testGenA)
 	candidate := *previous
 	candidate.Generation = testGenB
-	candidate.Families = cloneFamilies(previous.Families)
+	candidate.Families = policy.CloneFamilies(previous.Families)
 	for familyIndex := range candidate.Families {
 		for pathIndex := range candidate.Families[familyIndex].Paths {
 			for ruleIndex := range candidate.Families[familyIndex].Paths[pathIndex].Rules {

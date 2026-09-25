@@ -146,11 +146,21 @@ func peerDialTCP(t *testing.T, network, address, expectation string, timeout tim
 	if expectation == "success" {
 		t.Fatalf("TCP connection failed: %v", err)
 	}
-	if expectation == "reject" && time.Since(started) > 700*time.Millisecond {
-		t.Fatalf("reject did not fail promptly: %v", err)
+	if expectation == "drop" {
+		var networkErr net.Error
+		if !errors.As(err, &networkErr) || !networkErr.Timeout() {
+			t.Fatalf("TCP DROP produced an error instead of a timeout: %v", err)
+		}
 	}
-	if expectation == "drop" && time.Since(started) < 700*time.Millisecond {
-		t.Fatalf("drop failed too quickly: %v", err)
+	if expectation == "reject" {
+		// Both native backends reject TCP with a reset, which refuses the
+		// connect rather than timing it out or reporting a routing failure.
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Fatalf("TCP REJECT did not refuse the connection: %v", err)
+		}
+		if time.Since(started) > 700*time.Millisecond {
+			t.Fatalf("TCP REJECT did not fail promptly: %v", err)
+		}
 	}
 }
 

@@ -66,7 +66,11 @@ func NewStatic(cfg config.Config, target *firewall.Target, snapshot source.Snaps
 	if target == nil {
 		return view, nil
 	}
-	view.families = cloneFamilies(target.Families)
+	if len(target.Families) == 0 {
+		view.families = nil
+	} else {
+		view.families = policy.CloneFamilies(target.Families)
+	}
 	view.table = target.Table
 	view.buildIndexes()
 	if target.IPTables != nil {
@@ -133,32 +137,6 @@ func stringsJoin(values []string) string {
 	out := values[0]
 	for _, value := range values[1:] {
 		out += "\x00" + value
-	}
-	return out
-}
-
-func cloneFamilies(values []policy.FamilyPlan) []policy.FamilyPlan {
-	if len(values) == 0 {
-		return nil
-	}
-	out := make([]policy.FamilyPlan, len(values))
-	for i, family := range values {
-		out[i].Family = family.Family
-		out[i].Sets = make([]policy.PrefixSet, len(family.Sets))
-		for j, set := range family.Sets {
-			out[i].Sets[j] = set
-			out[i].Sets[j].Prefixes = append([]netip.Prefix(nil), set.Prefixes...)
-		}
-		out[i].Paths = make([]policy.Path, len(family.Paths))
-		for j, path := range family.Paths {
-			out[i].Paths[j] = path
-			out[i].Paths[j].Rules = make([]policy.Rule, len(path.Rules))
-			for k, rule := range path.Rules {
-				out[i].Paths[j].Rules[k] = rule
-				out[i].Paths[j].Rules[k].Match.Traffic.TCP = append([]policy.PortRange(nil), rule.Match.Traffic.TCP...)
-				out[i].Paths[j].Rules[k].Match.Traffic.UDP = append([]policy.PortRange(nil), rule.Match.Traffic.UDP...)
-			}
-		}
 	}
 	return out
 }

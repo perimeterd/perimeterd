@@ -260,3 +260,139 @@ func TestCacheCanonicalEncoding(t *testing.T) {
 		t.Fatalf("canonical bytes = %q, want %q", got, want)
 	}
 }
+
+func TestCacheLoadChecksCanonicalPayloadAfterValidContentHashes(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		malformed string
+		wantError string
+	}{
+		{name: "valid control"},
+		{name: "duplicate object key", malformed: "duplicate-object", wantError: `duplicate object key "selector"`},
+		{name: "noncanonical manifest", malformed: "noncanonical-manifest", wantError: "cache record is not canonical JSON"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache, _ := openCacheTest(t, nil)
+			snapshot, err := cache.Stage([]Record{cacheTestRecord(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))})
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifestData, err := os.ReadFile(cache.manifestPath(snapshot.ManifestID()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifest manifestFile
+			if err := json.Unmarshal(manifestData, &manifest); err != nil {
+				t.Fatal(err)
+			}
+
+			manifestID := snapshot.ManifestID()
+			switch tc.malformed {
+			case "duplicate-object":
+				objectData, err := os.ReadFile(cache.objectPath(manifest.Entries[0].Object))
+				if err != nil {
+					t.Fatal(err)
+				}
+				validSelector := `"selector":{"kind":"country","value":"US"}`
+				duplicateSelector := validSelector + `,"selector":{"kind":"country","value":"US"}`
+				malformedObject := []byte(strings.Replace(string(objectData), validSelector, duplicateSelector, 1))
+				if string(malformedObject) == string(objectData) {
+					t.Fatal("test fixture did not add a duplicate selector key")
+				}
+				objectID := digestID(malformedObject)
+				if err := os.WriteFile(cache.objectPath(objectID), malformedObject, cacheFileMode); err != nil { // #nosec G703 -- content ID and cache path belong to a private test fixture.
+					t.Fatal(err)
+				}
+				manifest.Entries[0].Object = objectID
+				updatedManifest, err := canonicalJSON(manifest)
+				if err != nil {
+					t.Fatal(err)
+				}
+				manifestID = digestID(updatedManifest)
+				if err := os.WriteFile(cache.manifestPath(manifestID), updatedManifest, cacheFileMode); err != nil {
+					t.Fatal(err)
+				}
+			case "noncanonical-manifest":
+				malformedManifest := append(append([]byte(nil), manifestData...), '\n')
+				manifestID = digestID(malformedManifest)
+				if err := os.WriteFile(cache.manifestPath(manifestID), malformedManifest, cacheFileMode); err != nil { // #nosec G703 -- content ID and cache path belong to a private test fixture.
+					t.Fatal(err)
+				}
+			}
+
+			loaded, err := cache.Load(manifestID)
+			if tc.wantError == "" {
+				if err != nil {
+					t.Fatalf("load valid content-addressed fixture: %v", err)
+				}
+				if loaded.ManifestID() != snapshot.ManifestID() || len(loaded.Records()) != 1 {
+					t.Fatalf("loaded control snapshot = %q with %d records", loaded.ManifestID(), len(loaded.Records()))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("cache admitted malformed canonical payload")
+			}
+			if !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("load error = %v, want canonical rejection containing %q", err, tc.wantError)
+			}
+			if strings.Contains(err.Error(), "content hash mismatch") || errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("load failed before the intended canonical boundary: %v", err)
+			}
+		})
+	}
+}
+
+func TestCacheLoadRevalidatesRIPERequestIdentityAfterValidHashes(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	snapshot, err := cache.Stage([]Record{cacheTestRecord(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestData, err := os.ReadFile(cache.manifestPath(snapshot.ManifestID()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest manifestFile
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	objectData, err := os.ReadFile(cache.objectPath(manifest.Entries[0].Object))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object objectFile
+	if err := json.Unmarshal(objectData, &object); err != nil {
+		t.Fatal(err)
+	}
+	object.Parameters["resource"] = "CA"
+	mutatedObject, err := canonicalJSON(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID := digestID(mutatedObject)
+	if err := os.WriteFile(cache.objectPath(objectID), mutatedObject, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Entries[0].Object = objectID
+	manifest.Entries[0].Parameters["resource"] = "CA"
+	mutatedManifest, err := canonicalJSON(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestID := digestID(mutatedManifest)
+	if err := os.WriteFile(cache.manifestPath(manifestID), mutatedManifest, cacheFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := cache.Load(manifestID); err == nil {
+		t.Fatal("cache admitted request parameters inconsistent with the selector")
+	} else {
+		if !strings.Contains(err.Error(), "selector request parameters do not match its identity") {
+			t.Fatalf("load error = %v, want selector identity rejection", err)
+		}
+		if strings.Contains(err.Error(), "content hash mismatch") || errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("load failed before request identity validation: %v", err)
+		}
+	}
+}

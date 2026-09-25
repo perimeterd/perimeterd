@@ -86,44 +86,6 @@ func cloneIPTablesAttachments(values []config.Attachment) []config.Attachment {
 	return out
 }
 
-func cloneFamilies(values []policy.FamilyPlan) []policy.FamilyPlan {
-	if values == nil {
-		return nil
-	}
-	out := make([]policy.FamilyPlan, len(values))
-	for i, family := range values {
-		out[i].Family = family.Family
-		if family.Sets != nil {
-			out[i].Sets = make([]policy.PrefixSet, len(family.Sets))
-		}
-		for j, set := range family.Sets {
-			out[i].Sets[j] = set
-			if set.Prefixes != nil {
-				out[i].Sets[j].Prefixes = append([]netip.Prefix(nil), set.Prefixes...)
-			}
-		}
-		if family.Paths != nil {
-			out[i].Paths = make([]policy.Path, len(family.Paths))
-		}
-		for j, path := range family.Paths {
-			out[i].Paths[j] = path
-			if path.Rules != nil {
-				out[i].Paths[j].Rules = make([]policy.Rule, len(path.Rules))
-			}
-			for k, rule := range path.Rules {
-				out[i].Paths[j].Rules[k] = rule
-				if rule.Match.Traffic.TCP != nil {
-					out[i].Paths[j].Rules[k].Match.Traffic.TCP = append([]policy.PortRange(nil), rule.Match.Traffic.TCP...)
-				}
-				if rule.Match.Traffic.UDP != nil {
-					out[i].Paths[j].Rules[k].Match.Traffic.UDP = append([]policy.PortRange(nil), rule.Match.Traffic.UDP...)
-				}
-			}
-		}
-	}
-	return out
-}
-
 func sameFamilies(a, b []policy.FamilyPlan) bool {
 	return reflect.DeepEqual(a, b)
 }

@@ -204,23 +204,21 @@ func recordFresh(record Record, interval time.Duration) bool {
 }
 
 func selectorTiming(cfg config.Config, selector policy.Selector) (time.Duration, time.Duration, error) {
+	var refreshInterval, requestTimeout time.Duration
 	switch selector.Kind {
 	case policy.IPList:
 		list, ok := cfg.IPLists[selector.Value]
 		if !ok {
 			return 0, 0, fmt.Errorf("source: custom list %q is not configured", selector.Value)
 		}
-		if list.RefreshInterval <= 0 || list.RequestTimeout <= 0 {
-			return 0, 0, fmt.Errorf("source: custom list %q has invalid timing", selector.Value)
-		}
+		refreshInterval, requestTimeout = list.RefreshInterval, list.RequestTimeout
 	case policy.Provider:
-		if cfg.Providers.RefreshInterval <= 0 || cfg.Providers.RequestTimeout <= 0 {
-			return 0, 0, errors.New("source: provider refresh interval and request timeout must be positive")
-		}
+		refreshInterval, requestTimeout = cfg.Providers.RefreshInterval, cfg.Providers.RequestTimeout
 	default:
-		if cfg.Geo.RefreshInterval <= 0 || cfg.Geo.RequestTimeout <= 0 {
-			return 0, 0, errors.New("source: refresh interval and request timeout must be positive")
-		}
+		refreshInterval, requestTimeout = cfg.Geo.RefreshInterval, cfg.Geo.RequestTimeout
+	}
+	if err := validateSelectorTiming(selector, refreshInterval, requestTimeout); err != nil {
+		return 0, 0, err
 	}
 	spec, err := DescribeSelector(cfg, selector)
 	if err != nil {
@@ -230,7 +228,11 @@ func selectorTiming(cfg config.Config, selector policy.Selector) (time.Duration,
 }
 
 func validSelectorTiming(selector policy.Selector, spec SelectorSpec) error {
-	if spec.RefreshInterval > 0 && spec.RequestTimeout > 0 {
+	return validateSelectorTiming(selector, spec.RefreshInterval, spec.RequestTimeout)
+}
+
+func validateSelectorTiming(selector policy.Selector, refreshInterval, requestTimeout time.Duration) error {
+	if refreshInterval > 0 && requestTimeout > 0 {
 		return nil
 	}
 	switch selector.Kind {
@@ -500,7 +502,8 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	text := selector.Kind == policy.IPList || selector.Kind == policy.Provider
 	endpoint := spec.Endpoint
 	sourceLabel := ""
-	values := url.Values{"sourceapp": {"perimeterd"}}
+	var values url.Values
+	var requestDescription ripeRequestDescription
 	route := spec.Transport
 	var binding upstream.Binding
 	switch selector.Kind {
@@ -512,11 +515,16 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		}
 	case policy.Provider:
 		sourceLabel = fmt.Sprintf("provider %q", selector.Value)
-	case policy.Country:
-		values.Set("resource", selector.Value)
-		values.Set("v4_format", "prefix")
-	case policy.ASN:
-		values.Set("resource", selector.Value[2:])
+	case policy.Country, policy.ASN:
+		requestDescription, err = ripeRequestFor(selector)
+		if err != nil {
+			return Record{}, err
+		}
+		endpoint = requestDescription.endpoint
+		values = make(url.Values, len(requestDescription.parameters))
+		for key, value := range requestDescription.parameters {
+			values.Set(key, value)
+		}
 	default:
 		return Record{}, fmt.Errorf("unsupported source selector kind %q", selector.Kind)
 	}
@@ -600,19 +608,10 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	var record Record
 	if text {
 		record, err = parseTextList(body, endpoint, selector)
+	} else if selector.Kind == policy.Country {
+		record, err = parseCountry(body, endpoint, requestDescription.apiVersion, requestDescription.parameters, selector)
 	} else {
-		params := make(map[string]string, len(values))
-		for key, list := range values {
-			if len(list) != 1 {
-				return Record{}, fmt.Errorf("request parameter %q has unexpected multiplicity", key)
-			}
-			params[key] = list[0]
-		}
-		if selector.Kind == policy.Country {
-			record, err = parseCountry(body, endpoint, params, selector)
-		} else {
-			record, err = parseASN(body, endpoint, params, selector)
-		}
+		record, err = parseASN(body, endpoint, requestDescription.apiVersion, requestDescription.parameters, selector)
 	}
 	if err != nil {
 		return Record{}, err
@@ -770,8 +769,8 @@ type countryData struct {
 	} `json:"resources"`
 }
 
-func parseCountry(body []byte, endpoint string, params map[string]string, selector policy.Selector) (Record, error) {
-	envelope, err := decodeEnvelope(body, endpointVersions[countryEndpoint], "country-resource-list")
+func parseCountry(body []byte, endpoint, apiVersion string, params map[string]string, selector policy.Selector) (Record, error) {
+	envelope, err := decodeEnvelope(body, apiVersion, "country-resource-list")
 	if err != nil {
 		return Record{}, err
 	}
@@ -823,8 +822,8 @@ type asnTimeline struct {
 	EndTime   string `json:"endtime"`
 }
 
-func parseASN(body []byte, endpoint string, params map[string]string, selector policy.Selector) (Record, error) {
-	envelope, err := decodeEnvelope(body, endpointVersions[asnEndpoint], "announced-prefixes")
+func parseASN(body []byte, endpoint, apiVersion string, params map[string]string, selector policy.Selector) (Record, error) {
+	envelope, err := decodeEnvelope(body, apiVersion, "announced-prefixes")
 	if err != nil {
 		return Record{}, err
 	}

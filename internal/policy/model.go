@@ -162,6 +162,31 @@ type FamilyPlan struct {
 	Paths  []Path
 }
 
+// CloneFamilies returns an independent deep copy of family plans while
+// preserving nil and non-nil empty slices.
+func CloneFamilies(values []FamilyPlan) []FamilyPlan {
+	if values == nil {
+		return nil
+	}
+	families := make([]FamilyPlan, len(values))
+	for i, family := range values {
+		families[i] = family
+		families[i].Sets = slices.Clone(family.Sets)
+		for j, set := range family.Sets {
+			families[i].Sets[j].Prefixes = slices.Clone(set.Prefixes)
+		}
+		families[i].Paths = slices.Clone(family.Paths)
+		for j, path := range family.Paths {
+			families[i].Paths[j].Rules = slices.Clone(path.Rules)
+			for k, rule := range path.Rules {
+				families[i].Paths[j].Rules[k].Match.Traffic.TCP = slices.Clone(rule.Match.Traffic.TCP)
+				families[i].Paths[j].Rules[k].Match.Traffic.UDP = slices.Clone(rule.Match.Traffic.UDP)
+			}
+		}
+	}
+	return families
+}
+
 // State is the immutable backend-neutral compiled policy state. Its zero value is
 // the canonical empty desired state. The compiler in this package is the only
 // production writer of its unexported family plans.
@@ -181,32 +206,7 @@ func (s State) Families() []FamilyPlan {
 	if len(s.families) == 0 {
 		return nil
 	}
-	families := make([]FamilyPlan, len(s.families))
-	for i, family := range s.families {
-		families[i].Family = family.Family
-		if family.Sets != nil {
-			families[i].Sets = make([]PrefixSet, len(family.Sets))
-		}
-		for j, set := range family.Sets {
-			families[i].Sets[j] = set
-			families[i].Sets[j].Prefixes = slices.Clone(set.Prefixes)
-		}
-		if family.Paths != nil {
-			families[i].Paths = make([]Path, len(family.Paths))
-		}
-		for j, path := range family.Paths {
-			families[i].Paths[j] = path
-			if path.Rules != nil {
-				families[i].Paths[j].Rules = make([]Rule, len(path.Rules))
-			}
-			for k, rule := range path.Rules {
-				families[i].Paths[j].Rules[k] = rule
-				families[i].Paths[j].Rules[k].Match.Traffic.TCP = slices.Clone(rule.Match.Traffic.TCP)
-				families[i].Paths[j].Rules[k].Match.Traffic.UDP = slices.Clone(rule.Match.Traffic.UDP)
-			}
-		}
-	}
-	return families
+	return CloneFamilies(s.families)
 }
 
 // GeoEligible returns the fixed, release-pinned geo-eligible prefix set for a

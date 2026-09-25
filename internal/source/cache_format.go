@@ -138,6 +138,34 @@ func canonicalRecords(records []Record) ([]Record, error) {
 	return out, nil
 }
 
+type ripeRequestDescription struct {
+	endpoint   string
+	apiVersion string
+	parameters map[string]string
+}
+
+func ripeRequestFor(selector policy.Selector) (ripeRequestDescription, error) {
+	var endpoint string
+	var parameters map[string]string
+	switch selector.Kind {
+	case policy.Country:
+		endpoint = countryEndpoint
+		parameters = map[string]string{
+			"resource": selector.Value, "sourceapp": "perimeterd", "v4_format": "prefix",
+		}
+	case policy.ASN:
+		endpoint = asnEndpoint
+		parameters = map[string]string{
+			"resource": selector.Value[2:], "sourceapp": "perimeterd",
+		}
+	default:
+		return ripeRequestDescription{}, errors.New("cache selector must be an expanded country or ASN")
+	}
+	return ripeRequestDescription{
+		endpoint: endpoint, apiVersion: endpointVersions[endpoint], parameters: parameters,
+	}, nil
+}
+
 func canonicalRecord(record Record) (Record, error) {
 	selector, err := policy.CanonicalSelector(record.Selector.Kind, record.Selector.Value)
 	if err != nil {
@@ -206,19 +234,15 @@ func canonicalRecord(record Record) (Record, error) {
 	if transport.Type != "" {
 		return Record{}, errors.New("RIPEstat transport must be direct")
 	}
-	expectedEndpoint := countryEndpoint
-	expectedParams := map[string]string{"resource": selector.Value, "sourceapp": "perimeterd", "v4_format": "prefix"}
-	if selector.Kind == policy.ASN {
-		expectedEndpoint = asnEndpoint
-		expectedParams = map[string]string{"resource": selector.Value[2:], "sourceapp": "perimeterd"}
-	} else if selector.Kind != policy.Country {
-		return Record{}, errors.New("cache selector must be an expanded country or ASN")
+	request, err := ripeRequestFor(selector)
+	if err != nil {
+		return Record{}, err
 	}
-	if record.Endpoint != expectedEndpoint || record.APIVersion != endpointVersions[expectedEndpoint] {
+	if record.Endpoint != request.endpoint || record.APIVersion != request.apiVersion {
 		return Record{}, errors.New("unsupported selector endpoint or API version")
 	}
 	parameters := cloneParameters(record.Parameters)
-	if !maps.Equal(parameters, expectedParams) {
+	if !maps.Equal(parameters, request.parameters) {
 		return Record{}, errors.New("selector request parameters do not match its identity")
 	}
 	queryStart, err := canonicalTimestamp(record.QueryStart, "query_start")

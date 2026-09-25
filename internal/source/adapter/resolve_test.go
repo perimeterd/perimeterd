@@ -79,13 +79,13 @@ func TestActualCountryAndASNResponses(t *testing.T) {
 		}
 		switch r.URL.Query().Get("resource") {
 		case "LI":
-			if r.URL.Path != "/data/country-resource-list/data.json" || r.URL.Query().Get("v4_format") != "prefix" {
+			if r.URL.Path != "/data/country-resource-list/data.json" || r.URL.RawQuery != "resource=LI&sourceapp=perimeterd&v4_format=prefix" {
 				http.Error(w, "bad country request", 400)
 				return
 			}
 			_, _ = w.Write(country)
 		case "3333":
-			if r.URL.Path != "/data/announced-prefixes/data.json" {
+			if r.URL.Path != "/data/announced-prefixes/data.json" || r.URL.RawQuery != "resource=3333&sourceapp=perimeterd" {
 				http.Error(w, "bad ASN request", 400)
 				return
 			}
@@ -97,6 +97,43 @@ func TestActualCountryAndASNResponses(t *testing.T) {
 	resolved, err := resolver.Resolve(context.Background(), sourceConfig([]string{"LI"}, []string{"AS3333"}), "", false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	records := resolved.Snapshot.Records()
+	for _, want := range []struct {
+		selector   policy.Selector
+		endpoint   string
+		apiVersion string
+		parameters map[string]string
+	}{
+		{
+			selector: policy.Selector{Kind: policy.Country, Value: "LI"},
+			endpoint: "https://stat.ripe.net/data/country-resource-list/data.json", apiVersion: "0.2",
+			parameters: map[string]string{"resource": "LI", "sourceapp": "perimeterd", "v4_format": "prefix"},
+		},
+		{
+			selector: policy.Selector{Kind: policy.ASN, Value: "AS3333"},
+			endpoint: "https://stat.ripe.net/data/announced-prefixes/data.json", apiVersion: "1.2",
+			parameters: map[string]string{"resource": "3333", "sourceapp": "perimeterd"},
+		},
+	} {
+		var found bool
+		for _, record := range records {
+			if record.Selector != want.selector {
+				continue
+			}
+			found = true
+			if record.Endpoint != want.endpoint || record.APIVersion != want.apiVersion || len(record.Parameters) != len(want.parameters) {
+				t.Fatalf("record metadata for %v = endpoint %q, version %q, parameters %#v", want.selector, record.Endpoint, record.APIVersion, record.Parameters)
+			}
+			for key, value := range want.parameters {
+				if record.Parameters[key] != value {
+					t.Fatalf("record parameter %q for %v = %q, want %q", key, want.selector, record.Parameters[key], value)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("resolved records omitted %v", want.selector)
+		}
 	}
 	for _, example := range []struct {
 		selector policy.Selector

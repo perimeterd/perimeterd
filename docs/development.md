@@ -52,9 +52,10 @@ Makefile                      local and CI entry points
 ```
 
 Ownership follows [architecture](architecture.md): `internal/app` owns
-revision admission and the serialized writer; `internal/policy` stays
-backend-neutral; source resolution and cache publication stay in
-`internal/source`; native firewall mutation stays in `internal/firewall`.
+revision admission and the serialized writer; `internal/policy` owns the
+backend-neutral model and its typed family-plan deep copy; source resolution
+and cache publication stay in `internal/source`; native firewall mutation
+stays in `internal/firewall`.
 The detailed lifecycle, source, configuration, and packet-path contracts belong
 to their canonical documents rather than this contributor guide.
 
@@ -67,10 +68,11 @@ The most useful file boundaries when changing an existing path are:
 - `internal/upstream/identity.go` and `manager.go`: validated credential capture
   and identity-generation/session lifecycle.
 - `internal/source/source.go`: shared selector metadata and active identity-profile
-  selection; `cache_format.go`: cache wire schemas and validation; `cache_json.go`:
-  canonical JSON codec (no format or behavior change); `cache.go`: filesystem storage.
-- `internal/app/publication.go`: staged metrics/listener reservations and
-  transaction-gated runtime publication.
+  selection; `resolve.go`: source timing and fetch; `cache_format.go`: cache
+  request identity, wire schemas, and validation; `cache_json.go`: canonical JSON
+  codec; `cache.go`: filesystem storage.
+- `internal/app/publication.go`: staged metrics/listener reservations with
+  explicit collector and context dependencies, and transaction-gated publication.
 - `internal/app/crowdsec.go`: staged client epochs, serialized dynamic
   reconciliation, independent expiry/renewal workers, and reconnect handover.
 - `internal/crowdsec/`: response validation, decision identity, absolute
@@ -356,7 +358,7 @@ The executable target inventory is:
 | `package-fixtures` | Build an older package set in `dist-upgrade` and the candidate in `dist` |
 | `test-package` | Exercise DEB/RPM installation, upgrade, validation, failed removal, and removal |
 | `test-systemd` | Run the installed package in the pinned Ubuntu QEMU VM, including the real startup deadline |
-| `test-release` | Exercise signed-tag admission and main prerelease versioning with temporary Git/GPG repositories |
+| `test-release` | Exercise signed-tag/prerelease admission and checksum-validated asset staging with temporary Git/GPG and filesystem fixtures |
 
 `verify` intentionally excludes race, privileged integration, package, and
 systemd gates; those run separately. Local package verification on an amd64
