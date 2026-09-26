@@ -615,6 +615,7 @@ than one layer when the real boundary matters.
 | Cache and snapshots | Strict versioned cache decoding, immutable selector blobs, and complete snapshot manifests reject corruption or malformed state rather than silently accepting it; corruption and crashes before or after active-record commit are covered. | Unit |
 | Active-record checkpoints | Crash checkpoints before file sync, before rename, and before directory sync recover using complete observed record bytes; ambiguous rename/sync failures retain recovery evidence and fence work. | Unit; privileged netns E2E |
 | Durable commit recovery | Crashes before and after durable commit recover the correct target, snapshot, and owned generations without broad cleanup. | Privileged netns E2E |
+| CrowdSec rollback authority | Failed precommit applies retain the old durable revision, authenticated client, decisions, and selected enforcement. Rollback resynchronization may replace the in-memory state and epoch; tests wait for that transition rather than require pointer identity. A committed disable removes authority. | App checkpoint fixtures; shuffled race tests |
 | Pending apply recovery | A pending apply journal plus invalid current YAML recovers before configuration failure is reported. | Disposable systemd VM |
 
 ### Kernel backend and coexistence

@@ -268,7 +268,11 @@ func TestCrowdTransactionSelectionKeepsMatchingAuthority(t *testing.T) {
 			})
 			engine.mu.Lock()
 			old := engine.crowd.active
+			previous, err := engine.readActiveLocked()
 			engine.mu.Unlock()
+			if err != nil || previous == nil {
+				t.Fatalf("read initial active revision: %v, %v", previous, err)
+			}
 			cfg.CrowdSec.Enabled = false
 			candidate := admitCandidate(t, engine, cfg)
 			armed = true
@@ -276,16 +280,43 @@ func TestCrowdTransactionSelectionKeepsMatchingAuthority(t *testing.T) {
 			if err == nil {
 				t.Fatal("checkpoint did not fail")
 			}
-			engine.mu.Lock()
-			active := engine.crowd.active
-			engine.mu.Unlock()
 			if phase == "after-commit" {
+				engine.mu.Lock()
+				active := engine.crowd.active
+				engine.mu.Unlock()
 				if !outcome.Committed || active != nil || len(backend.selectedProjection()) != 0 {
 					t.Fatalf("committed disable retained authority: %#v", outcome)
 				}
-			} else if outcome.Committed || active != old || len(backend.selectedProjection()) != 1 {
-				t.Fatalf("rollback did not retain old authority: %#v", outcome)
+				return
 			}
+			if outcome.Committed || outcome.Degraded || outcome.Active == nil || outcome.Active.ID != previous.ID {
+				t.Fatalf("rollback did not retain old revision: %#v", outcome)
+			}
+			expected := netip.MustParsePrefix("198.51.100.9/32")
+			assertAuthority := func() {
+				t.Helper()
+				engine.mu.Lock()
+				defer engine.mu.Unlock()
+				active := engine.crowd.active
+				if active == nil || active.client != old.client {
+					t.Fatal("rollback did not retain the authenticated client")
+				}
+				projection := active.store.Projection(time.Now())
+				if len(projection) != 1 || projection[0].Prefix != expected {
+					t.Fatalf("rollback lost authoritative decisions: %v", projection)
+				}
+				if selected := backend.selectedProjection(); len(selected) != 1 || selected[0].Prefix != expected {
+					t.Fatalf("rollback lost selected enforcement: %v", selected)
+				}
+			}
+			assertAuthority()
+			// Rollback restarts full synchronization with the retained client.
+			// It may replace the state and epoch before Apply's caller resumes.
+			waitCrowdWrite(t, backend, 3*time.Second, func(event crowdWriteEvent) bool {
+				active := engine.crowd.active
+				return event.err == nil && active != nil && active.epoch > old.epoch
+			})
+			assertAuthority()
 		})
 	}
 }
