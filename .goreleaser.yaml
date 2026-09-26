@@ -22,7 +22,7 @@ builds:
 nfpms:
   - id: packages
     package_name: perimeterd
-    file_name_template: "{{ .ConventionalFileName }}"
+    file_name_template: '{{ replace .ConventionalFileName "~" "-" }}'
     ids:
       - linux
     formats:

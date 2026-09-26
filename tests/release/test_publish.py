@@ -28,6 +28,7 @@ class FakeGitHub:
         self.mutations = []
         self.errors = {}
         self.upload_failure = None
+        self.upload_name_mismatch = None
         self.next_asset_id = 1
         outer = self
 
@@ -145,16 +146,19 @@ class FakeGitHub:
                         return
                     asset_id = outer.next_asset_id
                     outer.next_asset_id += 1
+                    stored_name = (outer.upload_name_mismatch[1]
+                                   if outer.upload_name_mismatch and name == outer.upload_name_mismatch[0]
+                                   else name)
                     asset = {
                         "id": asset_id,
-                        "name": name,
+                        "name": stored_name,
                         "size": len(body),
                         "state": "uploaded",
                         "url": f"http://127.0.0.1:{outer.server.server_port}{prefix}/releases/assets/{asset_id}",
                         "data": body,
                     }
-                    outer.assets[name] = asset
-                    outer.mutations.append(("upload", name))
+                    outer.assets[stored_name] = asset
+                    outer.mutations.append(("upload", stored_name))
                     self.send_json(201, {key: value for key, value in asset.items() if key != "data"})
                 else:
                     self.send_error(404)
@@ -241,8 +245,11 @@ class ReleasePublication(unittest.TestCase):
             "PRERELEASE": "true",
         }
 
-    def write_subjects(self):
-        package = self.assets / "perimeterd_1_amd64.deb"
+    def write_subjects(self, name="perimeterd_1_amd64.deb"):
+        for path in self.assets.iterdir():
+            if path.name not in (publisher.CHECKSUMS, publisher.PROVENANCE):
+                path.unlink()
+        package = self.assets / name
         package.write_bytes(b"tested package bytes\n")
         digest = hashlib.sha256(package.read_bytes()).hexdigest()
         (self.assets / publisher.CHECKSUMS).write_text(f"{digest}  {package.name}\n", encoding="utf-8")
@@ -520,6 +527,48 @@ class ReleasePublication(unittest.TestCase):
         with self.assertRaisesRegex(publisher.PublishError, "checksum mismatch"):
             self.publish()
         self.assertEqual(self.remote.mutations, [])
+
+    def test_checksum_inventory_rejects_unsafe_artifact_names_before_remote_mutation(self):
+        for name in (
+            "perimeterd_0.0.1~dev.42.gaaaaaaaaaaaa-1_amd64.deb",
+            ".perimeterd_0.0.1-dev.42.gaaaaaaaaaaaa-1_amd64.deb",
+        ):
+            with self.subTest(name=name):
+                self.write_subjects(name)
+                with self.assertRaisesRegex(publisher.PublishError, "invalid release checksum entry"):
+                    self.publish()
+                self.assertEqual(self.remote.mutations, [])
+                self.assertIsNone(self.remote.release)
+                self.assertEqual(self.remote.tags, {})
+                self.assertEqual(self.remote.assets, {})
+
+    def test_upload_name_mismatch_keeps_server_asset_in_unpublished_draft(self):
+        package = "perimeterd_1_amd64.deb"
+        renamed = "perimeterd_1_amd64-renamed.deb"
+        self.remote.upload_name_mismatch = (package, renamed)
+        with self.assertRaisesRegex(
+            publisher.PublishError,
+            f"requested {package!r}.*returned {renamed!r}",
+        ):
+            self.publish()
+
+        self.assertTrue(self.remote.release["draft"])
+        self.assertNotIn("publish", [entry[0] for entry in self.remote.mutations])
+        self.assertEqual(set(self.remote.assets), {publisher.CHECKSUMS, renamed})
+        self.assertEqual(
+            self.remote.assets[renamed]["data"],
+            (self.assets / package).read_bytes(),
+        )
+
+    def test_safe_prerelease_artifact_name_is_published(self):
+        name = f"perimeterd_{self.version}-1_amd64.deb"
+        self.write_subjects(name)
+        self.write_bundle(self.assets / publisher.PROVENANCE, issued="candidate")
+
+        self.publish()
+
+        self.assertFalse(self.remote.release["draft"])
+        self.assertIn(name, self.remote.assets)
 
 
 if __name__ == "__main__":

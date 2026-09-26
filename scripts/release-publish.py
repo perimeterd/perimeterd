@@ -236,8 +236,22 @@ class GitHubAPI:
         query = urllib.parse.urlencode({"name": path.name})
         url = urllib.parse.urlunsplit(parsed._replace(query=query))
         result = self.request("POST", url, path.read_bytes(), "application/octet-stream")
-        if not isinstance(result, dict) or result.get("name") != path.name:
-            raise PublishError(f"GitHub did not confirm upload of {path.name}")
+        if not isinstance(result, dict):
+            raise PublishError(
+                f"GitHub upload response for {path.name} was "
+                f"{type(result).__name__}, not an asset object"
+            )
+        returned_name = result.get("name")
+        if returned_name != path.name:
+            if isinstance(returned_name, str):
+                returned = f"returned {returned_name!r}"
+            elif returned_name is None:
+                returned = "missing name"
+            else:
+                returned = f"name of type {type(returned_name).__name__}"
+            raise PublishError(
+                f"GitHub upload name mismatch: requested {path.name!r}, {returned}"
+            )
         return result
 
     def publish(self, release, latest):
@@ -264,7 +278,11 @@ def local_assets(directory):
         raise PublishError(f"release assets must include {CHECKSUMS} and {PROVENANCE}")
     manifest = {}
     for line in files[CHECKSUMS].read_text(encoding="utf-8").splitlines():
-        match = re.fullmatch(r"([a-f0-9]{64})  ([A-Za-z0-9_.+~-]+)", line, re.ASCII)
+        match = re.fullmatch(
+            r"([a-f0-9]{64})  ([A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?)",
+            line,
+            re.ASCII,
+        )
         if not match:
             raise PublishError("invalid release checksum entry")
         checksum, name = match.groups()

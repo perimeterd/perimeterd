@@ -87,6 +87,35 @@ class ReleaseAssetStaging(unittest.TestCase):
             (self.source / "checksums.txt").read_bytes(),
         )
 
+    def test_stages_safe_prerelease_names_with_exact_inventory(self):
+        subjects = (
+            "perimeterd_0.0.1-dev.1.g09a3c501a820-1_amd64.deb",
+            "perimeterd_0.0.1-dev.1.g09a3c501a820-1_arm64.deb",
+            "perimeterd-0.0.1-dev.1.g09a3c501a820-1.x86_64.rpm",
+            "perimeterd-0.0.1-dev.1.g09a3c501a820-1.aarch64.rpm",
+            "perimeterd-source-0.0.1-dev.1.g09a3c501a820.tar.gz",
+        )
+        names = [*subjects, *(f"{name}.spdx.sbom.json" for name in subjects)]
+        for name in names:
+            (self.source / name).write_bytes(f"synthetic artifact: {name}\n".encode())
+        self.write_manifest(names)
+
+        release.stage(self.source, self.destination)
+
+        self.assertEqual(
+            {path.name for path in self.destination.iterdir()},
+            set(names) | {"checksums.txt"},
+        )
+        for name in names:
+            self.assertEqual(
+                (self.destination / name).read_bytes(),
+                (self.source / name).read_bytes(),
+            )
+        self.assertEqual(
+            (self.destination / "checksums.txt").read_bytes(),
+            (self.source / "checksums.txt").read_bytes(),
+        )
+
     def test_modified_bytes_with_valid_manifest_reach_checksum_guard(self):
         names = self.create_fixture()
         self.write_manifest(names)
@@ -105,6 +134,40 @@ class ReleaseAssetStaging(unittest.TestCase):
         self.write_manifest(names, [f"{'a' * 64}  ../escape.deb"])
 
         self.assert_rejected_by("invalid release checksum entry")
+
+    def test_unsafe_package_basename_is_rejected_as_invalid_entry(self):
+        old_package = PACKAGE_ARTIFACTS[0]
+        unsafe_package = "perimeterd_0.0.1~dev.1.g09a3c501a820-1_amd64.deb"
+        names = self.create_fixture(
+            omit=(old_package, f"{old_package}.spdx.sbom.json"),
+            additional=(
+                unsafe_package,
+                f"{unsafe_package}.spdx.sbom.json",
+            ),
+        )
+        self.write_manifest(names)
+
+        self.assert_rejected_by("invalid release checksum entry")
+        self.assertFalse(self.destination.exists())
+
+    def test_existing_destination_is_rejected_without_changes(self):
+        names = self.create_fixture()
+        self.write_manifest(names)
+        self.destination.mkdir()
+        existing_file = self.destination / "keep.txt"
+        existing_file.write_text("preexisting destination", encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            release.stage(self.source, self.destination)
+
+        self.assertEqual(
+            {path.name for path in self.destination.iterdir()},
+            {existing_file.name},
+        )
+        self.assertEqual(
+            existing_file.read_text(encoding="utf-8"),
+            "preexisting destination",
+        )
 
     def test_symlink_artifact_is_rejected(self):
         names = self.create_fixture()

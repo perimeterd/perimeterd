@@ -817,6 +817,20 @@ OIDC-backed signing identity, uploaded to a draft, and then published:
   `checksums.txt`, in `provenance.sigstore.json` (the bundle itself is outside
   the checksum manifest).
 
+GoReleaser fixes final package filenames before generating package/source SBOMs
+and checksums: nFPM's conventional DEB/RPM separators, release suffixes, and
+architecture suffixes remain, but `~` in an external basename becomes `-` for
+GitHub release asset compatibility. Stable names without `~` are unchanged.
+Checksum-covered asset basenames must start and end with an ASCII letter or
+digit and otherwise contain only ASCII letters/digits, `_`, `-`, or `.`.
+For example, `perimeterd_0.0.1-dev.1.g09a3c501a820-1_amd64.deb` still
+contains the native package version `0.0.1~dev.1.g09a3c501a820-1`; its
+internal `~` preserves package-manager prerelease ordering. The tested names
+and bytes flow unchanged through staging, Actions artifacts, attestation
+subjects, and release upload.
+There is no post-build or publish-time rename: GitHub returning a different
+upload name is a publication failure.
+
 ### Publication and recovery
 
 Before publishing, the workflow stages the same checksum-covered inventory
@@ -840,6 +854,13 @@ bytes, unexpected assets, invalid provenance, ambiguous drafts, or an
 incomplete published release fail without overwriting or deleting remote
 assets. A valid pre-existing provenance bundle is retained even when a new
 attestation uses different timestamps or serialization.
+
+A filename-policy fix requires a newly admitted run from the fixed commit:
+rerunning the failed workflow attempt uses its original checkout and cannot
+import later code. Cleanup of a failed run's old draft/tag belongs to the
+repository owner, not to publication recovery. Automated recovery applies
+only to a matching release identity and matching existing asset names, bytes,
+and provenance; it never renames or replaces conflicting remote assets.
 
 The admitted version, commit, and build time are injected into
 `perimeterd version` and `perimeterd_build_info`. Local snapshot builds never
