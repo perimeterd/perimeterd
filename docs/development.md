@@ -735,9 +735,16 @@ weekly schedule, and release-workflow invocations. CI, CodeQL, and package jobs
 read the Go version from `go.mod` after checkout; all executable workflow jobs
 have explicit deadlines (including the retained 120-minute systemd VM limit).
 Renovate tracks Go modules and GitHub Actions, including pinned development
-tools. Actions updates must retain immutable commit SHAs and refresh their
-human-readable release comments. Downloaded binary pins use the manual
-procedure above. Scale targets are opt-in, not CI gates.
+tools. Non-major updates and pin/digest maintenance are grouped separately
+for CI setup actions, artifact/provenance actions, Go development tools,
+CrowdSec, OpenZiti, and go-openapi libraries. Major updates stay outside
+these project groups (existing upstream monorepo grouping may still apply);
+CodeQL actions and the Go language directive are not absorbed into them.
+Actions retain immutable commit SHAs and refreshed human-readable
+release comments. Renovate does not automerge these updates: normal review,
+required PR checks, and existing security handling still apply. Downloaded
+binary pins use the manual procedure above. Scale targets are opt-in, not CI
+gates.
 
 Workflow permissions are read-only by default and elevated only for a job's
 required security or artifact operation. Superseded pull-request CI and CodeQL
@@ -754,10 +761,11 @@ releases do not replace one another.
 - A signed, canonical **bare SemVer** tag such as `0.0.1` or `0.0.2` publishes
   a stable release. `v0.0.1`, leading zeroes, and prerelease/build suffixes are
   rejected. The tagged commit must be reachable from `origin/main`.
-- Every push to `main` publishes a development prerelease after the same gates.
-  Its version is the next patch after the highest reachable stable SemVer tag, followed
-  by `-dev.RUN.gSHORTCOMMIT`; without a stable tag the base is `0.0.1`.
-  Prereleases never become GitHub's latest release.
+- A push to `main` admits a development prerelease candidate, but superseded
+  candidates do not publish. Its version is the next patch after the highest
+  reachable stable SemVer tag, followed by `-dev.RUN.gSHORTCOMMIT`; without a
+  stable tag the base is `0.0.1`. Prereleases never become GitHub's latest
+  release.
 
 Configure repository variable `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
 ASCII-armored OpenPGP public keys before publishing stable tags. Admission uses
@@ -768,6 +776,26 @@ commit and main ancestry, and verifies the annotated tag signature. For example:
 git tag -s 0.0.1 -m 'Release 0.0.1'
 git push origin 0.0.1
 ```
+
+### Main candidate freshness
+
+After persisting the admitted version and triggering commit, each executed
+main metadata job waits **60 seconds**, then requests the current
+`refs/heads/main` SHA from GitHub. A different SHA successfully supersedes
+that run: its release CI, CodeQL, and package jobs do not run, and it neither
+attests nor publishes. This is not a successful test result for the skipped
+commit. A missing ref, malformed response, or API/authentication failure
+instead fails the job; it is never treated as supersession.
+
+The publish job checks main again after all existing gates and asset staging,
+immediately before attestation. If main advanced during those gates, both
+attestation and publication are skipped. A failed newest candidate never
+falls back to an older superseded run. After the final affirmative decision,
+an active publisher finishes without cancellation or repeated freshness
+checks. A push arriving after that decision may result in two releases; the
+branch comparison and publication are not atomic. Stable signed tags bypass
+both freshness checks and the wait, even when main advances beyond their
+admitted ancestor. Direct PR CI and CodeQL behavior is unchanged.
 
 ### Durable identity and reruns
 
@@ -782,6 +810,15 @@ admitted downstream builds. After expiry/deletion or an initial failure before
 upload, use a separately admitted new release run under the normal triggers;
 neither a guessed version nor an arbitrary override recovers that run. The
 repository's Actions retention policy must permit the configured 90 days.
+
+A rerun that executes metadata keeps the saved version and commit but waits
+another 60 seconds and makes a new early freshness decision. A failed-jobs-only
+rerun can reuse successful metadata and gate jobs; its publish job therefore
+always makes its own late lookup. If an old main run is rerun after main
+advances, it skips publication even when an old draft or published release
+already exists: the workflow does not attest, repair, or mutate those remote
+objects. Owner action is required for a superseded draft. Still-current main
+and stable-tag reruns retain the publisher's immutable recovery behavior.
 
 Every package build attempt uploads the candidate and its paired upgrade
 fixture under names unique to the **producer's** run attempt. Architecture

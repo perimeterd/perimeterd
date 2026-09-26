@@ -21,6 +21,75 @@
         "mvdan.cc/gofumpt"
       ],
       "rangeStrategy": "pin"
+    },
+    {
+      "description": "Keep major artifact action upgrades independent",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["actions/upload-artifact", "actions/download-artifact"],
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "groupSlug": null
+    },
+    {
+      "description": "Group related CI setup actions",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": [
+        "actions/checkout",
+        "actions/setup-go",
+        "docker/setup-qemu-action"
+      ],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "CI setup actions",
+      "groupSlug": "ci-setup-actions"
+    },
+    {
+      "description": "Group related artifact and provenance actions",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": [
+        "actions/upload-artifact",
+        "actions/download-artifact",
+        "actions/attest"
+      ],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "Artifact and provenance actions",
+      "groupSlug": "artifact-provenance-actions"
+    },
+    {
+      "description": "Group Go development tools",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": [
+        "github.com/golangci/golangci-lint/v2",
+        "golang.org/x/tools",
+        "golang.org/x/vuln",
+        "mvdan.cc/gofumpt"
+      ],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "Go development tools",
+      "groupSlug": "go-development-tools"
+    },
+    {
+      "description": "Group CrowdSec libraries",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/crowdsecurity/**"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "CrowdSec libraries",
+      "groupSlug": "crowdsec-libraries"
+    },
+    {
+      "description": "Group OpenZiti libraries",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/openziti/**"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "OpenZiti libraries",
+      "groupSlug": "openziti-libraries"
+    },
+    {
+      "description": "Group OpenAPI libraries",
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/go-openapi/**"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "groupName": "OpenAPI libraries",
+      "groupSlug": "openapi-libraries"
     }
   ]
 }

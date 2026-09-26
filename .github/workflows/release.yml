@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
 
-# Every main commit gets its own prerelease; tags never cancel one another.
+# Runs never cancel an admitted publisher; stale main candidates skip at freshness gates.
 concurrency:
   group: release-${{ github.run_id }}
   cancel-in-progress: false
@@ -24,6 +24,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       prerelease: ${{ steps.release.outputs.prerelease }}
       commit: ${{ steps.release.outputs.commit }}
+      eligible: ${{ steps.early.outputs.eligible }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,13 +46,21 @@ jobs:
       - name: Expose only the durable release identity
         id: release
         run: python3 scripts/release-metadata.py --emit "$RUNNER_TEMP/release-metadata.json"
+      - name: Wait for a quiet main and check candidate freshness
+        id: early
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        run: python3 scripts/release-freshness.py --early "$COMMIT"
 
   checks:
     needs: metadata
+    if: ${{ success() && needs.metadata.outputs.eligible == 'true' }}
     uses: ./.github/workflows/ci.yml
 
   codeql:
     needs: metadata
+    if: ${{ success() && needs.metadata.outputs.eligible == 'true' }}
     permissions:
       actions: read
       contents: read
@@ -61,6 +70,7 @@ jobs:
   packages:
     needs: metadata
     uses: ./.github/workflows/packages.yml
+    if: ${{ success() && needs.metadata.outputs.eligible == 'true' }}
     with:
       version: ${{ needs.metadata.outputs.version }}
       prerelease: ${{ needs.metadata.outputs.prerelease == 'true' }}
@@ -68,6 +78,7 @@ jobs:
 
   publish:
     needs: [metadata, checks, codeql, packages]
+    if: ${{ success() && needs.metadata.outputs.eligible == 'true' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
@@ -84,12 +95,20 @@ jobs:
           path: dist
       - name: Verify and select the tested release assets
         run: python3 scripts/release-assets.py dist release-assets
+      - name: Check candidate freshness before publication
+        id: late
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.metadata.outputs.commit }}
+        run: python3 scripts/release-freshness.py --late "$COMMIT"
       - name: Sign provenance for every release asset
+        if: ${{ success() && steps.late.outputs.eligible == 'true' }}
         id: attest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: release-assets/*
       - name: Recover or publish the immutable tested release
+        if: ${{ success() && steps.late.outputs.eligible == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.metadata.outputs.version }}
