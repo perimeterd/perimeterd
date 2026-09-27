@@ -116,6 +116,7 @@ bench-native-scale-large: build-e2e
 	$(E2E_SUDO) env PERIMETERD_E2E=1 PERIMETERD_NATIVE_MEASURE=1 PERIMETERD_NATIVE_PROFILE=large E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.run '^TestE2ECrowdSecNativeMeasurement$$' -test.count=1
 
 release-tools: $(RELEASE_TOOLS)/goreleaser $(RELEASE_TOOLS)/syft
+	@command -v bsdtar >/dev/null || { echo "install bsdtar (Ubuntu: libarchive-tools; Fedora: bsdtar) for release SBOM inspection" >&2; exit 1; }
 
 $(RELEASE_TOOLS)/goreleaser $(RELEASE_TOOLS)/syft &: scripts/install-release-tools.sh
 	scripts/install-release-tools.sh "$(RELEASE_TOOLS)"

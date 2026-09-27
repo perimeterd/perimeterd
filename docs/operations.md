@@ -835,14 +835,45 @@ variants. Release workflows and provenance checks are owned by
 [development](development.md#release-workflow). Packages also depend on
 `ca-certificates` for HTTPS upstreams.
 
-Verify downloaded artifacts before installing:
+Verify every downloaded release subject before installing. Download its
+`checksums.txt` and `provenance.sigstore.json` along with the artifacts and
+their exactly named `<artifact-name>.spdx.sbom.json` companions. In the
+download directory:
 
 ```sh
 sha256sum --check checksums.txt
-gh attestation verify perimeterd_0.0.1-1_amd64.deb --repo perimeterd/perimeterd
+COMMIT='INSERT_ADMITTED_SOURCE_SHA'
+REF='refs/tags/INSERT_VERSION'    # use refs/heads/main for a main prerelease
+for file in $(sed -n 's/^[0-9a-f]\{64\}  //p' checksums.txt) checksums.txt; do
+    gh attestation verify "$file" \
+      --bundle provenance.sigstore.json --repo perimeterd/perimeterd \
+      --signer-workflow perimeterd/perimeterd/.github/workflows/release.yml \
+      --source-digest "$COMMIT" --source-ref "$REF"
+done
 ```
 
-The release includes the signed provenance bundle for offline retention.
+The manifest covers seven parents (both architecture-specific binary
+tarballs, four native packages, and the source archive) and their seven
+companion SPDX JSON documents; the manifest itself is another provenance
+subject. The bundle is not checksum-covered. Inspect the expected GitHub
+workflow, repository, admitted source commit and ref when verifying a hosted
+release; `gh attestation verify` checks the bundle cryptographically, not just
+its decoded payload. A valid signature authenticates the document and
+subject bytes; it does **not** establish SBOM inventory completeness.
+
+Binary archive and DEB/RPM SBOMs describe the shipped executable's effective
+linked Go modules, the Go standard library/toolchain version, and a separate
+release-version application identity. The Go main-module source identity may
+have a pseudo-version distinct from the release version; do not assign the
+release version to third-party modules. The source-archive SBOM also covers
+source/development and tooling inputs, which need not ship in the binary.
+Local workflow references can have unknown versions without hiding a linked
+dependency. `nftables`, `iptables`, `ipset` and `ca-certificates` are host
+installation requirements, not pinned components embedded in static binaries.
+To independently check executable linkage against Go build metadata, run
+`python3 scripts/release-assets.py DOWNLOADED_DIR ABSENT_DESTINATION` from a
+checkout of the release scripts with the Go version in `go.mod` and `bsdtar`
+installed; this validates downloaded files without rebuilding or rescanning.
 
 ## Package lifecycle
 

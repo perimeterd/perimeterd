@@ -32,6 +32,10 @@ jobs:
         with:
           go-version-file: go.mod
           check-latest: false
+      - name: Install package payload inspection tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libarchive-tools
       - name: Check scripts, workflows, release config and regressions
         run: make support-check
 

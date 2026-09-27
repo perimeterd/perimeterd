@@ -145,15 +145,24 @@ checksum:
   algorithm: sha256
 
 sboms:
+  - id: archive-sbom
+    artifacts: archive
+    documents:
+      - "${artifact}.spdx.sbom.json"
+    cmd: python3
+    args:
+      - ../scripts/release_sbom.py
+      - $artifact
+      - $document
   - id: package-sbom
     artifacts: package
     documents:
       - "${artifact}.spdx.sbom.json"
-    cmd: syft
+    cmd: python3
     args:
-      - "$artifact"
-      - --output
-      - "spdx-json=$document"
+      - ../scripts/release_sbom.py
+      - $artifact
+      - $document
   - id: source-sbom
     artifacts: source
     documents:

@@ -359,10 +359,10 @@ The executable target inventory is:
 | `bench-scale-large` | Run large-100k/large-250k control-plane/serialization benchmarks with `-benchmem` |
 | `bench-native-scale-small` | Run the isolated small native scale profile |
 | `bench-native-scale-large` | Run the isolated large native scale profile |
-| `release-tools` | Install checksum-pinned GoReleaser and Syft into `bin/release-tools` |
+| `release-tools` | Check for `bsdtar`; install checksum-pinned GoReleaser and Syft into `bin/release-tools` |
 | `support-tools` | Install checksum-pinned ShellCheck and build the pinned Ubuntu-26.04-aware actionlint into `bin/support-tools` |
 | `support-check` | Run ShellCheck, actionlint (including embedded shell), `goreleaser check`, and `test-release` without formatting, package builds, VMs, or secrets |
-| `package` | Build local snapshot packages, binary/source archives, SBOMs, and checksums in `dist` |
+| `package` | Build local snapshot packages, binary/source archives, seven companion SBOMs, and checksums in `dist` |
 | `package-fixtures` | Build an older package set in `dist-upgrade` and the candidate in `dist` |
 | `test-package` | Exercise DEB/RPM installation, upgrade, validation, failed removal, and removal |
 | `test-systemd` | Run the installed package in the pinned Ubuntu QEMU VM, including the real startup deadline |
@@ -393,12 +393,17 @@ activation beyond 90 seconds without waiting for the 75-minute deadline. Run
 
 Run `make support-check` on Linux amd64 for the lightweight supporting-file
 gate; the first invocation downloads checksum-verified tools and may need
-network access. `GOTOOLCHAIN=auto make support-check` selects the module's
-Go toolchain if the host Go is older. The installer keeps these binaries in
-`bin/`, outside the application dependency graph. To check staged real
-outputs, run `python3 scripts/release-assets.py dist /tmp/perimeterd-staged`
-with an absent destination, then compare its inventory and checksum manifest
-to `dist/`. This gate does not build packages or start VMs.
+network access. Install `bsdtar` first (`libarchive-tools` on Ubuntu,
+`bsdtar` on Fedora) to inspect DEB/RPM payloads without installing them.
+`GOTOOLCHAIN=auto make support-check` selects the module's Go toolchain if
+the host Go is older. For generated-output proof, build in an isolated
+checkout if `dist/` contains user-owned files; `make package` cleans `dist/`.
+Run `python3 scripts/release-assets.py dist /tmp/perimeterd-staged` with an
+absent destination, then run it again with `/tmp/perimeterd-staged` as input
+and another absent destination. Both checks inspect the actual binaries with
+`go version -m` and `bsdtar`, without Syft or a build tree in admission.
+Compare the staged inventory and manifest with `dist/`. The supporting-file
+gate itself does not build packages or start VMs.
 
 #### Tool pin maintenance
 
@@ -422,12 +427,14 @@ and `govulncheck`.
 
 The **release maintainer** owns atomic updates of downloaded binaries; Renovate
 updates Go modules (including `go tool` dependencies) and GitHub Actions only,
-not the downloaded binary pins below. The current manual-pin inventory is:
+not the downloaded binary pins below. The current manual-pin inventory and
+OS extractor prerequisite are:
 
-| Download | Version/pin location | Real consumer after update |
+| Download or prerequisite | Version/pin location | Real consumer after update |
 | --- | --- | --- |
-| GoReleaser | `scripts/install-release-tools.sh` | Fresh installer, `goreleaser check`, real package/SBOM build |
-| Syft | `scripts/install-release-tools.sh` | Fresh installer and all required real package/source SBOMs |
+| GoReleaser | `scripts/install-release-tools.sh` (v2.18.2) | Fresh installer, `goreleaser check`, real archive/package/SBOM build and admission |
+| Syft | `scripts/install-release-tools.sh` (v1.52.0) | Fresh installer and real binary archive, native package and source SBOMs; compare actual linked Go inventories against build information |
+| `bsdtar` (OS package, not a downloaded pin) | Ubuntu `libarchive-tools`; Fedora `bsdtar`; installed in build and publish jobs | Real DEB/RPM payload extraction and admission for both architectures, including unsafe paths/links |
 | OpenZiti | `.github/workflows/ci.yml` | Verify archive layout; existing real OpenZiti gate |
 | CrowdSec binary | `.github/workflows/ci.yml` | Verify archive layout; existing integration consumer; inspect paired CrowdSec fixture version |
 | Docker Engine | `.github/workflows/ci.yml` | Verify archive layout; existing isolated Docker gate |
@@ -700,7 +707,7 @@ passing.
 | Systemd sandbox | A disposable systemd VM boots with no pre-existing xtables lock and proves the installed service reconciles both supported iptables tool variants under its actual filesystem and capability sandbox. Container payload inspection alone is not evidence that the service sandbox works. | Disposable systemd VM |
 | Boot and restart lifecycle | The VM covers install-after-boot tmpfiles provisioning, lifecycle-lock exclusion, retained runtime-directory inode across restart, ongoing degraded enforcement health, and removal failure preserving recovery state. | Disposable systemd VM |
 | Startup timeout protocol | CI's cold-start fixture takes more than `90s`, remains activating through `EXTEND_TIMEOUT_USEC`, and becomes ready only after commit. Fake-clock tests cover the overall deadline; the opt-in full VM gate verifies real 75-minute termination without losing recovery evidence. | CI fast systemd VM; unit fake-clock fixtures; opt-in full systemd VM |
-| Release artifacts | GoReleaser v2 builds static Linux binaries for `amd64` (`GOAMD64=v1`) and `arm64`, one DEB and one RPM per architecture, checksums, required package/source SBOMs, and a source archive. Only the artifacts that pass all gates are attested and published. | Release workflow; matching-architecture package containers; systemd VM |
+| Release artifacts | GoReleaser v2 builds static Linux binaries for `amd64` (`GOAMD64=v1`) and `arm64`, one archive, DEB and RPM per architecture, plus a source archive. All seven parents have exact checksum-covered companion SPDX SBOMs; the six executable inventories cover their linked Go modules, stdlib and release application identity. Build and publish staging inspect the same checksum-verified bytes, not regenerated artifacts. | Real snapshot and release-mode builds; asset admission; release workflow; matching-architecture package containers; systemd VM |
 | Architecture coverage | Each package is installed in a matching-architecture distribution container; pinned QEMU/binfmt runs non-native architecture containers. | Package smoke |
 | Version provenance | Stable releases use a verified signed tag; main prereleases use their durably admitted development version. Both inject version, commit, and build time into `perimeterd version` and `perimeterd_build_info`. Local and PR snapshots do not publish releases. | Release workflow; package smoke |
 
@@ -834,8 +841,10 @@ rerun integration as verified.
 
 Both channels run static analysis, unit and race tests, CodeQL, privileged
 native E2E, real Docker/CrowdSec/OpenZiti compatibility, package lifecycle, and
-the fast systemd VM gate before publication. GoReleaser and Syft are
-checksum-pinned by `scripts/install-release-tools.sh`.
+the fast systemd VM gate before publication. GoReleaser 2.18.2 and Syft 1.52.0
+are checksum-pinned by `scripts/install-release-tools.sh`; `bsdtar` comes from
+the runner's `libarchive-tools` package. The publish job also provisions Go
+from `go.mod` to inspect downloaded executables.
 
 The [service and packaging matrix](#service-and-packaging) defines package
 installation, architecture, sandbox, restart, recovery, and version-metadata
@@ -843,29 +852,41 @@ acceptance. The fast systemd gate verifies startup activation beyond 90 seconds
 with `EXTEND_TIMEOUT_USEC`; the real 75-minute stalled-startup scenario remains
 an explicit [full VM check](#package-and-systemd-gates), not a CI publication gate.
 
-The tested artifacts—not a rebuild—are checksum-verified, attested with GitHub's
-OIDC-backed signing identity, uploaded to a draft, and then published:
+The tested artifacts—not a rebuild—are checksum-verified, semantically admitted,
+attested with GitHub's OIDC-backed signing identity, uploaded to a draft, and
+then published:
 
-- two DEBs and two RPMs, each with an exact checksum-covered
-  `<package-name>.spdx.sbom.json`;
-- binary archives and SHA-256 `checksums.txt`;
-- the configured source archive and its exact checksum-covered
-  `<source-name>.spdx.sbom.json`; and
+- two Linux binary archives, two DEBs, two RPMs, and one source archive, **each**
+  with its exact checksum-covered `<artifact-name>.spdx.sbom.json` companion;
+- SHA-256 `checksums.txt` covering all seven parents and seven companions; and
 - GitHub artifact attestations for every checksum-covered file **and**
   `checksums.txt`, in `provenance.sigstore.json` (the bundle itself is outside
   the checksum manifest).
 
-GoReleaser fixes final package filenames before generating package/source SBOMs
-and checksums: nFPM's conventional DEB/RPM separators, release suffixes, and
-architecture suffixes remain, but `~` in an external basename becomes `-` for
-GitHub release asset compatibility. Stable names without `~` are unchanged.
-Checksum-covered asset basenames must start and end with an ASCII letter or
-digit and otherwise contain only ASCII letters/digits, `_`, `-`, or `.`.
-For example, `perimeterd_0.0.1-dev.1.g09a3c501a820-1_amd64.deb` still
-contains the native package version `0.0.1~dev.1.g09a3c501a820-1`; its
-internal `~` preserves package-manager prerelease ordering. The tested names
-and bytes flow unchanged through staging, Actions artifacts, attestation
-subjects, and release upload.
+That is 14 checksum entries, 15 attested subjects including the manifest, and
+16 final assets including the provenance bundle for the current matrix. Admission
+checks exact architecture/name pairs, parent digest/filename and executable
+relationships, native wrapper version/architecture, and every effective linked
+Go module and stdlib version against `go version -m` on extracted binaries.
+The archive/DEB/RPM SBOM represents the **shipped executable**, while the source
+archive SBOM is a broader source/development inventory; the latter is not a
+dependency oracle for a binary. A distinct release-application component records
+the admitted version; Syft's Go main-module pseudo-version remains its source
+identity. Pseudo-versions are not shortened, and unversioned local Go
+replacements are rejected instead of being assigned invented versions.
+Runtime OS packages (including firewall tools and CA certificates) are
+installation requirements, not statically linked Go components.
+
+GoReleaser fixes final artifact filenames before SBOM generation and checksums:
+nFPM's conventional DEB/RPM separators, release suffixes, and architecture
+suffixes remain, but `~` in an external basename becomes `-` for GitHub release
+asset compatibility. Stable names without `~` are unchanged. Checksum-covered
+asset basenames must start and end with an ASCII letter or digit and otherwise
+contain only ASCII letters/digits, `_`, `-`, or `.`. For example,
+`perimeterd_0.0.1-dev.1.g09a3c501a820-1_amd64.deb` still contains the native
+package version `0.0.1~dev.1.g09a3c501a820-1`; its internal `~` preserves
+package-manager prerelease ordering. The tested names and bytes flow unchanged
+through staging, Actions artifacts, attestation subjects, and release upload.
 There is no post-build or publish-time rename: GitHub returning a different
 upload name is a publication failure.
 
