@@ -191,13 +191,17 @@ func TestIPTablesSnapshotCountersRequireAndSelectOwnedRuleStats(t *testing.T) {
 
 func nftCounterTableJSON(target *Target) []byte {
 	data, _ := json.Marshal(map[string]any{"nftables": []any{
-		map[string]any{"table": map[string]any{"family": "inet", "name": target.Table, "comment": tableComment(target.Owner)}},
+		map[string]any{"table": map[string]any{"family": "inet", "name": target.Table}},
 	}})
 	return data
 }
 
 func nftCounterInventoryJSON(target *Target, malformed, foreign bool) []byte {
-	objects := []any{map[string]any{"table": map[string]any{"family": "inet", "name": target.Table, "comment": tableComment(target.Owner)}}}
+	objects := []any{
+		map[string]any{"table": map[string]any{"family": "inet", "name": target.Table}},
+		map[string]any{"chain": map[string]any{"family": "inet", "table": target.Table, "name": "pd_" + target.Owner + "_stable_ownership"}},
+		map[string]any{"rule": map[string]any{"family": "inet", "table": target.Table, "chain": "pd_" + target.Owner + "_stable_ownership", "comment": "perimeterd owner=" + target.Owner + " role=table_witness_v1", "expr": []any{map[string]any{"return": nil}}}},
+	}
 	for index, spec := range target.Counters {
 		packets, byteCount := any(uint64(17)), any(uint64(1700))
 		if spec.Role.Kind == policy.Denied {
@@ -208,7 +212,6 @@ func nftCounterInventoryJSON(target *Target, malformed, foreign bool) []byte {
 		}
 		objects = append(objects, map[string]any{"counter": map[string]any{
 			"family": "inet", "table": target.Table, "name": spec.Name,
-			"comment": ownershipComment(target.Owner, stableToken, "counter/"+spec.Name, true),
 			"packets": packets, "bytes": byteCount,
 		}})
 	}

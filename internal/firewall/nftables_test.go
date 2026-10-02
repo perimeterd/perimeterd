@@ -218,7 +218,7 @@ func TestInspectUsesTypedTableQuery(t *testing.T) {
 		queryInput = append([]byte(nil), input...)
 		return response, nil
 	}}
-	if _, err := backend.inspect(context.Background(), target.Table, target); err != nil {
+	if _, err := backend.inspect(context.Background(), target.Table); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(strings.Join(queryArgs, " "), target.Table) {
@@ -511,7 +511,7 @@ func TestRetireFlushesEntryBeforeGeneration(t *testing.T) {
 		if len(args) >= 3 && args[1] == "-f" && args[2] == "-" && strings.Contains(string(input), `"list"`) {
 			entry := entryChainName(previous, policy.IPv4, policy.Ingress)
 			path := generationChainName(previous, policy.IPv4, policy.Ingress)
-			return []byte(`{"nftables":[{"table":{"family":"inet","name":"test-perimeterd","comment":"perimeterd owner=0123456789abcdef0123456789abcdef role=table"}},{"chain":{"family":"inet","table":"test-perimeterd","name":"` + entry + `","comment":"` + ownershipComment(previous.Owner, stableToken, entryRole(policy.IPv4, policy.Ingress), true) + `"}},{"chain":{"family":"inet","table":"test-perimeterd","name":"` + path + `","comment":"` + ownershipComment(previous.Owner, previous.Generation, chainRole(policy.IPv4, policy.Ingress), false) + `"}}]}`), nil
+			return nftFixtureResponse(t, previous, map[string]any{"chain": objectRef(previous.Table, entry)}, map[string]any{"chain": objectRef(previous.Table, path)}), nil
 		}
 		payload = append([]byte(nil), input...)
 		return []byte(`{"nftables":[]}`), nil
@@ -565,7 +565,7 @@ func TestRetireDeletesCandidateOnlyCountersOnRollback(t *testing.T) {
 			return []byte(`{"nftables":[{"table":{"family":"inet","name":"test-perimeterd","comment":"perimeterd owner=0123456789abcdef0123456789abcdef role=table"}}]}`), nil
 		}
 		if len(args) >= 3 && args[1] == "-f" && args[2] == "-" && strings.Contains(string(input), `"list"`) {
-			return []byte(`{"nftables":[{"table":{"family":"inet","name":"test-perimeterd","comment":"perimeterd owner=0123456789abcdef0123456789abcdef role=table"}},{"counter":{"family":"inet","table":"test-perimeterd","name":"` + oldCounter.Name + `","comment":"` + ownershipComment(previous.Owner, stableToken, "counter/"+oldCounter.Name, true) + `"}}]}`), nil
+			return nftFixtureResponse(t, previous, map[string]any{"counter": objectRef(previous.Table, oldCounter.Name)}), nil
 		}
 		payload = append([]byte(nil), input...)
 		return []byte(`{"nftables":[]}`), nil
@@ -595,6 +595,9 @@ func TestValidateInventoryRejectsWrongOwnedBaseHook(t *testing.T) {
 	inventory := newNFTInventory()
 	inventory.present = true
 	inventory.table = nftObject{Kind: "table", Family: "inet", Name: target.Table, Comment: tableComment(target.Owner)}
+	witness := witnessChainName(target)
+	inventory.chains[witness] = nftObject{Kind: "chain", Family: "inet", Table: target.Table, Name: witness}
+	inventory.rules = append(inventory.rules, nftObject{Kind: "rule", Family: "inet", Table: target.Table, Chain: witness, Comment: "perimeterd owner=" + target.Owner + " role=table_witness_v1", Expr: []json.RawMessage{json.RawMessage(`{"return":null}`)}})
 	name := baseChainName(target, policy.Ingress)
 	inventory.chains[name] = nftObject{Kind: "chain", Family: "inet", Table: target.Table, Name: name, Comment: ownershipComment(target.Owner, stableToken, baseRole(policy.Ingress), true), Type: "filter", Hook: "output", Policy: "accept", Prio: target.Priority, HasPrio: true}
 	if err := validateInventory(inventory, target); err == nil {

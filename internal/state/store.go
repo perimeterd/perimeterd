@@ -181,7 +181,14 @@ func (s *Store) read() (View, error) {
 	return view, nil
 }
 
-// Prepare durably records an immutable candidate and then its apply journal before kernel mutation.
+func revisionID(revision *Revision) string {
+	if revision == nil {
+		return ""
+	}
+	return revision.ID
+}
+
+// Prepare records an immutable candidate and its intent before kernel mutation.
 func (s *Store) Prepare(previous, candidate *Revision) error {
 	if candidate == nil {
 		return errors.New("state: nil candidate revision")
@@ -203,6 +210,9 @@ func (s *Store) Prepare(previous, candidate *Revision) error {
 	}
 	if current.Journal != nil {
 		return errors.New("state: transaction already pending")
+	}
+	if revisionID(current.Active) != revisionID(previous) {
+		return errors.New("state: previous revision is not active")
 	}
 	if previous != nil && previous.Manifest != "" {
 		if err := s.prefixes.Stabilize(previous.Manifest); err != nil {
@@ -232,7 +242,7 @@ func (s *Store) Prepare(previous, candidate *Revision) error {
 	return nil
 }
 
-// MarkPhase durably updates the diagnostic phase of the pending apply journal.
+// MarkPhase durably updates apply diagnostics.
 func (s *Store) MarkPhase(phase string) error {
 	view, err := s.read()
 	if err != nil {
@@ -371,6 +381,9 @@ func (s *Store) Stabilize() error {
 func (s *Store) BeginCleanup(view View, id string) error {
 	if view.Owner != s.owner {
 		return errors.New("state: cleanup view belongs to another owner")
+	}
+	if _, err := s.read(); err != nil {
+		return err
 	}
 	if err := validateID(id, "cleanup transaction"); err != nil {
 		return err

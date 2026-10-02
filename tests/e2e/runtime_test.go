@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -70,6 +71,49 @@ func TestE2ENFTMetrics(t *testing.T) {
 		})
 		assertE2EMetricLabelNames(t, body, "perimeterd_firewall_denied_packets_total", "backend", "family", "direction", "reason", "action")
 	}
+}
+
+// TestE2ENFTReloadOwnership exercises the native nft JSON round trip, not a
+// simulated inventory. A successful first install must remain manageable when
+// the next policy is applied, including on older distribution nft packages.
+func TestE2ENFTReloadOwnership(t *testing.T) {
+	if os.Getenv(e2eChildEnv) != "1" {
+		runIsolated(t, "TestE2ENFTReloadOwnership", "nft-reload-ownership")
+		return
+	}
+	requireIsolatedChild(t)
+	prepareMounts(t)
+	peer := newPeerNamespace(t)
+	table := fmt.Sprintf("pdownership_%d", os.Getpid())
+	path := tempConfig(t, "reload-ownership")
+	writeConfig(t, path, table, "drop", nil, []string{"8.8.8.8/32"}, -10)
+	daemon := startDaemon(t, path, table)
+	initialWitness := witnessRule(t, table)
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("daemon diagnostics:\n%s", daemon.diagnosticOutput())
+		}
+	})
+	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "success", "tcp")
+
+	before := activeRevision()
+	writeConfig(t, path, table, "drop", nil, []string{"8.8.8.8/32", fixtureIPv4Peer + "/32"}, -10)
+	daemon.reload(t)
+	waitForActiveRevisionChange(t, before, path)
+	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
+	selectedWitness := witnessRule(t, table)
+	if initialWitness["chain"] != selectedWitness["chain"] || initialWitness["comment"] != selectedWitness["comment"] {
+		t.Fatal("policy reload changed the stable table witness")
+	}
+	daemon.stop(t)
+	// Reboot may lose the entire table, but not durable reconstruction authority.
+	command(t, 10*time.Second, "nft", "delete", "table", "inet", table)
+	daemon = startDaemon(t, path, table)
+	witnessRule(t, table)
+	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
+	daemon.stop(t)
+	command(t, 30*time.Second, e2eBinary(t), "cleanup")
+	waitNoNFTTable(t, table)
 }
 
 func TestE2ERuntime(t *testing.T) {
@@ -237,14 +281,32 @@ func TestE2ERuntime(t *testing.T) {
 
 	// An unrecorded same-name table is a hard collision. Reload failure must
 	// preserve the active target and the foreign table byte-for-byte.
+	collisionBefore, err := nftTableMayFail(collision)
+	if err != nil {
+		t.Fatalf("inspect collision fixture: %v", err)
+	}
+	before = activeRevision()
 	writeConfig(t, configPath, collision, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -9)
 	diagnosticOffset = daemonDiagnosticOffset(daemon)
 	daemon.reload(t)
-	waitForDaemonDiagnostic(t, daemon, []string{"foreign_child"}, diagnosticOffset)
+	// Correlate completion with this candidate's table, not an incidental child
+	// name: an unrecorded table is refused before its children are authorized.
+	waitForDaemonDiagnostic(t, daemon, []string{collision}, diagnosticOffset)
+	if activeRevision() != before {
+		t.Fatal("collision reload changed the active revision")
+	}
 	if _, err := nftTableMayFail(table); err != nil {
 		t.Fatalf("collision reload removed active table: %v", err)
 	}
 	assertForeignTable(t, collision)
+	collisionAfter, err := nftTableMayFail(collision)
+	if err != nil {
+		t.Fatalf("inspect rejected collision fixture: %v", err)
+	}
+	if !bytes.Equal(collisionBefore, collisionAfter) {
+		t.Fatalf("collision reload mutated foreign inventory:\nbefore: %s\nafter: %s", collisionBefore, collisionAfter)
+	}
+	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "reject", "tcp")
 
 	// Table migration builds a second owned table before retiring the first.
 	migrated := table + "_m"
@@ -274,10 +336,9 @@ func TestE2ERuntime(t *testing.T) {
 		t.Fatalf("normal stop removed active nftables table: %v", err)
 	}
 
-	// Reboot-style self-recovery: retain durable target metadata and owned
-	// objects, remove only table rules, and require startup to restore actual
-	// packet enforcement before the process can serve.
-	flushOwnedTableRules(t, migrated)
+	// Owned packet-rule incompleteness is repairable while the witness survives.
+	// Missing table proof is tested separately and must never be repaired.
+	flushOwnedPacketRules(t, migrated)
 	daemon = startDaemon(t, configPath, migrated)
 	waitCrowdPacket(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop")
 	probeEgress(t, peer, "tcp4", fixtureIPv4Peer+":18081", "drop", "tcp")

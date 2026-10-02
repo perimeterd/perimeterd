@@ -102,8 +102,10 @@ The most useful file boundaries when changing an existing path are:
   native grammars, deterministic lowering, and snapshot decoding.
 - `internal/firewall/nftables.go` and `nftables_model.go`: nftables inspection,
   reconciliation, and native model generation.
-- `internal/state/store.go`, `records.go`, and `filesystem.go`: durable
-  lifecycle, record validation/encoding, and filesystem barriers.
+- `internal/state/store.go`, `records.go`, and `filesystem.go`: durable lifecycle,
+  record validation/encoding, and filesystem barriers, using internal state
+  format 2 with explicit rejection of version-1 development state and unknown
+  future versions before native mutation; no state conversion or owner floor.
 - `tests/e2e/`: namespace admission and isolation (`harness_test.go`), traffic
   probes (`network_test.go`), daemon lifecycle (`daemon_test.go`), geo
   scenarios (`geo_test.go`, `custom_list_test.go`, and `providers_test.go`), native backend scenarios (`nftables_test.go` and
@@ -219,6 +221,30 @@ explicit deadlines. Configuration files and readiness sockets use private,
 unique temporary directories, and table-deletion assertions require successful
 ruleset inspection plus explicit absence; command failures, timeouts, and
 malformed inspection output fail the assertion.
+
+The focused nft ownership scenarios are `TestE2ENFTReloadOwnership`,
+`TestE2ENFTMissingWitnessRefused` and `TestE2EOldStateRecordVersionRefused`.
+Run matching current-source daemon/test binaries on the pinned Rocky 8 guest
+and a modern kernel; revision selection alone is not proof of packet enforcement.
+They cover real reload traffic, stable witness identity, absent-table
+reconstruction, missing-witness refusal and explicit old-state rejection by
+both `run` and `cleanup`, before and after cleanup.
+
+Internal durable records use version 2 while the configuration schema remains
+version 1. There is no legacy layout migration or old-binary fixture requirement.
+The state-version regression supplies a checksum-valid version-1 owner envelope
+to the current daemon and requires a genuine bounded failure with unchanged
+durable/native bytes. A timeout is never a passing refusal.
+
+The sibling role's test-only `--candidate-dist` mode consumes original
+`make package` output and runs two disposable overlays per pinned guest. Build
+one real non-published snapshot, retain its metadata/checksums/package bytes,
+and use the exact same artifacts for every install/reinstall. Record the daemon
+HEAD **and dirty-tree patch/untracked source**, Go/tool versions, build command,
+native package NVR/architecture, image digest and full VM logs. Embedded HEAD
+and a source archive of HEAD alone do not identify dirty working-tree code.
+Local synthetic GitHub metadata and generated checksums are not independent
+provenance or signing, and local VM passes do not imply hosted CI or publication.
 
 Use the [verification matrix](#verification-matrix) for required behavior and
 the [service and packaging matrix](#service-and-packaging) for shared isolation

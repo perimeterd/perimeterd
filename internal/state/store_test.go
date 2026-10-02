@@ -47,7 +47,7 @@ func storeTestRevision(t *testing.T, store *Store, id string) *Revision {
 	if err != nil {
 		t.Fatalf("build store test target: %v", err)
 	}
-	return &Revision{Version: 1, ID: id, Epoch: 1, ConfigPath: "/does/not/exist.yaml", Config: cfg, Target: target}
+	return &Revision{Version: recordVersion, ID: id, Epoch: 1, ConfigPath: "/does/not/exist.yaml", Config: cfg, Target: target}
 }
 
 func openTestStore(t *testing.T, checkpoint func(string) error) (*Store, string) {
@@ -96,6 +96,52 @@ func persistStoreRevision(t *testing.T, store *Store, id string) *Revision {
 	return revision
 }
 
+func TestStoreRejectsUnsupportedOwnerVersionWithoutRewritingRecords(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version int
+		message string
+	}{
+		{name: "old state", version: 1, message: "record version 1 is unsupported"},
+		{name: "future state", version: 3, message: "record version 3 is unsupported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, dir := openTestStore(t, nil)
+			revision := persistStoreRevision(t, store, strings.Repeat("1", 32))
+			ownerPath := filepath.Join(dir, "owner.json")
+			mutateJSONFile(t, ownerPath, func(value map[string]any) {
+				value["version"] = tc.version
+			})
+			paths := []string{
+				ownerPath,
+				filepath.Join(dir, "active.json"),
+				filepath.Join(dir, "journal.json"),
+				filepath.Join(dir, "revisions", revision.ID+".json"),
+			}
+			before := make(map[string][]byte, len(paths))
+			for _, path := range paths {
+				data, err := os.ReadFile(path) // #nosec G304 -- paths are fixed durable records beneath t.TempDir.
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[path] = data
+			}
+			if _, err := Open(dir, nil); err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("open unsupported owner version: %v", err)
+			}
+			for _, path := range paths {
+				data, err := os.ReadFile(path) // #nosec G304 -- paths are fixed durable records beneath t.TempDir.
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(data, before[path]) {
+					t.Fatalf("rejected state rewrote %s", path)
+				}
+			}
+		})
+	}
+}
+
 func TestStoreRejectsMalformedVersionedMetadataAndBrokenReferences(t *testing.T) {
 	const id = "0123456789abcdef0123456789abcdef"
 
@@ -113,7 +159,7 @@ func TestStoreRejectsMalformedVersionedMetadataAndBrokenReferences(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		duplicate := bytes.Replace(owner, []byte(`"version":1,`), []byte(`"version":1,"version":1,`), 1)
+		duplicate := bytes.Replace(owner, []byte(`"version":2,`), []byte(`"version":2,"version":2,`), 1)
 		if bytes.Equal(owner, duplicate) {
 			t.Fatal("owner fixture did not contain its version field")
 		}
@@ -681,7 +727,7 @@ func iptablesStoreRevision(t *testing.T, store *Store, id, block string) *Revisi
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Revision{Version: 1, ID: id, Epoch: 1, ConfigPath: "/missing.yaml", Config: cfg, Target: target}
+	return &Revision{Version: recordVersion, ID: id, Epoch: 1, ConfigPath: "/missing.yaml", Config: cfg, Target: target}
 }
 
 func TestFamilyProgressSurvivesRestartWithoutCommittingCandidate(t *testing.T) {

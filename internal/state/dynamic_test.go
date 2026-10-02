@@ -22,7 +22,7 @@ func TestRestartRetainsDynamicContainerAndCredentialLocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	revision := &Revision{Version: 1, ID: id, Epoch: 1, ConfigPath: "/missing/configuration", Config: cfg, Target: target}
+	revision := &Revision{Version: recordVersion, ID: id, Epoch: 1, ConfigPath: "/missing/configuration", Config: cfg, Target: target}
 	if err := store.Prepare(nil, revision); err != nil {
 		t.Fatal(err)
 	}

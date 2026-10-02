@@ -417,13 +417,34 @@ before staging, unhooking, or deletion. A foreign name containing spaces or
 newlines cannot forge a complete generated identifier because every generated
 identifier occupies all 31 bytes of the kernel name limit.
 
-The nftables backend uses typed JSON inventory. It requires the marked `inet`
-table, exact ownership comments and types for chains and counters, complete
-expected set elements, and only recorded rules and objects. nft JSON does not
-round-trip set comments; set ownership therefore comes from the recorded
-owner/generation-qualified name plus exact type, flags, and contents inside the
-marked table. Unknown children or foreign references reject the operation
-rather than being adopted.
+The nftables backend uses typed JSON inventory and one portable rule-witness
+protocol on every kernel. Each authorized `inet` table contains the stable chain
+`pd_<owner>_stable_ownership`, with exactly one rule whose comment is
+`perimeterd owner=<owner> role=table_witness_v1` and expression is
+`[{"return":null}]`. This chain has no hook, type, priority, policy, flags or
+timeout, and no rule may jump or goto it. It never participates in packet
+processing or accounting.
+
+The witness proves table identity, not authorization to adopt an arbitrary
+table. Preflight authorizes only the durable previous target; an in-memory
+candidate, matching name or copied witness cannot expand that authority.
+Inside the proven table, the complete recorded inventory still governs chain
+definitions, counter roles, packet-rule comments/references, static set contents,
+and dynamic set metadata. Duplicate definitions, unknown children and foreign
+references reject the operation. New tables, chains and counters omit object
+comments; any conflicting comment on an existing object remains an error.
+
+A fresh table, policy and witness are installed atomically, followed by a bounded
+typed read-back of the witness before durable commit. Ordinary repair preserves
+the witness; an existing recorded table without it is refused, never adopted or
+repaired. A completely absent table can be reconstructed from validated durable
+state. The witness survives generation retirement and is removed only with
+authorized final table deletion. Counter reads require the same witness/table
+authority independently of the selected target's expected counter identities
+and roles.
+
+The internal state format is version 2. Old development state is rejected, not
+converted; object comments are never an alternative ownership proof.
 
 ## Failure and cleanup behavior
 

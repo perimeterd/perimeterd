@@ -227,7 +227,7 @@ func benchmarkAppReconcileSetup(b *testing.B, geoCount, crowdCount int) (*Engine
 		b.Fatal(err)
 	}
 	revision := &state.Revision{
-		Version: 1, ID: generation, Epoch: 1, ConfigPath: "benchmark.yaml", Config: cfg,
+		Version: 2, ID: generation, Epoch: 1, ConfigPath: "benchmark.yaml", Config: cfg,
 		Manifest: cached.ManifestID(), Target: target,
 	}
 	client, err := crowd.NewClient(cfg.CrowdSec, nil)

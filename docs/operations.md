@@ -519,13 +519,31 @@ are in [Packet and byte accounting](firewall-backends.md#packet-and-byte-account
    inactive, and run `cleanup` with the source-built or installed binary
    (`sudo bin/perimeterd cleanup` or `sudo /usr/bin/perimeterd cleanup`). Package
    removal performs this cleanup through its
-   [lifecycle procedure](#package-lifecycle). Purge state only after cleanup
-   reports success.
+   [lifecycle procedure](#package-lifecycle). Cleanup retains the owner identity.
+   Do not purge or relabel retained state to make an incompatible daemon start.
 
 Backend-specific mixed-family windows, migration overlap, retained ownership,
 and degraded recovery are defined in
 [architecture](architecture.md#durable-apply-and-crash-recovery) and
 [firewall backend failure behavior](firewall-backends.md#failure-and-cleanup-behavior).
+
+## Unsupported development state
+
+Internal durable records use version 2; the configuration schema remains
+version 1. Because perimeterd has not been deployed, version-1 development
+state is unsupported rather than migrated. Both `run` and `cleanup` reject
+unsupported record versions without changing durable records or native rules.
+Changing a record's version number does not make its contents compatible.
+
+Recreate disposable development guests instead of converting their records.
+For any manual decommissioning of a retained host, stop the daemon, preserve
+private state and native inventories, and require operator review of exact
+resources and any enforcement gap. Never flush the host ruleset, delete
+unrelated tables or bypass ownership validation.
+
+There is no automatic legacy-table adoption. An existing table without the
+canonical witness fails ownership validation; complete table absence permits
+reconstruction only from validated current-format state.
 
 ## Supported CrowdSec LAPI prerequisite
 
@@ -901,3 +919,11 @@ may remove retained private data manually only after successful cleanup and
 after confirming no perimeterd process remains. Scripts never flush global
 netfilter state, create Docker-owned chains, infer ownership from names alone,
 or remove the host-wide xtables lock.
+
+Package downgrade permission is not persistent-state compatibility. The daemon
+supports internal state format 2, not earlier development formats. Cleanup
+retains its versioned owner record; installing an older reader does not convert
+that state. Use a binary compatible with the retained format, or recreate a
+disposable development guest. Never erase or relabel records to force startup;
+permanent removal of retained data is a separate decommissioning decision.
+

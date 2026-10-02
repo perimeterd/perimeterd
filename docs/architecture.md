@@ -539,7 +539,7 @@ unjournaled target may be created.
 
 | Record | Responsibility |
 | --- | --- |
-| Owner record | Persistent identity used to validate owned native objects |
+| Owner record | Persistent native ownership identity |
 | Immutable revision | Validated configuration and config path, compiled target/generation, snapshot manifest, and admission epoch |
 | Journal | Transaction identity, operation/phase, previous and candidate revision/manifest references, and observed iptables family selections |
 | Active record | The ID of the selected immutable revision |
@@ -606,7 +606,7 @@ At startup, while holding lifecycle ownership and before admitting new work:
 1. Validate the journal, active record, referenced immutable files, and observed
    ownership markers. Missing or inconsistent evidence fails closed to operator
    repair; never infer deletion authority from a name alone.
-2. If the active record does not name the prepared transaction, restore the
+2. For an ordinary apply, if the active record does not name the prepared transaction, restore the
    previous owned static selection and remove the candidate artifacts. For a
    first installation with no previous selection, remove only recorded candidate
    artifacts. Recovery is idempotent and inspects actual rules because a crash
@@ -627,6 +627,24 @@ An explicit cleanup intent instead resumes deletion of all recorded owned
 targets; it never restores a policy being intentionally removed. Remove its
 active record only after owned artifacts are gone. Partial cleanup retains
 the journal and metadata for the next invocation.
+
+### Internal state format
+
+Durable record envelopes, revisions and journals use version 2; the configuration
+schema remains version 1. This is a clean pre-deployment cutover, not a migration.
+Version-1 development state and unknown future versions are rejected explicitly
+before native mutation. Records are never rewritten or relabeled to bypass
+that rejection.
+
+Every nft target uses the canonical rule-witness ownership protocol. There is
+no per-target layout selector, owner floor or ownership-upgrade transaction.
+Ordinary apply and cleanup are the only journal operations. Their existing
+commit/rollback recovery, source/client publication gates and counter-retirement
+semantics remain unchanged.
+
+Cleanup retains the owner identity. Complete native table absence permits
+reconstruction from validated current-format state; a missing or malformed
+witness in an existing table never permits adoption or fallback.
 
 ### Recovery failure
 

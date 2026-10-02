@@ -135,6 +135,11 @@ func Run(ctx context.Context, options Options) error {
 	engine.setTelemetry(collector)
 	engine.ConfigureCrowdSecTransport(opts.SourceClient)
 	defer engine.Close()
+
+	recovered, err := recoverUntilReady(startupCtx, engine, nil)
+	if err != nil {
+		return errors.Join(err, stopNotifier())
+	}
 	lookupPath := filepath.Join(filepath.Dir(opts.LockPath), "lookup.sock")
 	lookupServer, err := lookup.Listen(lookupPath, engine.Lookup)
 	if err != nil {
@@ -151,11 +156,6 @@ func Run(ctx context.Context, options Options) error {
 			}
 		}
 	}()
-
-	recovered, err := recoverUntilReady(startupCtx, engine, nil)
-	if err != nil {
-		return errors.Join(err, stopNotifier())
-	}
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, stopNotifier())
 	}

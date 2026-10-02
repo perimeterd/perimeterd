@@ -97,11 +97,15 @@ type nftObject struct {
 	Type       string
 	Hook       string
 	Policy     string
+	HasType    bool
+	HasHook    bool
+	HasPolicy  bool
 	Prio       int32
 	HasPrio    bool
 	Expr       []json.RawMessage
 	Elem       json.RawMessage
 	Flags      []string
+	HasFlags   bool
 	Timeout    json.RawMessage
 	HasTimeout bool
 	Packets    json.RawMessage
@@ -127,10 +131,6 @@ type nftInventory struct {
 
 func newNFTInventory() *nftInventory {
 	return &nftInventory{chains: make(map[string]nftObject), sets: make(map[string]nftObject), counters: make(map[string]nftObject)}
-}
-
-func (n *nftInventory) hasTable(target *Target) bool {
-	return n != nil && n.present && n.table.Comment == tableComment(target.Owner)
 }
 
 func (n *nftInventory) hasChain(name string) bool {
@@ -203,9 +203,11 @@ func (n *NFT) inspect(ctx context.Context, table string, targets ...*Target) (*n
 	inventory := newNFTInventory()
 	for _, object := range tables {
 		if object.Kind == "table" && object.Family == "inet" && object.Name == table {
+			if inventory.present && inventory.table.Name != "" {
+				return nil, errors.New("nft backend: duplicate table inventory")
+			}
 			inventory.present = true
 			inventory.table = object
-			break
 		}
 	}
 	if !inventory.present {
@@ -216,25 +218,37 @@ func (n *NFT) inspect(ctx context.Context, table string, targets ...*Target) (*n
 		return nil, err
 	}
 	inventory.sizeBytes = sizeBytes
+	tableCount := 0
 	for _, object := range objects {
 		switch object.Kind {
 		case "table":
-			if object.Family == "inet" && object.Name == table {
-				inventory.table = object
+			if object.Family != "inet" || object.Name != table || tableCount != 0 {
+				return nil, errors.New("nft backend: malformed or duplicate table inventory")
 			}
+			tableCount++
+			inventory.table = object
 		case "chain":
 			if object.Family != "inet" || object.Table != table || object.Name == "" {
 				return nil, errors.New("nft backend: malformed chain inventory")
+			}
+			if _, exists := inventory.chains[object.Name]; exists {
+				return nil, errors.New("nft backend: duplicate chain inventory")
 			}
 			inventory.chains[object.Name] = object
 		case "set":
 			if object.Family != "inet" || object.Table != table || object.Name == "" {
 				return nil, errors.New("nft backend: malformed set inventory")
 			}
+			if _, exists := inventory.sets[object.Name]; exists {
+				return nil, errors.New("nft backend: duplicate set inventory")
+			}
 			inventory.sets[object.Name] = object
 		case "counter":
 			if object.Family != "inet" || object.Table != table || object.Name == "" {
 				return nil, errors.New("nft backend: malformed counter inventory")
+			}
+			if _, exists := inventory.counters[object.Name]; exists {
+				return nil, errors.New("nft backend: duplicate counter inventory")
 			}
 			inventory.counters[object.Name] = object
 		case "rule":
@@ -249,8 +263,10 @@ func (n *NFT) inspect(ctx context.Context, table string, targets ...*Target) (*n
 			return nil, fmt.Errorf("nft backend: unsupported object %q in table inventory", object.Kind)
 		}
 	}
-	if err := validateInventory(inventory, targets...); err != nil {
-		return nil, err
+	if len(targets) != 0 {
+		if err := validateInventory(inventory, targets...); err != nil {
+			return nil, err
+		}
 	}
 	return inventory, nil
 }
@@ -338,6 +354,20 @@ func decodeNFTObject(kind string, raw json.RawMessage) (nftObject, error) {
 	object.Flags, object.Timeout = common.Flags, common.Timeout
 	object.Packets, object.Bytes = common.Packets, common.Bytes
 	object.HasTimeout = common.Timeout != nil
+	object.HasFlags = common.Flags != nil
+	if kind == "chain" {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return object, err
+		}
+		_, object.HasType = fields["type"]
+		_, object.HasHook = fields["hook"]
+		_, object.HasPolicy = fields["policy"]
+		_, object.HasFlags = fields["flags"]
+		if _, present := fields["prio"]; present && common.Prio == "" {
+			return object, errors.New("nft backend: malformed chain priority")
+		}
+	}
 	if common.Prio != "" {
 		value, err := strconv.ParseInt(string(common.Prio), 10, 32)
 		if err != nil {
@@ -504,6 +534,7 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 	counterComments := make(map[string]string)
 	ruleChains := make(map[string]string)
 	var owner string
+	var authority *Target
 	for _, target := range targets {
 		if target == nil {
 			continue
@@ -520,6 +551,13 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 			continue
 		}
 		valid["table"] = struct{}{}
+		if authority == nil {
+			authority = target
+		}
+		name := witnessChainName(target)
+		valid["chain/"+name] = struct{}{}
+		chainComments[name] = ""
+		ruleChains[witnessRule(target)["comment"].(string)] = name
 		for _, value := range []policy.Direction{policy.Ingress, policy.Egress} {
 			base := baseChainName(target, value)
 			valid["chain/"+base] = struct{}{}
@@ -579,8 +617,11 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 			ruleChains[comment] = baseChainName(target, policy.Egress)
 		}
 	}
-	if owner != "" && inventory.table.Comment != tableComment(owner) {
-		return errors.New("nft backend: table ownership collision")
+	if authority == nil {
+		return errors.New("nft backend: table has no recorded authority")
+	}
+	if err := validateNFTTableProof(inventory, authority); err != nil {
+		return err
 	}
 	for name, set := range inventory.sets {
 		if _, ok := valid["set/"+name]; !ok {
@@ -614,7 +655,7 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 		if _, ok := valid["chain/"+name]; !ok {
 			return fmt.Errorf("nft backend: unknown or foreign chain %q", name)
 		}
-		if expected, ok := chainComments[name]; !ok || chain.Comment != expected {
+		if expected, ok := chainComments[name]; !ok || !nftObjectCommentMatches(chain.Comment, expected) {
 			return fmt.Errorf("nft backend: chain %q has foreign ownership marker", name)
 		}
 		if definitions, ok := baseDefs[name]; ok {
@@ -631,12 +672,15 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 		} else if chain.Type != "" || chain.Hook != "" || chain.Policy != "" || chain.HasPrio {
 			return fmt.Errorf("nft backend: regular chain %q is unexpectedly hooked", name)
 		}
+		if len(chain.Flags) != 0 || chain.HasTimeout {
+			return fmt.Errorf("nft backend: chain %q has unexpected flags or timeout", name)
+		}
 	}
 	for name, counter := range inventory.counters {
 		if _, ok := valid["counter/"+name]; !ok {
 			return fmt.Errorf("nft backend: unknown or foreign counter %q", name)
 		}
-		if expected, ok := counterComments[name]; !ok || counter.Comment != expected {
+		if expected, ok := counterComments[name]; !ok || !nftObjectCommentMatches(counter.Comment, expected) {
 			return fmt.Errorf("nft backend: counter %q has foreign ownership marker", name)
 		}
 	}
@@ -646,6 +690,101 @@ func validateInventory(inventory *nftInventory, targets ...*Target) error {
 		}
 	}
 	return nil
+}
+
+func nftObjectCommentMatches(observed, expected string) bool {
+	return observed == "" || observed == expected
+}
+
+// Table proof is independent of the counter identities selected for a sample.
+func validateNFTTableProof(inventory *nftInventory, target *Target) error {
+	if inventory == nil || !inventory.present || inventory.table.Family != "inet" || inventory.table.Name != target.Table {
+		return errors.New("nft backend: table authority mismatch")
+	}
+	if !nftObjectCommentMatches(inventory.table.Comment, tableComment(target.Owner)) {
+		return errors.New("nft backend: table ownership collision")
+	}
+	return validateNFTWitness(inventory, target)
+}
+
+func validateNFTWitness(inventory *nftInventory, target *Target) error {
+	name := witnessChainName(target)
+	chain, ok := inventory.chains[name]
+	if !ok || chain.Family != "inet" || chain.Table != target.Table || chain.Name != name ||
+		chain.Comment != "" || chain.HasType || chain.HasHook || chain.HasPolicy || chain.Type != "" || chain.Hook != "" || chain.Policy != "" ||
+		chain.HasPrio || chain.HasFlags || len(chain.Flags) != 0 || chain.HasTimeout ||
+		!chainRulesComplete(inventory, name, []map[string]any{witnessRule(target)}) {
+		return errors.New("nft backend: missing or malformed ownership witness")
+	}
+	for _, rule := range inventory.rules {
+		for _, raw := range rule.Expr {
+			var expression any
+			if err := json.Unmarshal(raw, &expression); err != nil {
+				return errors.New("nft backend: malformed rule expression")
+			}
+			if nftReferencesChain(expression, name) {
+				return errors.New("nft backend: ownership witness is referenced")
+			}
+		}
+	}
+	return nil
+}
+
+func nftReferencesChain(value any, name string) bool {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if key == "jump" || key == "goto" {
+				if reference, ok := child.(map[string]any); ok && reference["target"] == name {
+					return true
+				}
+			}
+			if nftReferencesChain(child, name) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range value {
+			if nftReferencesChain(child, name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (n *NFT) readWitness(ctx context.Context, target *Target) error {
+	request := map[string]any{"nftables": []any{map[string]any{"list": map[string]any{"chain": objectRef(target.Table, witnessChainName(target))}}}}
+	input, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	data, err := n.run(ctx, []string{"-j", "-f", "-"}, input)
+	if err != nil {
+		return fmt.Errorf("nft backend: ownership witness read-back: %w", err)
+	}
+	objects, err := decodeNFTObjects(data)
+	if err != nil {
+		return err
+	}
+	inventory := newNFTInventory()
+	for _, object := range objects {
+		switch object.Kind {
+		case "chain":
+			if object.Name != witnessChainName(target) || object.Family != "inet" || object.Table != target.Table || len(inventory.chains) != 0 {
+				return errors.New("nft backend: malformed ownership witness read-back")
+			}
+			inventory.chains[object.Name] = object
+		case "rule":
+			if object.Family != "inet" || object.Table != target.Table || object.Chain != witnessChainName(target) {
+				return errors.New("nft backend: malformed ownership witness read-back rule")
+			}
+			inventory.rules = append(inventory.rules, object)
+		default:
+			return errors.New("nft backend: unexpected ownership witness read-back object")
+		}
+	}
+	return validateNFTWitness(inventory, target)
 }
 
 func (n *NFT) probe(ctx context.Context) error {
@@ -690,7 +829,7 @@ func (n *NFT) Preflight(ctx context.Context, previous, candidate *Target, dynami
 			continue
 		}
 		seen[target.Table] = struct{}{}
-		if _, err := n.inspect(ctx, target.Table, previous, candidate); err != nil {
+		if _, err := n.inspect(ctx, target.Table, previous); err != nil {
 			return err
 		}
 	}
@@ -737,7 +876,13 @@ func (n *NFT) Apply(ctx context.Context, previous, candidate *Target, dynamic *D
 	if err != nil {
 		return err
 	}
-	return n.applyBatch(ctx, batch)
+	if err := n.applyBatch(ctx, batch); err != nil {
+		return err
+	}
+	if !inventory.present {
+		return n.readWitness(ctx, candidate)
+	}
+	return nil
 }
 
 func encodeNFTBatch(batch nftBatch) ([]byte, error) {
@@ -854,7 +999,7 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 			return nil
 		}
 		if n.retirement != nil && n.retirement.enabled() {
-			values, snapshotErr := nftCounterSnapshots(previous, inventory)
+			values, snapshotErr := nftCounterSnapshots(previous, inventory, previous)
 			n.retirement.report(previous, values, snapshotErr)
 		}
 		return n.applyBatch(ctx, nftBatch{Nftables: []nftCommand{{Delete: map[string]any{"table": map[string]any{"family": "inet", "name": previous.Table}}}}})
@@ -932,7 +1077,7 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 		}
 	}
 	if n.retirement != nil && n.retirement.enabled() {
-		values, snapshotErr := nftCounterSnapshots(previous, inventory)
+		values, snapshotErr := nftCounterSnapshots(previous, inventory, candidate)
 		n.retirement.report(previous, values, snapshotErr)
 	}
 	return n.applyBatch(ctx, batch)
@@ -950,7 +1095,7 @@ func (n *NFT) retireSingle(ctx context.Context, target *Target) error {
 		return nil
 	}
 	if n.retirement != nil && n.retirement.enabled() {
-		values, snapshotErr := nftCounterSnapshots(target, inventory)
+		values, snapshotErr := nftCounterSnapshots(target, inventory, target)
 		n.retirement.report(target, values, snapshotErr)
 	}
 	return n.applyBatch(ctx, nftBatch{Nftables: []nftCommand{{Delete: map[string]any{"table": map[string]any{"family": "inet", "name": target.Table}}}}})
@@ -1014,60 +1159,26 @@ func (n *NFT) SnapshotCounters(ctx context.Context, target *Target) (map[string]
 	if err != nil {
 		return nil, err
 	}
-	return nftCounterSnapshots(target, inventory)
+	return nftCounterSnapshots(target, inventory, target)
 }
 
 func (n *NFT) counterInventory(ctx context.Context, target *Target) (*nftInventory, error) {
-	tables, err := n.listTables(ctx)
+	inventory, err := n.inspect(ctx, target.Table)
 	if err != nil {
 		return nil, err
 	}
-	var table *nftObject
-	for index := range tables {
-		object := &tables[index]
-		if object.Kind == "table" && object.Family == "inet" && object.Name == target.Table {
-			if table != nil {
-				return nil, errors.New("nft backend: duplicate table in counter snapshot")
-			}
-			table = object
-		}
-	}
-	if table == nil {
-		return nil, errors.New("nft backend: owned table is absent during counter snapshot")
-	}
-	if table.Comment != tableComment(target.Owner) {
-		return nil, errors.New("nft backend: counter snapshot table ownership mismatch")
-	}
-	objects, _, err := n.listTable(ctx, target.Table)
-	if err != nil {
+	if err := validateNFTTableProof(inventory, target); err != nil {
 		return nil, err
-	}
-	inventory := newNFTInventory()
-	inventory.present, inventory.table = true, *table
-	for _, object := range objects {
-		if object.Kind == "table" && object.Family == "inet" && object.Name == target.Table {
-			if object.Comment != tableComment(target.Owner) {
-				return nil, errors.New("nft backend: counter snapshot table ownership mismatch")
-			}
-			inventory.table = object
-		}
-		if object.Kind != "counter" {
-			continue
-		}
-		if object.Family != "inet" || object.Table != target.Table || object.Name == "" {
-			return nil, errors.New("nft backend: malformed counter snapshot inventory")
-		}
-		if _, exists := inventory.counters[object.Name]; exists {
-			return nil, fmt.Errorf("nft backend: duplicate counter %q in snapshot", object.Name)
-		}
-		inventory.counters[object.Name] = object
 	}
 	return inventory, nil
 }
 
-func nftCounterSnapshots(target *Target, inventory *nftInventory) (map[string]CounterSnapshot, error) {
-	if inventory == nil || !inventory.present || inventory.table.Comment != tableComment(target.Owner) {
-		return nil, errors.New("nft backend: owned table is absent or not owned during counter snapshot")
+func nftCounterSnapshots(target *Target, inventory *nftInventory, authority *Target) (map[string]CounterSnapshot, error) {
+	if authority == nil || target.Owner != authority.Owner || target.Table != authority.Table {
+		return nil, errors.New("nft backend: counter snapshot authority mismatch")
+	}
+	if err := validateNFTTableProof(inventory, authority); err != nil {
+		return nil, err
 	}
 	if len(target.Counters) > maxCounterSnapshotRows {
 		return nil, fmt.Errorf("nft backend: counter snapshot exceeds %d rules", maxCounterSnapshotRows)
@@ -1083,7 +1194,7 @@ func nftCounterSnapshots(target *Target, inventory *nftInventory) (map[string]Co
 			return nil, fmt.Errorf("nft backend: owned counter %q is absent", spec.Name)
 		}
 		if counter.Family != "inet" || counter.Table != target.Table ||
-			counter.Comment != ownershipComment(target.Owner, stableToken, "counter/"+spec.Name, true) {
+			!nftObjectCommentMatches(counter.Comment, ownershipComment(target.Owner, stableToken, "counter/"+spec.Name, true)) {
 			return nil, fmt.Errorf("nft backend: counter %q ownership mismatch", spec.Name)
 		}
 		packets, err := parseNFTCounterValue(counter.Packets)

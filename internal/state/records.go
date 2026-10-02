@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	recordVersion  = 1
+	recordVersion  = 2
 	idLength       = 32
 	maxRecordBytes = 16 << 20
 	stateDirMode   = 0o700
@@ -37,7 +37,7 @@ type Revision struct {
 	Target          *firewall.Target `json:"target"`
 }
 
-// Journal describes an in-flight apply or explicit cleanup operation.
+// Journal describes an in-flight policy apply or cleanup.
 type Journal struct {
 	Version           int               `json:"version"`
 	ID                string            `json:"id"`

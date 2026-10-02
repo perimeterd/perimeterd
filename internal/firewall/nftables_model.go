@@ -473,19 +473,16 @@ func commandBatch(target *Target, inventory *nftInventory, dynamic *DynamicState
 	}
 	var batch nftBatch
 	if inventory == nil || !inventory.present {
-		batch.Nftables = append(batch.Nftables, nftCommand{Create: map[string]any{"table": map[string]any{
-			"family": "inet", "name": target.Table, "comment": tableComment(target.Owner),
-		}}})
+		definition := map[string]any{"family": "inet", "name": target.Table}
+		batch.Nftables = append(batch.Nftables, nftCommand{Create: map[string]any{"table": definition}})
+		batch.Nftables = append(batch.Nftables, witnessCommands(target)...)
 	}
 	// Counters, static sets and generated chains are immutable per generation.
 	for _, counter := range target.Counters {
 		if inventory != nil && inventory.hasCounter(counter.Name) {
 			continue
 		}
-		batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"counter": map[string]any{
-			"family": "inet", "table": target.Table, "name": counter.Name,
-			"comment": ownershipComment(target.Owner, stableToken, "counter/"+counter.Name, true),
-		}}})
+		batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"counter": objectRef(target.Table, counter.Name)}})
 	}
 	now := time.Now()
 	for _, family := range target.Families {
@@ -549,10 +546,7 @@ func commandBatch(target *Target, inventory *nftInventory, dynamic *DynamicState
 					batch.Nftables = append(batch.Nftables, nftCommand{Flush: map[string]any{"chain": objectRef(target.Table, name)}})
 				}
 			} else {
-				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"chain": map[string]any{
-					"family": "inet", "table": target.Table, "name": name,
-					"comment": ownershipComment(target.Owner, target.Generation, chainRole(family.Family, direction), false),
-				}}})
+				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"chain": objectRef(target.Table, name)}})
 			}
 			if inventory == nil || !inventory.hasChain(name) || !keepGeneration {
 				for _, rule := range familyPathRules(target, family, direction) {
@@ -567,10 +561,7 @@ func commandBatch(target *Target, inventory *nftInventory, dynamic *DynamicState
 			name := entryChainName(target, family.Family, direction)
 			exists := inventory != nil && inventory.hasChain(name)
 			if !exists {
-				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"chain": map[string]any{
-					"family": "inet", "table": target.Table, "name": name,
-					"comment": ownershipComment(target.Owner, stableToken, entryRole(family.Family, direction), true),
-				}}})
+				batch.Nftables = append(batch.Nftables, nftCommand{Add: map[string]any{"chain": objectRef(target.Table, name)}})
 			} else if !keepEntry {
 				batch.Nftables = append(batch.Nftables, nftCommand{Flush: map[string]any{"chain": objectRef(target.Table, name)}})
 			}
@@ -616,12 +607,31 @@ func objectRef(table, name string) map[string]any {
 	return map[string]any{"family": "inet", "table": table, "name": name}
 }
 
+func witnessChainName(target *Target) string {
+	return artifactName(target.Owner, stableToken, "ownership")
+}
+
+func witnessRule(target *Target) map[string]any {
+	return map[string]any{
+		"family": "inet", "table": target.Table, "chain": witnessChainName(target),
+		"comment": ownershipComment(target.Owner, stableToken, "table_witness_v1", true),
+		"expr":    []any{map[string]any{"return": nil}},
+	}
+}
+
+func witnessCommands(target *Target) []nftCommand {
+	return []nftCommand{
+		{Add: map[string]any{"chain": objectRef(target.Table, witnessChainName(target))}},
+		{Add: map[string]any{"rule": witnessRule(target)}},
+	}
+}
+
 func baseChain(target *Target, direction policy.Direction) map[string]any {
 	hook := "input"
 	if direction == policy.Egress {
 		hook = "output"
 	}
-	return map[string]any{"family": "inet", "table": target.Table, "name": baseChainName(target, direction), "type": "filter", "hook": hook, "prio": target.Priority, "policy": "accept", "comment": ownershipComment(target.Owner, stableToken, baseRole(direction), true)}
+	return map[string]any{"family": "inet", "table": target.Table, "name": baseChainName(target, direction), "type": "filter", "hook": hook, "prio": target.Priority, "policy": "accept"}
 }
 
 func baseRules(target *Target, direction policy.Direction) []map[string]any {
@@ -645,7 +655,7 @@ func entryRules(target *Target, family policy.Family, direction policy.Direction
 	counter := counterName(target.Owner, family, direction, policy.CounterRole{Kind: policy.Processed})
 	return []map[string]any{
 		{"family": "inet", "table": target.Table, "chain": chain, "comment": ownershipComment(target.Owner, stableToken, role+"/processed", true), "expr": []any{map[string]any{"counter": counter}}},
-		{"family": "inet", "table": target.Table, "chain": chain, "comment": ownershipComment(target.Owner, stableToken, role+"/established", true), "expr": []any{map[string]any{"match": map[string]any{"op": "in", "left": map[string]any{"ct": map[string]any{"key": "state"}}, "right": map[string]any{"set": []any{"established", "related"}}}}, map[string]any{"return": nil}}},
+		{"family": "inet", "table": target.Table, "chain": chain, "comment": ownershipComment(target.Owner, stableToken, role+"/established", true), "expr": []any{map[string]any{"match": map[string]any{"op": "==", "left": map[string]any{"ct": map[string]any{"key": "state"}}, "right": map[string]any{"set": []any{"established", "related"}}}}, map[string]any{"return": nil}}},
 		{"family": "inet", "table": target.Table, "chain": chain, "comment": ownershipComment(target.Owner, stableToken, role+"/not-new", true), "expr": []any{map[string]any{"match": map[string]any{"op": "!=", "left": map[string]any{"ct": map[string]any{"key": "state"}}, "right": "new"}}, map[string]any{"return": nil}}},
 		{"family": "inet", "table": target.Table, "chain": chain, "comment": ownershipComment(target.Owner, target.Generation, role+"/dispatch", false), "expr": []any{map[string]any{"jump": map[string]any{"target": generationChainName(target, family, direction)}}}},
 	}

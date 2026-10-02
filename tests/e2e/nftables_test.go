@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -96,10 +97,25 @@ func createForeignTable(t *testing.T, table string) {
 	commandInput(t, 10*time.Second, []byte(batch), "nft", "-j", "-f", "-")
 }
 
-func flushOwnedTableRules(t *testing.T, table string) {
+func flushOwnedPacketRules(t *testing.T, table string) {
 	t.Helper()
-	batch := fmt.Sprintf(`{"nftables":[{"flush":{"table":{"family":"inet","name":"%s"}}}]}`, table)
-	commandInput(t, 10*time.Second, []byte(batch), "nft", "-j", "-f", "-")
+	witness := witnessRule(t, table)["chain"]
+	var commands []any
+	walkJSON(objectJSON(t, table), func(object map[string]any) {
+		if chain, ok := object["chain"].(map[string]any); ok && chain["name"] != witness {
+			commands = append(commands, map[string]any{"flush": map[string]any{"chain": map[string]any{
+				"family": "inet", "table": table, "name": chain["name"],
+			}}})
+		}
+	})
+	if len(commands) == 0 {
+		t.Fatal("repair fixture has no packet-path chains")
+	}
+	batch, err := json.Marshal(map[string]any{"nftables": commands})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandInput(t, 10*time.Second, batch, "nft", "-j", "-f", "-")
 }
 
 func objectJSON(t *testing.T, table string) any {
@@ -125,6 +141,11 @@ type nftChainMetadata struct {
 func ownedBaseChain(t *testing.T, table string) nftChainMetadata {
 	t.Helper()
 	var found nftChainMetadata
+	witnessName, ok := witnessRule(t, table)["chain"].(string)
+	if !ok || !strings.HasSuffix(witnessName, "_stable_ownership") {
+		t.Fatal("witness has an unexpected native chain identity")
+	}
+	basePrefix := strings.TrimSuffix(witnessName, "ownership")
 	walkJSON(objectJSON(t, table), func(object map[string]any) {
 		if found.Name != "" {
 			return
@@ -136,7 +157,7 @@ func ownedBaseChain(t *testing.T, table string) nftChainMetadata {
 		hook, _ := chain["hook"].(string)
 		name, _ := chain["name"].(string)
 		comment, _ := chain["comment"].(string)
-		if name == "" || comment == "" || (hook != "input" && hook != "output") {
+		if (name != basePrefix+"base_ingress" && name != basePrefix+"base_egress") || (hook != "input" && hook != "output") {
 			return
 		}
 		prio, ok := chain["prio"].(float64)

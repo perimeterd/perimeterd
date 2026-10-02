@@ -307,7 +307,7 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
 	candidateRevision := &state.Revision{
-		Version:         1,
+		Version:         2,
 		ID:              transaction,
 		Epoch:           candidate.epoch,
 		ConfigPath:      candidate.path,
@@ -469,6 +469,9 @@ func (e *Engine) Recover(ctx context.Context) (revision *state.Revision, resultE
 	defer e.mu.Unlock()
 	revision, err := e.recoverLocked(ctx)
 	if err == nil {
+		e.healthy.Store(true)
+	}
+	if err == nil {
 		err = e.crowd.recoverLocked(ctx, revision)
 	}
 	if err == nil {
@@ -483,6 +486,7 @@ func (e *Engine) Recover(ctx context.Context) (revision *state.Revision, resultE
 
 func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 	e.invalidateLookupLocked()
+	e.healthy.Store(false)
 	if e.closing.Load() {
 		return nil, errEngineClosed
 	}
@@ -490,7 +494,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		return nil, errors.New("engine requires a state store and firewall backend")
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, e.recoveryFailureLocked(err)
 	}
 	view, err := e.store.Read()
 	if err != nil {
@@ -505,7 +509,6 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 	}
 	if view.Journal == nil {
 		if view.Active == nil {
-			e.healthy.Store(true)
 			e.adoptActiveEpochLocked(nil)
 			return nil, nil
 		}
@@ -530,7 +533,6 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		if err := e.store.Finish(); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		e.healthy.Store(true)
 		e.adoptActiveEpochLocked(view.Active)
 		return view.Active, nil
 	}
@@ -539,7 +541,6 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		if err := e.cleanupViewLocked(ctx, view); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		e.healthy.Store(true)
 		e.adoptActiveEpochLocked(nil)
 		return nil, nil
 	}
@@ -577,7 +578,6 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		if err := e.store.Finish(); err != nil {
 			return nil, e.recoveryFailureLocked(err)
 		}
-		e.healthy.Store(true)
 		e.adoptActiveEpochLocked(candidate)
 		return candidate, nil
 	}
@@ -590,7 +590,6 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 	if err := e.store.Finish(); err != nil {
 		return nil, e.recoveryFailureLocked(err)
 	}
-	e.healthy.Store(true)
 	e.adoptActiveEpochLocked(previous)
 	return previous, nil
 }
@@ -613,6 +612,8 @@ func (e *Engine) Cleanup(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	e.applyMu.Lock()
+	defer e.applyMu.Unlock()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := ctx.Err(); err != nil {
