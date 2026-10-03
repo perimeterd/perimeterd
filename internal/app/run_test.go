@@ -69,6 +69,48 @@ func TestSystemdNotifyUsesUnixDatagram(t *testing.T) {
 	}
 }
 
+func TestRunReadinessNotificationFailureReleasesOwnership(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.yaml")
+	stateDir := filepath.Join(dir, "state")
+	lockPath := filepath.Join(stateDir, "run", "owner.lock")
+	address := runAddress(t)
+	writeRunConfig(t, path, address, "8.8.8.8/32")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	notificationErr := errors.New("readiness notification failed")
+	err := Run(ctx, Options{
+		ConfigPath: path,
+		StateDir:   stateDir,
+		LockPath:   lockPath,
+		Backend:    &runBackend{recordingBackend: &recordingBackend{}, applied: make(chan struct{}, 1)},
+		Signals:    make(chan os.Signal),
+		Stderr:     io.Discard,
+		Notify: func(message string) error {
+			if strings.Contains(message, "READY=1") {
+				return notificationErr
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, notificationErr) {
+		t.Fatalf("startup error: got %v, want %v", err, notificationErr)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "run", "lookup.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("startup failure retained control socket: %v", err)
+	}
+	lock, err := state.AcquireLock(lockPath)
+	if err != nil {
+		t.Fatalf("startup failure retained lifecycle lock: %v", err)
+	}
+	defer func() { _ = lock.Close() }()
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("startup failure retained metrics listener: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+}
+
 func TestMetricsHealthEndpointAndBindPromotion(t *testing.T) {
 	var health atomic.Bool
 	health.Store(true)

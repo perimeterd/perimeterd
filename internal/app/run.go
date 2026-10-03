@@ -255,11 +255,10 @@ func Run(ctx context.Context, options Options) error {
 	if err := startupCtx.Err(); err != nil {
 		return err
 	}
-	if err := opts.Notify("READY=1\nSTATUS=perimeterd running"); err != nil {
-		return fmt.Errorf("send readiness notification: %w", err)
+	if err := bridge.notifyReady(opts.Notify); err != nil {
+		return err
 	}
 
-	bridge.ready.Store(true)
 	producerCtx, cancelProducers := context.WithCancel(runCtx)
 	defer cancelProducers()
 	results := make(chan stageResult, 8)

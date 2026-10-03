@@ -50,7 +50,7 @@ func TestBackgroundRefreshCannotCompleteReloadWaiter(t *testing.T) {
 	go func() {
 		result <- control.ReloadPath(context.Background(), filepath.Join(stateDir, "run", "lookup.sock"), control.ReloadRequest{})
 	}()
-	awaitBoundary(t, entered)
+	awaitReloadBoundary(t, "reload:after-read", entered, result)
 	sourceAddress.Store("9.9.9.9/32")
 	// The real refresh timer drives this barrier; no race-guessing sleep.
 	awaitSourcePolicy(t, backend.policies, "9.9.9.9/32")

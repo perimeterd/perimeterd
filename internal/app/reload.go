@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 
 	"github.com/perimeterd/perimeterd/internal/control"
@@ -22,6 +23,15 @@ type reloadBridge struct {
 
 func newReloadBridge(done <-chan struct{}) *reloadBridge {
 	return &reloadBridge{requests: make(chan *reloadRequest), done: done}
+}
+
+func (b *reloadBridge) notifyReady(notify func(string) error) error {
+	b.ready.Store(true)
+	if err := notify("READY=1\nSTATUS=perimeterd running"); err != nil {
+		b.ready.Store(false)
+		return fmt.Errorf("send readiness notification: %w", err)
+	}
+	return nil
 }
 
 func (b *reloadBridge) handle(ctx context.Context, input control.ReloadRequest) control.ReloadResult {

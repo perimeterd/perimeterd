@@ -495,7 +495,10 @@ on shutdown. Startup still withholds readiness until required recovery completes
 operations reuse `/run/perimeterd/lookup.sock`. Reload handlers validate and submit
 requests, but only the event loop admits epochs, applies candidates, and publishes.
 Startup readiness is explicitly synchronized; a bound socket does not imply reload
-admission is ready. Reload capacity is separate from lookup evaluation capacity.
+admission is ready. After initial publication and final startup checks, admission
+is enabled before `READY=1` is published. Earlier requests remain `not_ready`;
+notification failure disables admission and aborts startup with normal cleanup.
+Reload capacity is separate from lookup evaluation capacity.
 
 One synchronous waiter belongs to the current reload epoch and owns one buffered
 completion channel. New successful admission finishes older staging as superseded,

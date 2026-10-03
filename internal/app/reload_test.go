@@ -77,6 +77,17 @@ func awaitBoundary(t *testing.T, c <-chan struct{}) {
 	}
 }
 
+func awaitReloadBoundary(t *testing.T, phase string, boundary <-chan struct{}, result <-chan control.ReloadResult) {
+	t.Helper()
+	select {
+	case <-boundary:
+	case got := <-result:
+		t.Fatalf("checkpoint %s not reached: reload completed early: %#v", phase, got)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("checkpoint %s not reached", phase)
+	}
+}
+
 func assertPending(t *testing.T, c <-chan control.ReloadResult) {
 	t.Helper()
 	select {
@@ -114,10 +125,10 @@ func TestAcknowledgedReloadWaitsForNativeApplyAndPublication(t *testing.T) {
 	digest := fileDigest(t, f.path)
 	armed.Store(true)
 	result := reloadAsync(f, context.Background())
-	awaitBoundary(t, prepare)
+	awaitReloadBoundary(t, "after-prepare", prepare, result)
 	assertPending(t, result)
 	releaseA()
-	awaitBoundary(t, publish)
+	awaitReloadBoundary(t, "runtime:before-publish", publish, result)
 	assertPending(t, result)
 	releaseP()
 	got := <-result
@@ -176,7 +187,7 @@ func TestAcknowledgedReloadParsesSameReadBytesAfterReplacement(t *testing.T) {
 	writeRunConfig(t, f.path, f.address, "9.9.9.9/32")
 	digest := fileDigest(t, f.path)
 	result := reloadAsync(f, context.Background())
-	awaitBoundary(t, read)
+	awaitReloadBoundary(t, "reload:after-read", read, result)
 	if err := os.WriteFile(f.path, []byte("invalid: ["), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -209,14 +220,18 @@ func TestAcknowledgedReloadSupersessionAndSIGHUP(t *testing.T) {
 				return nil
 			})
 			first := reloadAsync(f, context.Background())
-			awaitBoundary(t, entered)
+			awaitReloadBoundary(t, "reload:after-read", entered, first)
 			var second <-chan control.ReloadResult
 			if signal {
 				f.signals <- syscall.SIGHUP
 			} else {
 				second = reloadAsync(f, context.Background())
 			}
-			awaitBoundary(t, entered)
+			if signal {
+				awaitBoundary(t, entered)
+			} else {
+				awaitReloadBoundary(t, "reload:after-read", entered, second)
+			}
 			if got := <-first; got.Outcome != "rejected" || got.Code != "superseded" {
 				t.Fatal(got)
 			}
@@ -251,8 +266,9 @@ func TestAcknowledgedReloadCancellationBeforeApplyAndDuringApply(t *testing.T) {
 			armed.Store(true)
 			writeRunConfig(t, f.path, f.address, "9.9.9.9/32")
 			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			result := reloadAsync(f, ctx)
-			awaitBoundary(t, entered)
+			awaitReloadBoundary(t, phase, entered, result)
 			cancel()
 			if got := <-result; got.Outcome != "unknown" {
 				t.Fatal(got)
@@ -307,6 +323,90 @@ func TestAcknowledgedReloadCommittedDegradedAndPublicationFailure(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestReloadReadinessAllowsRequestsDuringNotification(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	var workers sync.WaitGroup
+	defer func() { cancel(); workers.Wait() }()
+	bridge := newReloadBridge(ctx.Done())
+	if got := bridge.handle(ctx, control.ReloadRequest{}); got.Outcome != "rejected" || got.Code != "not_ready" {
+		t.Fatalf("pre-readiness reload: %#v", got)
+	}
+	want := control.ReloadResult{
+		SchemaVersion: 1,
+		Outcome:       "applied",
+		Revision:      strings.Repeat("b", 32),
+		ConfigSHA256:  strings.Repeat("a", 64),
+	}
+	result := make(chan control.ReloadResult, 1)
+	err := bridge.notifyReady(func(string) error {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			result <- bridge.handle(ctx, control.ReloadRequest{})
+		}()
+		select {
+		case request := <-bridge.requests:
+			request.result <- want
+		case got := <-result:
+			return fmt.Errorf("reload completed before admission during READY notification: %#v", got)
+		case <-ctx.Done():
+			return fmt.Errorf("reload not admitted during READY notification: %w", ctx.Err())
+		}
+		select {
+		case got := <-result:
+			if got != want {
+				return fmt.Errorf("admitted reload completion: got %#v, want %#v", got, want)
+			}
+		case <-ctx.Done():
+			return fmt.Errorf("reload did not complete during READY notification: %w", ctx.Err())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReloadReadinessNotificationFailureDisablesAdmission(t *testing.T) {
+	runCtx, stop := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	var workers sync.WaitGroup
+	defer func() { cancel(); stop(); workers.Wait() }()
+	bridge := newReloadBridge(runCtx.Done())
+	notificationErr := errors.New("readiness notification failed")
+	result := make(chan control.ReloadResult, 1)
+	err := bridge.notifyReady(func(string) error {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			result <- bridge.handle(ctx, control.ReloadRequest{})
+		}()
+		select {
+		case <-bridge.requests:
+		case got := <-result:
+			return fmt.Errorf("reload completed before notification failure: %#v", got)
+		case <-ctx.Done():
+			return fmt.Errorf("reload not admitted before notification failure: %w", ctx.Err())
+		}
+		return notificationErr
+	})
+	if !errors.Is(err, notificationErr) {
+		t.Fatalf("notification error: got %v, want %v", err, notificationErr)
+	}
+	if got := bridge.handle(ctx, control.ReloadRequest{}); got.Outcome != "rejected" || got.Code != "not_ready" {
+		t.Fatalf("reload admission remained enabled after notification failure: %#v", got)
+	}
+	stop()
+	select {
+	case got := <-result:
+		if got.Outcome != "unknown" || got.Code != "shutting_down" {
+			t.Fatalf("admitted reload survived startup shutdown: %#v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("admitted reload did not terminate after notification failure shutdown")
 	}
 }
 
@@ -376,7 +476,7 @@ func TestAcknowledgedReloadShutdownDrainsLateStaging(t *testing.T) {
 		return nil
 	})
 	result := reloadAsync(f, context.Background())
-	awaitBoundary(t, entered)
+	awaitReloadBoundary(t, "reload:after-read", entered, result)
 	f.cancel()
 	if got := <-result; got.Outcome == "applied" {
 		t.Fatal(got)
