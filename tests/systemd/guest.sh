@@ -269,7 +269,10 @@ served = False
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         global served
-        if self.path != "/list":
+        if self.path == "/reload-stall":
+            print("reload source request held beyond the client deadline", flush=True)
+            time.sleep(180)
+        elif self.path != "/list":
             self.send_error(404)
             return
         if not served:
@@ -525,6 +528,137 @@ assert_startup_sandbox() {
   fi
 }
 
+write_reload_config() {
+  local blocklist=$1 source_url=${2:-}
+  cat >"$CONFIG" <<EOF
+version: 1
+logging:
+  level: info
+  format: text
+metrics:
+  listen: "127.0.0.1:19095"
+global:
+  blocklist: $blocklist
+firewall:
+  backend: iptables
+  ipv4: true
+  ipv6: true
+  iptables:
+    attachments:
+      - chain: INPUT
+        direction: ingress
+      - chain: OUTPUT
+        direction: egress
+EOF
+  if [[ -n "$source_url" ]]; then
+    cat >>"$CONFIG" <<EOF
+ip_lists:
+  reload-source:
+    url: "$source_url"
+    request_timeout: 180s
+policies:
+  - name: reload-source
+    priority: 100
+    direction: ingress
+    mode: blocklist
+    traffic: [any]
+    include:
+      ip_lists: [reload-source]
+EOF
+  fi
+  chmod 0600 "$CONFIG"
+  /usr/bin/perimeterd validate --config "$CONFIG"
+}
+
+reload_revision() {
+  python3 -c 'import json; print(json.load(open("/var/lib/perimeterd/active.json"))["payload"]["id"])'
+}
+
+reload_packet() {
+  ip netns exec reload-packets ping -c 1 -W 2 192.0.2.1 >/dev/null 2>&1
+}
+
+exercise_reload_acknowledgement() {
+  local include_timeout=$1 pid_before revision_before digest output code elapsed
+  log 'Proving synchronous reload success/rejection, digest correlation, and real packet enforcement'
+  pid_before=$(show_property MainPID)
+  ip netns add reload-packets
+  ip link add reload-host type veth peer name reload-peer
+  ip link set reload-peer netns reload-packets
+  ip addr add 192.0.2.1/32 dev reload-host
+  ip link set reload-host up
+  ip route add 8.8.8.8/32 dev reload-host
+  ip netns exec reload-packets ip addr add 8.8.8.8/32 dev reload-peer
+  ip netns exec reload-packets ip link set reload-peer up
+  ip netns exec reload-packets ip route add 192.0.2.1/32 dev reload-peer
+  reload_packet || fail 'policy A did not allow the isolated packet'
+  revision_before=$(reload_revision)
+  write_reload_config '[8.8.8.8/32]'
+  systemctl reload "$UNIT"
+  [[ $(reload_revision) != "$revision_before" ]] || fail 'systemctl acknowledged the previous revision'
+  if reload_packet; then
+    fail 'systemctl reload returned before policy B enforced its packet denial'
+  fi
+  revision_before=$(reload_revision)
+  write_reload_config '[9.9.9.9/32]' "http://127.0.0.1:9/systemd-reload-unavailable"
+  if systemctl reload "$UNIT"; then
+    fail 'systemctl falsely acknowledged a locally valid runtime-rejected reload'
+  else
+    code=$?
+  fi
+  [[ $(reload_revision) == "$revision_before" ]] || fail 'runtime rejection selected another revision'
+  [[ $(show_property MainPID) == "$pid_before" ]] || fail 'runtime rejection restarted the daemon'
+  assert_property ActiveState active
+  if reload_packet; then
+    fail 'runtime rejection stopped enforcing the previous policy'
+  fi
+  log "Runtime rejection: systemctl exit=$code revision=$revision_before pid=$pid_before packet=denied"
+  write_reload_config '[9.9.9.9/32]'
+  if /usr/bin/perimeterd reload --expect-config-sha256 "$(printf '%064d' 0)"; then
+    fail 'digest mismatch was acknowledged'
+  fi
+  [[ $(reload_revision) == "$revision_before" ]] || fail 'digest mismatch mutated native selection'
+  if reload_packet; then
+    fail 'digest mismatch stopped enforcing the previous policy'
+  fi
+  mv "$RUNTIME_DIR/lookup.sock" "$RUNTIME_DIR/lookup.saved.sock"
+  if /usr/bin/perimeterd reload; then
+    fail 'missing socket was acknowledged'
+  fi
+  mv "$RUNTIME_DIR/lookup.saved.sock" "$RUNTIME_DIR/lookup.sock"
+  [[ $(reload_revision) == "$revision_before" ]] || fail 'unavailable endpoint mutated selection'
+  if [[ "$include_timeout" == yes ]]; then
+    write_reload_config '[9.9.9.9/32]' "http://127.0.0.1:$SOURCE_PORT/reload-stall"
+    elapsed=$SECONDS
+    if systemctl reload "$UNIT"; then
+      fail 'a reload exceeding the client deadline was acknowledged'
+    else
+      code=$?
+    fi
+    elapsed=$((SECONDS - elapsed))
+    ((elapsed >= 74 && elapsed < 90)) || fail "reload did not return before systemd's deadline: ${elapsed}s"
+    [[ $(reload_revision) == "$revision_before" ]] || fail 'timed-out staging committed a candidate'
+    [[ $(show_property MainPID) == "$pid_before" ]] || fail 'reload timeout restarted the daemon'
+    assert_property ActiveState active
+    if reload_packet; then
+      fail 'timeout stopped enforcing the previous policy'
+    fi
+    log "Unknown completion: systemctl exit=$code elapsed=${elapsed}s revision=$revision_before packet=denied"
+  fi
+  write_reload_config '[9.9.9.9/32]'
+  digest=$(sha256sum "$CONFIG")
+  digest=${digest%% *}
+  output=$(/usr/bin/perimeterd reload --expect-config-sha256 "$digest")
+  [[ "$output" == *"$(reload_revision)"* && "$output" == *"$digest"* ]] || fail "acknowledgement did not identify the committed revision/digest: $output"
+  reload_packet || fail 'the acknowledged policy did not allow the isolated packet'
+  [[ $(show_property MainPID) == "$pid_before" ]] || fail 'successful reload restarted the daemon'
+  log "Acknowledged CLI: $output packet=allowed"
+  ip link del reload-host
+  ip netns del reload-packets
+  write_config drop
+  systemctl reload "$UNIT"
+}
+
 log 'Confirming the freshly booted VM has no xtables lock or runtime directory'
 [[ -d /run/systemd/system ]] || fail 'the guest is not booted with systemd as PID 1'
 require_absent "$XTABLES_LOCK"
@@ -593,6 +727,7 @@ wait_health 1 30
 assert_owned_rules
 [[ $(ipset save) == *'203.0.113.77'* ]] || fail 'the delayed source prefix was not applied to the real kernel ipset state'
 assert_startup_sandbox
+exercise_reload_acknowledgement yes
 
 log 'Checking service/cleanup lock exclusion, restart inode retention, and degraded-health recovery'
 active_hash_before=$(sha256sum /var/lib/perimeterd/active.json | awk '{print $1}')
@@ -621,7 +756,9 @@ assert_owned_rules
 install_restore_fault
 active_hash_before=$(sha256sum /var/lib/perimeterd/active.json | awk '{print $1}')
 write_config reject
-systemctl reload "$UNIT"
+if systemctl reload "$UNIT"; then
+  fail 'uncertain native apply returned a successful systemctl acknowledgement'
+fi
 wait_degraded
 for _ in 1 2 3 4 5; do
   [[ $(show_property ActiveState) == active ]] || fail 'degraded enforcement terminated the systemd service'
@@ -693,6 +830,7 @@ cleanup_service_state
 set_variant nft
 write_config drop
 start_service_and_wait 90
+exercise_reload_acknowledgement no
 systemctl restart "$UNIT"
 wait_active 90
 wait_health 1 30
@@ -704,7 +842,9 @@ assert_owned_rules
 log 'Proving failed package removal preserves live recovery and ownership evidence'
 install_restore_fault
 write_config reject
-systemctl reload "$UNIT"
+if systemctl reload "$UNIT"; then
+  fail 'uncertain removal-fixture apply returned a successful acknowledgement'
+fi
 wait_degraded
 [[ -s /var/lib/perimeterd/journal.json ]] || fail 'removal-failure fixture has no recovery journal'
 active_hash_degraded=$(sha256sum /var/lib/perimeterd/active.json | awk '{print $1}')

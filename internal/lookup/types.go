@@ -11,8 +11,6 @@ import (
 )
 
 const (
-	// SocketPath is the production-only local query endpoint.
-	SocketPath = "/run/perimeterd/lookup.sock"
 	// Endpoint versions the read-only HTTP method on the Unix socket.
 	Endpoint = "/v1/lookup"
 	// SchemaVersion identifies the complete response envelope.

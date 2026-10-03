@@ -33,11 +33,12 @@ to the owning reference document rather than a separate implementation plan.
 ```text
 cmd/perimeterd/main.go
 internal/app/                 lifecycle, candidates, serialized writer, HTTP and notifications
-internal/cli/                 command dispatch, validation, lookup and version reporting
+internal/cli/                 command dispatch, validation, lookup, reload and version reporting
 internal/config/              YAML schema, defaults and strict validation
 internal/config/catalog/      checked-in country/group/RIR catalogs and ASN validation
+internal/control/             secure shared Unix transport and synchronous reload protocol
 internal/crowdsec/            bounded LAPI adapter, authoritative store and timed projection
-internal/lookup/              pure applied-state evaluation, attribution and private query transport
+internal/lookup/              applied-state evaluation, attribution, query validation and handler
 internal/policy/              immutable snapshots and backend-neutral compiler
 internal/metrics/             bounded-label instrumentation and native counter accumulation
 internal/prefix/              prefix normalization and set algebra
@@ -92,8 +93,15 @@ The most useful file boundaries when changing an existing path are:
   deadlines, and maximum-expiry overlap projection.
 - `internal/app/lookup.go`: atomic applied-view publication, invalidation,
   acknowledged dynamic lease evidence, and query completion fencing.
+- `internal/control/`: secure Unix socket/server/client lifecycle, strict reload
+  request/results, and independent reload-handler capacity. Header/body reads
+  retain five seconds; routed lookup writes/evaluation retain five seconds;
+  reload client/server bounds are 75/80 seconds, before systemd's 90 seconds.
 - `internal/lookup/`: complete address/traffic partitions, source explanation,
-  strict bounded HTTP-over-Unix transport, and the daemon client.
+  strict query protocol/handler, and the daemon client using shared Unix transport.
+- `internal/app/reload.go` and `run.go`: synchronized readiness, event-loop-owned
+  epoch waiter, read-once configuration digest, cancellation, and completion after
+  healthy committed runtime publication.
 - `internal/config/catalog/`: checked-in country, RIR, and ASN vocabulary.
 - `internal/firewall/exec.go`: bounded native subprocess I/O shared by
   backends.
@@ -213,6 +221,16 @@ configuration to become durably selected, candidate-correlated rejection
 evidence, or changed packet behavior; a request starting is not proof that its
 candidate finished. Keep bounded quiet windows for absence assertions and real
 lease-expiry waits, not fixed sleeps standing in for reload completion.
+
+Acknowledgement regressions use channels/checkpoints to hold native apply and
+publication, replace a file after its read, supersede staging with another request
+or `SIGHUP`, and distinguish degraded commitment from native uncertainty. Actual
+Unix transport tests cover reload beyond five seconds, short lookup/slow-upload
+limits, independent capacity, strict response/digest validation, and no retries.
+`tests/e2e/reload_test.go` exercises real CLI acknowledgements, immediate packet
+behavior, pre-apply rejection/mismatch, the production client timeout, and missing
+socket failure across nftables and both iptables families. Systemd/role VM surfaces
+also check nonzero reload propagation and exact successful-marker preservation.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent

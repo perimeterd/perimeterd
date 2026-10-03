@@ -108,6 +108,9 @@ func (p *runtimePublication) pending() bool {
 }
 
 func (p *runtimePublication) publish(revision *state.Revision) error {
+	if err := p.engine.check("runtime:before-publish"); err != nil {
+		return err
+	}
 	reservation := p.reservation
 	if reservation == nil {
 		return errors.New("runtime publication has no reservation")

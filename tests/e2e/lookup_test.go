@@ -310,15 +310,15 @@ func TestE2ELookupNative(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 	initialRequests := fixture.Requests(lookupMainList)
 	fixture.Set(lookupMainList, 500, "upstream unavailable\n")
-	daemon.reload(t)
+	command(t, 90*time.Second, e2eBinary(t), "reload")
 	waitCustomListRequests(t, fixture, lookupMainList, initialRequests+1)
 	waitForLookupVerdict(t, "8.21.0.2", "ingress", "tcp", port, "blocked")
 
 	// A malformed reload is rejected without replacing the committed query view.
 	writeInvalidConfigMarker(t, configPath, "unsupported-lookup-reload")
-	diagnosticOffset := daemonDiagnosticOffset(daemon)
-	daemon.reload(t)
-	waitForDaemonDiagnostic(t, daemon, []string{"unsupported-lookup-reload"}, diagnosticOffset)
+	before := activeRevision()
+	assertReloadRejected(t, "configuration_error")
+	assertReloadPolicyUnchanged(t, before)
 	waitForLookupVerdict(t, "8.21.0.2", "ingress", "tcp", port, "blocked")
 
 	daemon.stop(t)

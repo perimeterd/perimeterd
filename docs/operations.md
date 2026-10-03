@@ -46,6 +46,7 @@ The runtime supports:
 
 - strict offline `validate` and `version` commands;
 - `run` and `cleanup` under one process-lifetime ownership lock;
+- acknowledged `reload` through the running daemon's private Unix socket;
 - nftables and iptables/ipset policy application, including both legacy and
   nf_tables iptables tool families;
 - direct global address lists and RIPEstat country/ASN snapshots, with local
@@ -189,8 +190,8 @@ Ensure the daemon can still reach the feed and DNS under any egress policy.
 Custom lists do not automatically allow their own HTTP(S) endpoints through the
 firewall; retain the necessary outbound access using existing policy controls.
 
-Reload URL, interval, and reference changes with `SIGHUP`; a rejected reload
-retains the old configuration and its timers. With no matching committed
+Reload URL, interval, and reference changes with `perimeterd reload`; a rejected
+pre-apply reload retains the old configuration and its timers. With no matching committed
 fallback, an unavailable required list prevents first-start readiness or rejects
 a reload. Later outages retain the entire committed static snapshot and retry
 on schedule; stale entries have no automatic expiry. Removing/disabling a
@@ -271,7 +272,7 @@ connections. No automatic enrollment, direct fallback, interactive sign-in,
 or SDK installation step is allowed.
 
 Rotate identities by provisioning and validating replacements externally,
-then replacing their files safely and sending `SIGHUP`. Capture one complete
+then replacing their files safely and running `perimeterd reload`. Capture one complete
 credential bundle, including referenced files; avoid replacing only half of a
 certificate/key pair. Prefer a new directory/profile when coordinating multiple
 files. A same-path replacement is still a new loaded generation when certificate,
@@ -505,12 +506,13 @@ are in [Packet and byte accounting](firewall-backends.md#packet-and-byte-account
 
 ### Reload, recover, and cleanup
 
-1. Edit a complete configuration and send `SIGHUP` to a foreground
-   source-built process, or run `sudo systemctl reload perimeterd.service` for
-   a package installation. The packaged unit sends `SIGHUP`.
-2. If resolution, compilation, preflight, apply, or durable publication fails,
-   keep the active revision and inspect structured logs. Do not delete state to
-   force a reload.
+1. Edit a complete configuration and run `sudo bin/perimeterd reload` for a
+   foreground source build, or `sudo systemctl reload perimeterd.service` for a
+   package installation. The packaged unit runs `/usr/bin/perimeterd reload` and
+   propagates its acknowledged result.
+2. A pre-apply rejection retains the previous policy. Degraded or unknown
+   completion is not proof of rollback: preserve durable evidence, inspect the
+   error and structured logs, and do not delete state to force a reload.
 3. If enforcement becomes unhealthy, stop ordinary changes. Preserve the
    journal, active record, revisions, source manifests, and ownership metadata;
    restart the source-built `run` process or the packaged service and let
@@ -521,6 +523,55 @@ are in [Packet and byte accounting](firewall-backends.md#packet-and-byte-account
    removal performs this cleanup through its
    [lifecycle procedure](#package-lifecycle). Cleanup retains the owner identity.
    Do not purge or relabel retained state to make an incompatible daemon start.
+
+The command is:
+
+```text
+perimeterd reload [--expect-config-sha256 HEX]
+```
+
+It requires root and contacts the existing `/run/perimeterd/lookup.sock`; it
+does not take the lifecycle lock, read durable state, accept a configuration path,
+or submit YAML. The daemon reads its own configured file once, hashes those exact
+bytes, and parses the same bytes. To correlate a deployment with rendered content:
+
+```sh
+digest=$(sudo sha256sum /etc/perimeterd/perimeterd.yaml)
+sudo /usr/bin/perimeterd reload --expect-config-sha256 "${digest%% *}"
+```
+
+The optional digest must be 64 hexadecimal characters. A mismatch is rejected
+before credential loading, source resolution, or native apply. It covers only the
+configuration bytes, not referenced feeds or credential files. Success prints the
+committed revision and actual digest; it guarantees this request completed commit,
+required native work, and runtime publication with healthy enforcement and no
+pending recovery. A later reload or background refresh can supersede that revision.
+
+| Outcome | Meaning | Exit |
+| --- | --- | --- |
+| `applied` | This request completed clean commit and healthy runtime publication | 0 |
+| `rejected` | This request did not commit or enter an uncertain native transaction | 1 |
+| `degraded` | This candidate is known committed, but required completion failed; revision included | 1 |
+| `unknown` | Completion cannot be established, including a lost response or timeout; rollback is not claimed | 1 |
+
+Usage errors exit 2, and `reload --help` works without a daemon. Failure diagnostics
+include outcome/code and actionable detail without exposing YAML or credentials.
+Malformed, incompatible, or inconsistent responses fail closed. There is no
+automatic retry, asynchronous fallback, request history, or polling API.
+
+The client waits at most 75 seconds; the server operation/write bound is 80 seconds,
+before systemd's existing 90-second reload deadline. Header/body reads and lookup
+operations retain their five-second limits. Source timeouts are unchanged. A slow
+request can return unknown completion: cancellation before native apply prevents
+that mutation, but an already-started transaction completes under the daemon's
+context, even if its client leaves. Do not automatically retry an ambiguous result.
+
+`systemctl reload` returns nonzero for rejected, degraded, or unknown completion.
+An ordinary pre-apply rejection leaves the daemon running without a restart and
+keeps the old policy. An old daemon without this endpoint fails safely.
+Manual `SIGHUP` remains asynchronous: signal delivery does not acknowledge
+application, and an admitted signal can supersede an older staging request.
+Startup requests are explicitly rejected as `not_ready`, rather than queued.
 
 Backend-specific mixed-family windows, migration overlap, retained ownership,
 and degraded recovery are defined in
@@ -556,7 +607,7 @@ Register a bouncer in that LAPI deployment and store its API key in a
 root-readable file with mode `0600`. Configure `crowdsec.enabled: true`,
 `lapi_url`, and `api_key_file`, then run or reload the daemon. Initial
 synchronization must succeed before readiness. A same-path key rotation is
-reread on `SIGHUP`; a failed replacement retains the old authenticated client
+reread on acknowledged reload or manual `SIGHUP`; a failed replacement retains the old authenticated client
 and its bans. The default update frequency is `10s`; request deadlines are at
 most `30s`. Failures do not extend a decision's absolute expiry. Lease renewal
 continues from retained authority while the writer can safely reconcile it.
@@ -633,7 +684,7 @@ Type=notify
 NotifyAccess=main
 TimeoutStartSec=90s
 ExecStart=/usr/bin/perimeterd run --config /etc/perimeterd/perimeterd.yaml
-ExecReload=/bin/kill -HUP $MAINPID
+ExecReload=/usr/bin/perimeterd reload
 Restart=on-failure
 RestartSec=5s
 StateDirectory=perimeterd
@@ -760,7 +811,10 @@ traversal and denial semantics.
 The endpoint also exports:
 
 - `perimeterd_build_info` (gauge): constant `1` with bounded build metadata.
-- `perimeterd_config_reload_total{result}` (counter): reload outcomes.
+- `perimeterd_config_reload_total{result}` (counter): `success` requires clean
+  committed apply, completed runtime publication, and healthy enforcement without
+  pending recovery; degraded/uncertain application counts as `error`. Background
+  refresh accounting is separate. This metric is not a per-request acknowledgement.
 - `perimeterd_reconcile_total{reason,result}` (counter): reconcile outcomes.
 - `perimeterd_reconcile_duration_seconds{reason}` (histogram): apply latency.
 - `perimeterd_prefixes{family,source,type}` (gauge): active prefix count.

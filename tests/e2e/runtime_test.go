@@ -98,8 +98,9 @@ func TestE2ENFTReloadOwnership(t *testing.T) {
 
 	before := activeRevision()
 	writeConfig(t, path, table, "drop", nil, []string{"8.8.8.8/32", fixtureIPv4Peer + "/32"}, -10)
-	daemon.reload(t)
-	waitForActiveRevisionChange(t, before, path)
+	digest := reloadConfigDigest(t, path)
+	acknowledgement := command(t, 90*time.Second, e2eBinary(t), "reload", "--expect-config-sha256", digest)
+	assertReloadAcknowledgement(t, before, digest, acknowledgement)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "drop", "tcp")
 	selectedWitness := witnessRule(t, table)
 	if initialWitness["chain"] != selectedWitness["chain"] || initialWitness["comment"] != selectedWitness["comment"] {
@@ -231,7 +232,7 @@ func TestE2ERuntime(t *testing.T) {
 	probeEgress(t, peer, "tcp4", fixtureIPv4Peer+":18084", "drop", "tcp")
 
 	// Reject is observable as a prompt connection failure, unlike DROP's
-	// timeout. A malformed HUP must preserve this active enforcement.
+	// timeout. A malformed acknowledged reload must preserve active enforcement.
 	writeConfig(t, configPath, table, "reject", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -10)
 	before = activeRevision()
 	daemon.reload(t)
@@ -243,9 +244,9 @@ func TestE2ERuntime(t *testing.T) {
 	probeEgress(t, peer, "udp4", fixtureIPv4Peer+":18083", "reject", "udp")
 	probeEgress(t, peer, "udp6", "["+fixtureIPv6Peer+"]:18083", "reject", "udp")
 	writeInvalidConfigMarker(t, configPath, "unsupported-native-reload")
-	diagnosticOffset := daemonDiagnosticOffset(daemon)
-	daemon.reload(t)
-	waitForDaemonDiagnostic(t, daemon, []string{"unsupported-native-reload"}, diagnosticOffset)
+	before = activeRevision()
+	assertReloadRejected(t, "configuration_error")
+	assertReloadPolicyUnchanged(t, before)
 	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18080", "reject", "tcp")
 
 	// Priority-only reload replaces only hook chains. The stable counters remain
@@ -287,11 +288,7 @@ func TestE2ERuntime(t *testing.T) {
 	}
 	before = activeRevision()
 	writeConfig(t, configPath, collision, "drop", nil, []string{fixtureIPv4Peer + "/32", fixtureIPv6Peer + "/128"}, -9)
-	diagnosticOffset = daemonDiagnosticOffset(daemon)
-	daemon.reload(t)
-	// Correlate completion with this candidate's table, not an incidental child
-	// name: an unrecorded table is refused before its children are authorized.
-	waitForDaemonDiagnostic(t, daemon, []string{collision}, diagnosticOffset)
+	assertReloadRejected(t, "apply_failed")
 	if activeRevision() != before {
 		t.Fatal("collision reload changed the active revision")
 	}

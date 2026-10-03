@@ -7,15 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"reflect"
+
+	"github.com/perimeterd/perimeterd/internal/control"
 )
 
 // Call queries the running daemon over the fixed root-only Unix socket. It
 // never falls back to a network or configuration-file evaluation.
 func Call(ctx context.Context, request Request) Response {
-	return callPath(ctx, SocketPath, request)
+	return callPath(ctx, control.SocketPath, request)
 }
 
 func callPath(ctx context.Context, path string, request Request) Response {
@@ -33,15 +34,8 @@ func callPath(ctx context.Context, path string, request Request) Response {
 	if err != nil || len(body) > MaxRequestBytes {
 		return Unknown(request, "request_too_large", "lookup request exceeds 4 KiB")
 	}
-	transport := &http.Transport{
-		DisableKeepAlives: true,
-		DialContext: func(dialCtx context.Context, _, _ string) (net.Conn, error) {
-			dialer := &net.Dialer{Timeout: Timeout}
-			return dialer.DialContext(dialCtx, "unix", path)
-		},
-	}
-	client := &http.Client{Transport: transport}
-	defer transport.CloseIdleConnections()
+	client, closeClient := control.UnixClient(path, Timeout)
+	defer closeClient()
 	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, "http://perimeterd"+Endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Unknown(request, "runtime", "create lookup request: "+err.Error())

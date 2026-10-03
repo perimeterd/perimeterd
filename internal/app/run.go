@@ -3,6 +3,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
+	"github.com/perimeterd/perimeterd/internal/control"
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/metrics"
@@ -141,7 +143,8 @@ func Run(ctx context.Context, options Options) error {
 		return errors.Join(err, stopNotifier())
 	}
 	lookupPath := filepath.Join(filepath.Dir(opts.LockPath), "lookup.sock")
-	lookupServer, err := lookup.Listen(lookupPath, engine.Lookup)
+	bridge := newReloadBridge(runCtx.Done())
+	lookupServer, err := control.Listen(lookupPath, lookup.HTTPHandler(engine.Lookup), control.ReloadHTTPHandler(bridge.handle))
 	if err != nil {
 		return errors.Join(fmt.Errorf("lookup listener: %w", err), stopNotifier())
 	}
@@ -256,6 +259,7 @@ func Run(ctx context.Context, options Options) error {
 		return fmt.Errorf("send readiness notification: %w", err)
 	}
 
+	bridge.ready.Store(true)
 	producerCtx, cancelProducers := context.WithCancel(runCtx)
 	defer cancelProducers()
 	results := make(chan stageResult, 8)
@@ -271,7 +275,78 @@ func Run(ctx context.Context, options Options) error {
 		recoveryBackoff = time.Second
 		recoveryTimer = time.NewTimer(0)
 	}
+	var waiter *reloadRequest
+	finish := func(epoch uint64, result control.ReloadResult) {
+		if waiter == nil || waiter.epoch != epoch {
+			return
+		}
+		result.ConfigSHA256 = waiter.digest
+		waiter.result <- result
+		waiter = nil
+	}
+	admitReload := func(request *reloadRequest) {
+		reject := func(code, message string) {
+			collector.ConfigReload("error")
+			if request != nil {
+				request.result <- control.Failure("rejected", code, message)
+			} else {
+				publication.logger.Warn("reload admission failed", "error", message)
+			}
+		}
+		if runCtx.Err() != nil {
+			reject("shutting_down", "daemon is shutting down")
+			return
+		}
+		if request != nil && request.ctx.Err() != nil {
+			reject("timeout", "reload canceled before admission")
+			return
+		}
+		if recovering || publication.pending() {
+			reject("busy", "firewall recovery or publication is pending")
+			return
+		}
+		requestEpoch, admitErr := engine.Admit()
+		if admitErr != nil {
+			reject("busy", admitErr.Error())
+			return
+		}
+		if waiter != nil {
+			finish(waiter.epoch, control.Failure("rejected", "superseded", "reload superseded before apply"))
+		}
+		if sources.reloadCancel != nil {
+			sources.reloadCancel()
+		}
+		reloadCtx, cancel := context.WithCancel(producerCtx)
+		expected := ""
+		stopCancellation := func() bool { return false }
+		if request != nil {
+			request.epoch = requestEpoch
+			waiter = request
+			expected = request.expected
+			stopCancellation = context.AfterFunc(request.ctx, cancel)
+		}
+		sources.reloadCancel = cancel
+		sources.reloadEpoch = requestEpoch
+		committed := sources.manifest()
+		resolver := sources.resolver
+		producers.Add(1)
+		go func() {
+			defer producers.Done()
+			defer stopCancellation()
+			result := stageCandidate(reloadCtx, opts, resolver, manager, requestEpoch, committed, expected)
+			select {
+			case results <- result:
+			case <-producerCtx.Done():
+				result.candidate.close()
+			}
+		}()
+	}
 	stopService := func() error {
+		bridge.ready.Store(false)
+		cancelRun()
+		if waiter != nil {
+			finish(waiter.epoch, control.Failure("rejected", "shutting_down", "daemon is shutting down"))
+		}
 		cancelProducers()
 		sources.close()
 		producers.Wait()
@@ -313,6 +388,8 @@ func Run(ctx context.Context, options Options) error {
 			}
 		case lookupErr := <-lookupFailures:
 			return errors.Join(fmt.Errorf("lookup listener failed: %w", lookupErr), stopService())
+		case request := <-bridge.requests:
+			admitReload(request)
 		case <-sources.events():
 			sources.stopTimer()
 			if recovering || sources.active == nil || sources.refreshCancel != nil {
@@ -352,29 +429,7 @@ func Run(ctx context.Context, options Options) error {
 			case syscall.SIGTERM, syscall.SIGINT:
 				return stopService()
 			case syscall.SIGHUP:
-				requestEpoch, admitErr := engine.Admit()
-				if admitErr != nil {
-					collector.ConfigReload("error")
-					publication.logger.Warn("reload admission failed", "error", admitErr)
-					continue
-				}
-				if sources.reloadCancel != nil {
-					sources.reloadCancel()
-				}
-				reloadCtx, cancel := context.WithCancel(producerCtx)
-				sources.reloadCancel = cancel
-				sources.reloadEpoch = requestEpoch
-				committed := sources.manifest()
-				producers.Add(1)
-				go func(epoch uint64) {
-					defer producers.Done()
-					result := stageCandidate(reloadCtx, opts, sources.resolver, manager, epoch, committed)
-					select {
-					case results <- result:
-					case <-producerCtx.Done():
-						result.candidate.close()
-					}
-				}(requestEpoch)
+				admitReload(nil)
 			}
 		case metricsErr := <-publication.metricsErrors():
 			if metricsErr != nil {
@@ -383,6 +438,15 @@ func Run(ctx context.Context, options Options) error {
 				return errors.Join(metricsErr, stopService())
 			}
 		case result := <-results:
+			requestEpoch := result.candidate.epoch
+			if result.candidate.refresh == 0 && waiter != nil && waiter.epoch == requestEpoch {
+				waiter.digest = result.digest
+			}
+			complete := func(outcome, code, message string) {
+				if result.candidate.refresh == 0 {
+					finish(requestEpoch, control.Failure(outcome, code, message))
+				}
+			}
 			recordReload := func(success bool) {
 				if result.candidate.refresh != 0 {
 					return
@@ -411,29 +475,53 @@ func Run(ctx context.Context, options Options) error {
 			}
 			if !engine.current(result.candidate.Candidate) {
 				recordReload(false)
+				complete("rejected", "superseded", "reload superseded before apply")
 				result.candidate.close()
 				continue
 			}
 			if result.err != nil {
 				recordReload(false)
+				code := "configuration_error"
+				if errors.Is(result.err, errConfigMismatch) {
+					code = "config_mismatch"
+				}
+				complete("rejected", code, result.err.Error())
 				result.candidate.close()
 				publication.logger.Warn("candidate resolution failed", "error", result.err, "refresh", result.candidate.refresh != 0, "snapshot_age", sources.age())
 				continue
 			}
 			if recovering || publication.pending() {
 				recordReload(false)
+				complete("rejected", "busy", "firewall recovery or publication is pending")
 				result.candidate.close()
 				continue
 			}
 			if err := publication.reserve(result, runCtx); err != nil {
 				recordReload(false)
+				complete("rejected", "configuration_error", err.Error())
 				result.candidate.close()
 				publication.logger.Warn("reload failed", "error", err)
 				continue
 			}
-			outcome, applyErr := engine.applyStaged(runCtx, result.candidate)
-			if applyErr != nil && !outcome.Committed {
+			if result.candidate.refresh == 0 && waiter != nil && waiter.epoch == requestEpoch && waiter.ctx.Err() != nil {
 				recordReload(false)
+				complete("rejected", "timeout", "reload canceled before native apply")
+				_ = publication.discard()
+				result.candidate.close()
+				continue
+			}
+			outcome, applyErr := engine.applyStaged(runCtx, result.candidate)
+			if !outcome.Committed {
+				recordReload(false)
+				message := "configuration apply produced no committed revision"
+				if applyErr != nil {
+					message = applyErr.Error()
+				}
+				if outcome.Degraded {
+					complete("unknown", "apply_failed", message)
+				} else {
+					complete("rejected", "apply_failed", message)
+				}
 				if outcome.Degraded && outcome.Transaction != "" {
 					if err := publication.retain(outcome.Transaction); err != nil {
 						_ = publication.discard()
@@ -450,17 +538,25 @@ func Run(ctx context.Context, options Options) error {
 				}
 				continue
 			}
-			if !outcome.Committed {
-				recordReload(false)
-				_ = publication.discard()
-				publication.logger.Warn("reload produced no committed revision")
-				continue
-			}
 			if err := publication.publish(outcome.Active); err != nil {
 				recordReload(false)
+				if waiter != nil && waiter.epoch == requestEpoch {
+					failed := control.Failure("degraded", "committed_degraded", err.Error())
+					failed.Revision = outcome.Active.ID
+					finish(requestEpoch, failed)
+				}
 				return errors.Join(err, stopService())
 			}
-			recordReload(true)
+			healthy := applyErr == nil && !outcome.Degraded && engine.Healthy() && publication.metricsHealthy() && !recovering
+			recordReload(healthy)
+			if result.candidate.refresh == 0 && waiter != nil && waiter.epoch == requestEpoch {
+				response := control.ReloadResult{SchemaVersion: 1, Outcome: "applied", Revision: outcome.Active.ID}
+				if !healthy {
+					response = control.Failure("degraded", "committed_degraded", "configuration committed but runtime health completion failed")
+					response.Revision = outcome.Active.ID
+				}
+				finish(requestEpoch, response)
+			}
 			if outcome.Degraded || !engine.Healthy() {
 				scheduleRecovery()
 			}
@@ -519,22 +615,46 @@ type stageResult struct {
 	err        error
 	refreshErr error
 	attempted  []policy.Selector
+	digest     string
 }
 
-func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver, manager *upstream.Manager, epoch uint64, committed string) stageResult {
-	cfg, err := config.Load(opts.ConfigPath)
+var errConfigMismatch = errors.New("configuration SHA-256 does not match expected digest")
+
+func stageCandidate(ctx context.Context, opts Options, resolver *source.Resolver, manager *upstream.Manager, epoch uint64, committed string, expected string) stageResult {
+	result := stageResult{candidate: &stagedCandidate{Candidate: Candidate{epoch: epoch}}}
+	data, err := os.ReadFile(opts.ConfigPath)
 	if err != nil {
-		return stageResult{candidate: &stagedCandidate{Candidate: Candidate{epoch: epoch}}, err: fmt.Errorf("load configuration: %w", err)}
+		result.err = fmt.Errorf("load configuration: %w", err)
+		return result
+	}
+	result.digest = fmt.Sprintf("%x", sha256.Sum256(data))
+	if opts.Checkpoint != nil {
+		if err := opts.Checkpoint("reload:after-read"); err != nil {
+			result.err = err
+			return result
+		}
+	}
+	if expected != "" && expected != result.digest {
+		result.err = errConfigMismatch
+		return result
+	}
+	cfg, err := config.Parse(data)
+	if err != nil {
+		result.err = errors.New("load configuration: invalid YAML or configuration values; run perimeterd validate to diagnose locally")
+		return result
 	}
 	if err := firewall.ValidateConfig(cfg); err != nil {
-		return stageResult{candidate: &stagedCandidate{Candidate: Candidate{epoch: epoch}}, err: fmt.Errorf("runtime configuration: %w", err)}
+		result.err = fmt.Errorf("runtime configuration: %w", err)
+		return result
 	}
 	session, err := loadUpstreamSession(ctx, manager, cfg)
 	if err != nil {
-		return stageResult{candidate: &stagedCandidate{Candidate: Candidate{epoch: epoch}}, err: fmt.Errorf("load upstream identities: %w", err)}
+		result.err = errors.New("load upstream identities: credentials or identity configuration unavailable; check referenced credential files")
+		return result
 	}
-	resolver = resolver.WithTransports(session)
-	return stageSource(ctx, opts, resolver, epoch, 0, cfg, committed, session)
+	staged := stageSource(ctx, opts, resolver.WithTransports(session), epoch, 0, cfg, committed, session)
+	staged.digest = result.digest
+	return staged
 }
 
 func loadUpstreamSession(ctx context.Context, manager *upstream.Manager, cfg config.Config) (*upstream.Session, error) {

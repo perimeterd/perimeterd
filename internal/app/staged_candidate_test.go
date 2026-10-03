@@ -127,3 +127,29 @@ func TestRejectedStagedApplyReleasesSession(t *testing.T) {
 		t.Fatal("rejected apply retained its staging session")
 	}
 }
+
+func TestLateStagedResultReleasesOnlyItsSessionOwnerOnce(t *testing.T) {
+	manager := upstream.NewManager()
+	defer func() { _ = manager.Close(context.Background()) }()
+	session, err := manager.Load(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	independentlyOwned := session.Retain()
+	if independentlyOwned == nil {
+		t.Fatal("could not retain independent session")
+	}
+	defer independentlyOwned.Close()
+	late := &stagedCandidate{session: session}
+	late.close()
+	late.close()
+	if retained := session.Retain(); retained != nil {
+		retained.Close()
+		t.Fatal("late result did not release staging handle")
+	}
+	retained := independentlyOwned.Retain()
+	if retained == nil {
+		t.Fatal("duplicate late close released another owner's session")
+	}
+	retained.Close()
+}

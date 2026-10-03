@@ -103,7 +103,8 @@ to the current files.
 | Runtime publication | Publish the selected source snapshot, logger, and listener; retain or discard staged resources according to the selected transaction | Treating an uncertain commit as success |
 | Lookup and explanation | Evaluate a coherent applied-state view and explain source membership through a private read-only daemon interface | Selecting candidates, contacting sources, native inspection, mutation, or claiming end-to-end reachability |
 
-The current configuration ingress is a local file, reloaded with `SIGHUP`;
+The current configuration ingress is a local file, reloaded through acknowledged
+`perimeterd reload` or asynchronous manual `SIGHUP`;
 implemented static sources are RIPEstat, custom HTTP(S) lists, and dynamic
 named-provider feeds. Any future configuration or prefix providers must
 preserve these boundaries and produce complete candidates rather than bypass
@@ -244,8 +245,9 @@ On startup or admitted reload, read only referenced identity profiles and
 capture validated credential material as an immutable generation. Construct
 replacement contexts/pools outside the apply critical section. Ordinary
 refreshes use the selected generation, not whatever bytes later appear at its
-file path. Replacement at the same path takes effect through `SIGHUP`, never
-through an untracked file watch or SDK credential-file rewrite.
+file path. Replacement at the same path takes effect through an admitted reload
+(`perimeterd reload` or manual `SIGHUP`), never through an untracked file watch or
+SDK credential-file rewrite.
 Loading credentials is a local check, not a requirement for successful network
 authentication before reusing valid same-route committed static fallback.
 Fresh fetches and CrowdSec synchronization still require live connectivity.
@@ -429,6 +431,7 @@ a separate writer-owned observation design, not ad hoc inspection by queries.
 | `run` | Acquire ownership, recover durable state before reading current YAML, initialize required sources, reconcile and commit, then report readiness |
 | `cleanup` | Acquire ownership and remove recorded owned targets using durable metadata, without consulting current YAML |
 | `lookup` | Query the running owner's applied policy and source evidence; no lifecycle lock, source requests, durable-store access, or native commands |
+| `reload` | Request application of the running owner's configuration file and await that request's result; optional exact-byte digest, no client lifecycle lock or durable-store access |
 
 `run` needs a complete static snapshot (fresh or acceptable committed cache) and
 authoritative CrowdSec synchronization when enabled. The
@@ -439,23 +442,25 @@ stopping the daemon, or eventual final package removal. See
 
 ### Signals and shutdown
 
-`SIGHUP` stages a complete reload. `SIGTERM` stops watchers, refresh workers,
-and the HTTP listener, drains or safely cancels in-flight work, and exits. It
+`SIGHUP` stages a complete asynchronous reload; delivery is not acknowledgement.
+`SIGTERM` stops watchers, refresh workers,
+and the private HTTP listener, drains or safely cancels in-flight work, and exits. It
 deliberately leaves the last applied static rules active across restart.
 CrowdSec retains only the remaining kernel lease on
 shutdown: without a running owner, bans may expire before the source decision's
 deadline. This is not indefinite fail-closed ban retention. Only explicit
 `cleanup` removes all recorded owned artifacts.
 
-The private lookup listener follows the shutdown draining contract above;
-retained static rules do not imply offline query availability.
+The shared private control listener follows the shutdown draining contract above;
+retained static rules do not imply offline query or reload availability.
 
 ### Staged reload
 
 Reload admission does not select a revision. Candidate resources remain separate
 until the durable commit:
 
-1. Admit a new request epoch, then parse and strictly validate the complete file.
+1. Admit a new request epoch, read the configuration once, hash those bytes, check
+   an optional expected digest, then parse and strictly validate the same bytes.
 2. Resolve selectors using acceptable cache entries and required network
    fetches, then compile immutable policy state.
 3. Bind any replacement metrics listener and fully synchronize a replacement
@@ -484,6 +489,33 @@ health remains false. An uncertain uncommitted result retains its staged listene
 until recovery either selects that transaction or discards it. An unchanged
 metrics address reuses the active listener; pending listeners are also released
 on shutdown. Startup still withholds readiness until required recovery completes.
+
+`internal/control` owns secure Unix-socket lifecycle and the reload protocol;
+`internal/lookup` owns lookup evaluation, validation, and its HTTP handler. Both
+operations reuse `/run/perimeterd/lookup.sock`. Reload handlers validate and submit
+requests, but only the event loop admits epochs, applies candidates, and publishes.
+Startup readiness is explicitly synchronized; a bound socket does not imply reload
+admission is ready. Reload capacity is separate from lookup evaluation capacity.
+
+One synchronous waiter belongs to the current reload epoch and owns one buffered
+completion channel. New successful admission finishes older staging as superseded,
+including admission by `SIGHUP`; failed admission cannot supersede it. Background
+refresh cannot satisfy that waiter. All terminal branches detach and complete the
+matching owner once, and stale results only release their staged resources.
+
+Acknowledgement follows runtime publication, not admission or commit alone.
+`applied` requires a committed candidate, no apply error or degraded outcome,
+successful publication, healthy engine/publication, and no pending recovery.
+Known commitment with failed completion is `degraded`; uncertain native application
+is `unknown`, not an asserted rollback. Existing retained-publication/recovery
+semantics remain authoritative and cannot retroactively change a delivered result.
+
+Client cancellation is linked to staging and rechecked before native apply. Once
+apply starts, the daemon transaction context remains in control; client departure
+must neither interrupt native completion nor block the event loop's buffered send.
+Shutdown closes admission and resolves/cancels waiters before draining producers
+and the control server. File digests and completion ownership are ephemeral: no
+durable request state, revision-format change, or raw-file digest is introduced.
 
 Removing a policy or setting its mode to `disabled` is valid. The canonical
 [empty desired state](configuration.md#empty-desired-state) predicate includes

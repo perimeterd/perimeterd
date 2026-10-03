@@ -27,8 +27,9 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 
 Validation requires neither root nor network access. It checks local syntax and
 semantics, not source availability or kernel enforcement. Root-only `run`,
-`cleanup`, and daemon-backed [lookup](docs/operations.md#ipcidr-lookup) are
-available for the [runtime capabilities](docs/operations.md#runtime-capabilities).
+`cleanup`, daemon-backed [lookup](docs/operations.md#ipcidr-lookup), and
+[acknowledged reload](docs/operations.md#reload-recover-and-cleanup) are available
+for the [runtime capabilities](docs/operations.md#runtime-capabilities).
 Try enforcement only in a disposable VM or isolated network namespace. See
 [development](docs/development.md#local-commands) for verification commands.
 
@@ -38,7 +39,7 @@ The runtime targets Linux on `amd64` and `arm64`, with nftables or iptables/ipse
 RIPEstat-derived geographic/ASN policy, custom HTTP(S) text IP lists in policy
 include/exclude selectors with per-list refresh intervals, direct provider IDs
 resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
-coexistence, IP/CIDR lookup with source explanations, and
+coexistence, acknowledged configuration reload, IP/CIDR lookup with source explanations, and
 [optional OpenZiti transport](docs/architecture.md#optional-openziti-upstream-transport)
 for selected CrowdSec/custom-list upstreams are implemented. Direct HTTP(S)
 remains the default, with no Ziti prerequisite. Prometheus observability,
