@@ -33,7 +33,7 @@ jobs:
       - name: Select or recover and re-admit the release identity
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_SIGNING_PUBLIC_KEYS: ${{ vars.RELEASE_SIGNING_PUBLIC_KEYS }}
+          RELEASE_SIGNING_PUBLIC_KEYS: ${{ secrets.RELEASE_SIGNING_PUBLIC_KEYS }}
         run: python3 scripts/release-metadata.py --prepare "$RUNNER_TEMP/release-metadata.json"
       - name: Persist release identity for this run
         if: github.run_attempt == '1'

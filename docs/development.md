@@ -819,10 +819,13 @@ releases do not replace one another.
   stable tag the base is `0.0.1`. Prereleases never become GitHub's latest
   release.
 
-Configure repository variable `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
-ASCII-armored OpenPGP public keys before publishing stable tags. Admission uses
-an isolated keyring, disables automatic key retrieval, checks the triggering
-commit and main ancestry, and verifies the annotated tag signature. For example:
+Configure Actions secret `RELEASE_SIGNING_PUBLIC_KEYS` with the trusted
+ASCII-armored OpenPGP public keys before publishing stable tags. Use a repository
+secret or an organization secret with access granted to this repository. Keep
+private signing keys on the signing machine; only public keys belong in Actions.
+Admission uses an isolated keyring, disables automatic key retrieval, checks the
+triggering commit and main ancestry, and verifies the annotated tag signature.
+For example:
 
 ```sh
 git tag -s 0.0.1 -m 'Release 0.0.1'
