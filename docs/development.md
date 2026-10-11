@@ -456,6 +456,14 @@ requirements in [`go.mod`](../go.mod). Make targets invoke them with `go tool`,
 so a globally installed tool or a version copied into this guide is not the
 authority.
 
+Update Go patch releases in the `go` directive; CI uses
+`go-version-file: go.mod`. Keep runtime and tool-module updates at explicit
+versions, regenerate checksums with `go mod tidy`, and run `make verify` and
+`make test-race` with the selected toolchain. Review transitive updates as part
+of the same change. Exercise dependency-sensitive runtime paths as well:
+live metrics scrapes for Prometheus changes and immutable cache publication
+and reload for `golang.org/x/sys` changes.
+
 | Tool | Go module | Used by |
 | --- | --- | --- |
 | `gofumpt` | `mvdan.cc/gofumpt` | `fmt`, `fmt-check` |
