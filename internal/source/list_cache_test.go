@@ -442,3 +442,112 @@ func TestResolveChangedTransportCannotFallbackCommittedList(t *testing.T) {
 		t.Fatal("changed transport revived the old committed list snapshot")
 	}
 }
+
+func TestCSVCacheRoundTripAndCanonicalMetadata(t *testing.T) {
+	cache, _ := openCacheTest(t, nil)
+	options := config.CSVConfig{Delimiter: ";", Header: true, IPColumn: 1, Filter: config.CSVFilterConfig{Column: 2, Op: ">=", Value: 0.5}}
+	record, err := parseCSVList([]byte("ip;confidence\n198.51.100.42/24;1\n2001:db8::1;0.5\n"), "https://example.com/feed", policy.Selector{Kind: policy.IPList, Value: "feed"}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := cache.Stage([]Record{record})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Config{
+		IPLists:  map[string]config.IPListConfig{"feed": {URL: record.Endpoint, CSV: options, RefreshInterval: time.Hour, RequestTimeout: time.Second}},
+		Policies: []config.Policy{{Mode: "blocklist", Include: config.Selector{IPLists: []string{"feed"}}}},
+	}
+	if err := cache.Stabilize(snapshot.ManifestID()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cache.Collect([]string{snapshot.ManifestID()}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := cache.Load(snapshot.ManifestID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := loaded.ValidateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ManifestID() != snapshot.ManifestID() || !reflect.DeepEqual(loaded.Records()[0].Parameters, record.Parameters) {
+		t.Fatal("exact CSV reference or parser parameters changed during recovery")
+	}
+	for name, mutate := range map[string]func(map[string]string){
+		"unknown":             func(p map[string]string) { p["unexpected"] = "1" },
+		"missing":             func(p map[string]string) { delete(p, "header") },
+		"bad-delimiter":       func(p map[string]string) { p["delimiter"] = "#" },
+		"noncanonical-bool":   func(p map[string]string) { p["header"] = "True" },
+		"noncanonical-column": func(p map[string]string) { p["ip_column"] = "01" },
+		"partial-filter":      func(p map[string]string) { delete(p, "filter_op") },
+		"bad-op":              func(p map[string]string) { p["filter_op"] = "=" },
+		"noncanonical-value":  func(p map[string]string) { p["filter_value"] = "0.50" },
+		"nonfinite":           func(p map[string]string) { p["filter_value"] = "NaN" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			corrupt := record
+			corrupt.Parameters = cloneParameters(record.Parameters)
+			mutate(corrupt.Parameters)
+			if _, err := cache.Stage([]Record{corrupt}); err == nil {
+				t.Fatal("accepted tampered CSV parameters")
+			}
+			objectIDs, err := cache.manifestObjectIDs(snapshot.ManifestID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			object, err := os.ReadFile(cache.objectPath(objectIDs[0]))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire objectFile
+			if err := json.Unmarshal(object, &wire); err != nil {
+				t.Fatal(err)
+			}
+			wire.Parameters = corrupt.Parameters
+			if _, err := validateObject(wire); err == nil {
+				t.Fatal("loaded tampered persisted CSV parameters")
+			}
+			tampered, err := canonicalJSON(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			objectID := digestID(tampered)
+			if err := os.WriteFile(cache.objectPath(objectID), tampered, cacheFileMode); err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := cache.readManifest(snapshot.ManifestID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.Entries[0].Object = objectID
+			manifest.Entries[0].Parameters = corrupt.Parameters
+			manifestBytes, err := canonicalJSON(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifestID := digestID(manifestBytes)
+			if err := os.WriteFile(cache.manifestPath(manifestID), manifestBytes, cacheFileMode); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cache.Load(manifestID); err == nil {
+				t.Fatal("rehashed tampered persisted CSV evidence loaded")
+			}
+		})
+	}
+	text := record
+	text.APIVersion = listFormatVersion
+	if _, err := cache.Stage([]Record{text}); err == nil {
+		t.Fatal("text parser accepted CSV parameters")
+	}
+	provider := record
+	provider.Selector = policy.Selector{Kind: policy.Provider, Value: "test_provider"}
+	provider.SourceKind, provider.SourceName = providerSourceKind, provider.Selector.Value
+	provider.Endpoint, err = providerEndpoint(provider.SourceName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cache.Stage([]Record{provider}); err == nil {
+		t.Fatal("provider accepted CSV parser")
+	}
+}

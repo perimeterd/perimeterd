@@ -94,6 +94,20 @@ type rawIPList struct {
 	RefreshInterval *string       `yaml:"refresh_interval"`
 	RequestTimeout  *string       `yaml:"request_timeout"`
 	Transport       *rawTransport `yaml:"transport"`
+	CSV             *rawCSV       `yaml:"csv"`
+}
+
+type rawCSV struct {
+	Delimiter *string       `yaml:"delimiter"`
+	Header    *bool         `yaml:"header"`
+	IPColumn  *int          `yaml:"ip_column"`
+	Filter    *rawCSVFilter `yaml:"filter"`
+}
+
+type rawCSVFilter struct {
+	Column *int     `yaml:"column"`
+	Op     *string  `yaml:"op"`
+	Value  *float64 `yaml:"value"`
 }
 
 type rawLogging struct {
@@ -182,6 +196,7 @@ const (
 	kindString
 	kindInt
 	kindBool
+	kindNumber
 )
 
 func unwrapDocument(node *yaml.Node) *yaml.Node {
@@ -342,12 +357,24 @@ func checkIPListsShape(node *yaml.Node, path string) error {
 			return err
 		}
 		if err := checkMappingFields(value, entryPath, map[string]nodeKind{
-			"url": kindString, "refresh_interval": kindString, "request_timeout": kindString, "transport": kindMap,
-		}, map[string]func(*yaml.Node, string) error{"transport": checkTransportShape}); err != nil {
+			"url": kindString, "refresh_interval": kindString, "request_timeout": kindString, "transport": kindMap, "csv": kindMap,
+		}, map[string]func(*yaml.Node, string) error{"transport": checkTransportShape, "csv": checkCSVShape}); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func checkCSVShape(node *yaml.Node, path string) error {
+	return checkMappingFields(node, path, map[string]nodeKind{
+		"delimiter": kindString, "header": kindBool, "ip_column": kindInt, "filter": kindMap,
+	}, map[string]func(*yaml.Node, string) error{"filter": checkCSVFilterShape})
+}
+
+func checkCSVFilterShape(node *yaml.Node, path string) error {
+	return checkMappingFields(node, path, map[string]nodeKind{
+		"column": kindInt, "op": kindString, "value": kindNumber,
+	}, nil)
 }
 
 func checkGroupsShape(node *yaml.Node, path string) error {
@@ -408,6 +435,8 @@ func expectNode(node *yaml.Node, expected nodeKind, path string) error {
 		ok = node.Kind == yaml.ScalarNode && node.Tag == "!!int"
 	case kindBool:
 		ok = node.Kind == yaml.ScalarNode && node.Tag == "!!bool"
+	case kindNumber:
+		ok = node.Kind == yaml.ScalarNode && (node.Tag == "!!int" || node.Tag == "!!float")
 	}
 	if !ok {
 		return fmt.Errorf("%s: wrong YAML type", path)

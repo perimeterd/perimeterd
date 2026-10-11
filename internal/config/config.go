@@ -54,13 +54,40 @@ func (c OpenZitiConfig) IsZero() bool {
 	return len(c.Identities) == 0
 }
 
-// IPListConfig describes one named HTTP(S) text source and its optional
+// IPListConfig describes one named HTTP(S) text or CSV source and its optional
 // per-source transport.
 type IPListConfig struct {
 	URL             string          `yaml:"url"`
 	RefreshInterval time.Duration   `yaml:"refresh_interval"`
 	RequestTimeout  time.Duration   `yaml:"request_timeout"`
 	Transport       TransportConfig `yaml:"transport,omitempty" json:"Transport,omitzero"`
+	CSV             CSVConfig       `yaml:"csv,omitempty" json:"CSV,omitzero"`
+}
+
+// CSVConfig selects CSV parsing with one-based column indices.
+// Its zero value selects the legacy text parser.
+type CSVConfig struct {
+	Delimiter string          `yaml:"delimiter"`
+	Header    bool            `yaml:"header"`
+	IPColumn  int             `yaml:"ip_column"`
+	Filter    CSVFilterConfig `yaml:"filter,omitempty" json:"Filter,omitzero"`
+}
+
+// CSVFilterConfig describes one numeric predicate. Its zero value means absent.
+type CSVFilterConfig struct {
+	Column int     `yaml:"column"`
+	Op     string  `yaml:"op"`
+	Value  float64 `yaml:"value"`
+}
+
+// IsZero reports whether CSV parsing is absent.
+func (c CSVConfig) IsZero() bool {
+	return c == (CSVConfig{})
+}
+
+// IsZero reports whether the numeric filter is absent.
+func (f CSVFilterConfig) IsZero() bool {
+	return f == (CSVFilterConfig{})
 }
 
 // LoggingConfig controls structured log verbosity and encoding.

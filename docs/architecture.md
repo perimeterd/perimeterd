@@ -36,7 +36,7 @@ flowchart LR
     V --> R[Selector resolver and immutable cache]
     R --> C[Policy compiler]
     RIPE[RIPEstat] --> R
-    TXT[HTTP/S text IP lists] --> R
+    TXT[HTTP/S text or CSV IP lists] --> R
     PROVIDERS[jsDelivr main provider feeds] --> R
     L[CrowdSec LAPI stream] --> D[Dynamic decision store]
     C --> W[Serialized firewall writer]
@@ -744,8 +744,8 @@ firewall syntax. No source adapter can select commands, chain names, or raw
 rules.
 Custom-list publishers control the addresses contributed by their selectors;
 using HTTP also trusts the network path. Prefer HTTPS with normal certificate
-verification. The text-list adapter accepts addresses only, never scripts,
-includes, or remote configuration.
+verification. Custom-list parsers accept selected addresses and an optional
+numeric CSV predicate, never scripts, includes, or remote configuration.
 
 `run` and `cleanup` require UID 0. The installed service's capability
 restrictions and systemd hardening are documented in

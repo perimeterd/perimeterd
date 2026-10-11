@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -256,6 +257,7 @@ func recordMatchesConfig(record Record, cfg config.Config) bool {
 			record.SourceName == spec.SourceName &&
 			record.Endpoint == spec.Endpoint &&
 			record.APIVersion == spec.APIVersion &&
+			maps.Equal(record.Parameters, spec.Parameters) &&
 			bindingMatchesConfig(record.Transport, spec.Transport)
 	case policy.Provider:
 		return record.SourceKind == spec.SourceKind &&
@@ -560,7 +562,11 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		return Record{}, fmt.Errorf("create request: %w", err)
 	}
 	if text {
-		req.Header.Set("Accept", "text/plain")
+		if spec.APIVersion == csvFormatVersion {
+			req.Header.Set("Accept", "text/csv, text/plain")
+		} else {
+			req.Header.Set("Accept", "text/plain")
+		}
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
@@ -606,7 +612,9 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		return Record{}, fmt.Errorf("response exceeds %d-byte limit", maxBodyBytes)
 	}
 	var record Record
-	if text {
+	if spec.APIVersion == csvFormatVersion {
+		record, err = parseCSVList(body, endpoint, selector, cfg.IPLists[selector.Value].CSV)
+	} else if text {
 		record, err = parseTextList(body, endpoint, selector)
 	} else if selector.Kind == policy.Country {
 		record, err = parseCountry(body, endpoint, requestDescription.apiVersion, requestDescription.parameters, selector)
@@ -666,17 +674,9 @@ func parseTextList(body []byte, endpoint string, selector policy.Selector) (Reco
 			continue
 		}
 		found = true
-		prefix, err := netip.ParsePrefix(line)
+		prefix, err := parseListAddress(line)
 		if err != nil {
-			address, addressErr := netip.ParseAddr(line)
-			if addressErr != nil || address.Zone() != "" {
-				return Record{}, fmt.Errorf("%s line %d is not one IP address or CIDR", description, lineNumber)
-			}
-			bits := 128
-			if address.Is4() {
-				bits = 32
-			}
-			prefix = netip.PrefixFrom(address, bits)
+			return Record{}, fmt.Errorf("%s line %d is not one IP address or CIDR", description, lineNumber)
 		}
 		if prefix.Addr().Is4() {
 			ipv4 = append(ipv4, prefix)
@@ -689,6 +689,26 @@ func parseTextList(body []byte, endpoint string, selector policy.Selector) (Reco
 	if !found {
 		return Record{}, fmt.Errorf("%s is empty", description)
 	}
+	return finishListRecord(ipv4, ipv6, endpoint, selector, sourceKind, description, listFormatVersion, map[string]string{})
+}
+
+func parseListAddress(cell string) (netip.Prefix, error) {
+	prefix, err := netip.ParsePrefix(cell)
+	if err == nil {
+		return prefix, nil
+	}
+	address, err := netip.ParseAddr(cell)
+	if err != nil || address.Zone() != "" {
+		return netip.Prefix{}, errors.New("not one IP address or CIDR")
+	}
+	bits := 128
+	if address.Is4() {
+		bits = 32
+	}
+	return netip.PrefixFrom(address, bits), nil
+}
+
+func finishListRecord(ipv4, ipv6 []netip.Prefix, endpoint string, selector policy.Selector, sourceKind, description, version string, parameters map[string]string) (Record, error) {
 	normalized4, err := normalizeFamily(ipv4, true)
 	if err != nil {
 		return Record{}, fmt.Errorf("%s IPv4: %w", description, err)
@@ -703,8 +723,8 @@ func parseTextList(body []byte, endpoint string, selector policy.Selector) (Reco
 	}
 	return Record{
 		Selector: selector, SourceKind: sourceKind, SourceName: selector.Value,
-		Endpoint: normalizedEndpoint, APIVersion: listFormatVersion,
-		Parameters: map[string]string{}, RetrievedAt: time.Now().UTC(),
+		Endpoint: normalizedEndpoint, APIVersion: version,
+		Parameters: parameters, RetrievedAt: time.Now().UTC(),
 		IPv4: normalized4, IPv6: normalized6,
 	}, nil
 }

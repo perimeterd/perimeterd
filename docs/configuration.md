@@ -146,11 +146,12 @@ and are always validated; only the selected backend is applied.
 | `geo.request_timeout` | duration | `30s` | Positive, per request |
 | `geo.refresh_jitter` | duration | `10m` | Positive upper delay |
 | `groups` | map | `{}` | Lowercase name to countries |
-| `ip_lists` | map | `{}` | List name to HTTP(S) text source |
+| `ip_lists` | map | `{}` | List name to HTTP(S) text or explicitly configured CSV source |
 | `ip_lists.<name>.url` | URL | — | Required absolute HTTP(S) URL |
 | `ip_lists.<name>.refresh_interval` | duration | `24h` | Positive per-list interval |
 | `ip_lists.<name>.request_timeout` | duration | `30s` | Positive timeout for a complete fetch |
 | `ip_lists.<name>.transport` | map | direct | Optional [transport binding](#optional-openziti-configuration) |
+| `ip_lists.<name>.csv` | map | absent (plain text) | Optional [CSV column selection and numeric filter](#csv-column-selection) |
 | `providers.refresh_interval` | duration | `24h` | Positive interval shared by named-provider sources |
 | `providers.request_timeout` | duration | `30s` | Positive timeout for a complete provider fetch |
 | `policies` | list | `[]` | Policy declarations, ordered by direction and priority |
@@ -249,12 +250,12 @@ terminate established connections.
 
 ## Custom IP lists
 
-`ip_lists` is a top-level map of reusable text-list sources. Names follow the
+`ip_lists` is a top-level map of reusable HTTP(S) list sources. Names follow the
 same lowercase DNS-label-like syntax as policy names and occupy a separate
 namespace from `groups`. Each definition accepts only `url`, `refresh_interval`,
-`request_timeout`, and optional [transport](#optional-openziti-configuration);
-defaults are listed above. Definitions are validated even when unreferenced. An omitted or
-empty `ip_lists` map defines no sources.
+`request_timeout`, optional [transport](#optional-openziti-configuration), and
+optional `csv`; defaults are listed above. Definitions are validated even when
+unreferenced. An omitted or empty `ip_lists` map defines no sources.
 
 `url` must be an absolute `http` or `https` URL with a host, no user information,
 and no fragment. Query strings are permitted; file paths and other schemes are
@@ -270,11 +271,13 @@ matching other selector categories. A list referenced several times is resolved
 once per candidate; unused definitions and references only in disabled policies
 cause no network requests.
 
-Each source serves plain text with one IPv4/IPv6 address or CIDR per line.
-See [the source contract](data-sources.md#custom-https-ip-lists) for
-normalization, blank/comment lines, invalid or empty responses, and cache
-fallback. `refresh_interval` is independent for each list and is not controlled
-by `geo.refresh_interval` or `geo.refresh_jitter`.
+Without `csv`, each source serves plain text with one IPv4/IPv6 address or CIDR
+per line. An explicit `csv` mapping selects CSV parsing; filenames, MIME types,
+headers, and content never select a parser automatically.
+See [the source contract](data-sources.md#custom-https-ip-lists) for normalization,
+comment handling, invalid or empty responses, and cache fallback.
+`refresh_interval` is independent for each list and is not controlled by
+`geo.refresh_interval` or `geo.refresh_jitter`.
 
 ### Custom list example
 
@@ -315,6 +318,64 @@ this policy, not a global allow overriding CrowdSec or global blocks. Existing
 established-flow, local-range, and surrounding-firewall behavior remains intact.
 The public feed is an illustrative operator-selected dependency, not a pinned
 or endorsed perimeterd source.
+
+### CSV column selection
+
+Columns are **one-based positive integers**, not header names. CSV supports one
+optional numeric condition; there is no expression language or list of filters.
+Named-provider feeds continue to use their existing text format.
+
+| Setting | Default | Contract |
+| --- | --- | --- |
+| `csv` | absent | Mapping selecting CSV; null and empty mappings are invalid |
+| `csv.delimiter` | `","` | One valid Unicode rune; reject NUL, CR, LF, `"`, U+FFFD, and `#` (reserved for comments). Quoted `"\t"` is allowed |
+| `csv.header` | `false` | Boolean; skip exactly the first record after blank lines/comments, requiring all referenced columns. Labels have no meaning |
+| `csv.ip_column` | required | Positive integer selecting an IP address or CIDR |
+| `csv.filter` | absent | Optional mapping; all three fields below are required when present |
+| `csv.filter.column` | required | Positive integer selecting a numeric cell |
+| `csv.filter.op` | required | Exactly one of `==`, `!=`, `<`, `<=`, `>`, `>=` |
+| `csv.filter.value` | required | Finite YAML integer or float; explicit zero is valid. Strings, booleans, null, NaN, and infinities are invalid |
+
+Unknown or duplicate nested keys and wrong scalar types fail offline validation,
+including in unused definitions. Equivalent numeric thresholds normalize to the
+same value, including signed zero. Comparisons use ordinary float64 numeric
+ordering/equality, not lexical ordering or a tolerance.
+
+### CSV feed examples
+
+These root-level fragments select the address column of the daily feed and
+confidence **column 3** of the eight-day feed. Both use semicolons, an initial
+comment block, and a header; the eight-day feed also contains CIDRs.
+
+```yaml
+ip_lists:
+  avastel-daily:
+    url: https://github.com/antoinevastel/avastel-bot-ips-lists/raw/refs/heads/master/avastel-proxy-bot-ips-1day.txt
+    csv:
+      delimiter: ";"
+      header: true
+      ip_column: 1
+
+  avastel-confident:
+    url: https://github.com/antoinevastel/avastel-bot-ips-lists/raw/refs/heads/master/avastel-proxy-bot-ips-blocklist-8days.txt
+    csv:
+      delimiter: ";"
+      header: true
+      ip_column: 1
+      filter:
+        column: 3
+        op: ">="
+        value: 1
+```
+
+Reference either name through `include.ip_lists` or `exclude.ip_lists` without
+policy syntax changes. Existing timing and transport settings remain available.
+These mutable third-party feeds are illustrative, not enabled by default or
+endorsed. A malformed row or a filter selecting no prefixes rejects the whole
+response; it cannot clear enforcement. Changing any parsing option requires new
+source evidence, even if the URL and resulting prefixes are unchanged. See
+[CSV parsing and validation](data-sources.md#csv-parsing-and-validation) and
+[list identity](data-sources.md#list-identity-and-immutable-cache).
 
 ## Named providers
 

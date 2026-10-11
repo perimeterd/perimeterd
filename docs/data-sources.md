@@ -34,6 +34,7 @@ deployment contract.
   - [Fresh reuse and stale fallback](#fresh-reuse-and-stale-fallback)
 - [Custom HTTP(S) IP lists](#custom-https-ip-lists)
   - [Text format and validation](#text-format-and-validation)
+  - [CSV parsing and validation](#csv-parsing-and-validation)
   - [HTTP transport](#http-transport)
   - [List identity and immutable cache](#list-identity-and-immutable-cache)
   - [Per-list refresh and complete snapshots](#per-list-refresh-and-complete-snapshots)
@@ -58,7 +59,7 @@ deployment contract.
 - [Lookup source attribution](#lookup-source-attribution)
 
 Version 1 uses RIPEstat for static country/ASN prefixes, custom HTTP(S)
-text lists as another static selector type, and CrowdSec LAPI for dynamic
+text or explicitly configured CSV lists as another static selector type, and CrowdSec LAPI for dynamic
 ingress bans. Named feeds from `rezmoss/cloud-provider-ip-addresses` also use
 the static-source pipeline. [Configuration](configuration.md) defines selectors and defaults;
 [architecture](architecture.md) defines revision admission, commit behavior,
@@ -322,7 +323,7 @@ normal schedule.
 
 ## Custom HTTP(S) IP lists
 
-Named `ip_lists` resolve operator-selected HTTP or HTTPS text feeds for
+Named `ip_lists` resolve operator-selected HTTP or HTTPS text or CSV feeds for
 `include.ip_lists` and `exclude.ip_lists`. They are independent of RIPEstat and
 do not infer countries or ASNs. [Configuration](configuration.md#custom-ip-lists)
 owns names, URL validation, defaults, references, and policy behavior.
@@ -353,12 +354,48 @@ The supplied
 is an example of this line-oriented IPv4/IPv6 format. Tests must use local
 fixtures rather than depend on that mutable public URL.
 
+### CSV parsing and validation
+
+Only an explicit `csv` mapping selects this parser; see
+[configuration](configuration.md#csv-column-selection) for the fields and feed
+examples. Named providers remain plain text.
+
+- Require valid UTF-8 and strict standard Go CSV quoting: quoted delimiters,
+  escaped double quotes, multiline fields, LF/CRLF, and an optional final newline
+  are supported. Empty physical lines are ignored. `#` starts a comment only in
+  the first character position outside a quoted field. Unlike text mode,
+  whitespace-prefixed comments and whitespace-only records are not stripped.
+  There is no inline-comment removal or preprocessing of physical lines.
+- If configured, discard exactly the first CSV record as a header, checking
+  that it contains every referenced column. Header labels are not interpreted.
+  Every data record must also contain the IP and optional numeric columns.
+  Variable-width records and unused extra fields are accepted.
+- Trim ASCII spaces/tabs around selected cells after CSV decoding. Validate
+  every selected address using the text parser's IP/CIDR rules, including rows
+  rejected by the predicate and addresses from disabled families. Hostnames,
+  ranges, and zones remain invalid. Matching prefixes use the same masking,
+  deduplication, and family normalization as text lists.
+- Parse each filter cell once as float64 and reject empty, nonnumeric, NaN, or
+  infinite values. Compare numerically against the normalized threshold; only
+  a valid false predicate omits a row. Unused cells need not be numeric.
+- Parse records through EOF after the bounded complete HTTP read. Malformed
+  quoting, a missing referenced column, invalid address or number, or a broken
+  tail rejects the entire response, never publishing partial prefixes.
+  Diagnostics identify the list, row/line, and selected column where useful,
+  without echoing cell contents, rows, URLs, or query strings.
+- Empty, comment-only, and header-only sources are invalid. **Zero matching
+  prefixes** is also an error, reported as no prefixes matching the CSV filter.
+  Filtering everything out cannot clear enforcement: only a complete,
+  exact-identity committed snapshot may serve as fallback.
+
 ### HTTP transport
 
 Fetch with HTTP GET. Require a final HTTP 200 and a fully read, validated body;
 204, unsolicited 304, other statuses, transport errors, truncated reads, or
-timeouts fail resolution. Parse the body as text regardless of MIME type or
-filename extension; a `.txt` suffix is not required.
+timeouts fail resolution. Use the configured text or CSV parser regardless of
+MIME type or filename extension; neither autodetects nor restricts the format.
+CSV requests advertise `Accept: text/csv, text/plain`; text requests use
+`Accept: text/plain`.
 
 Use the list's `request_timeout` for the entire fetch, including redirects and
 body reading. Enforce the existing 32 MiB decoded-response cap, including after
@@ -388,18 +425,34 @@ Version-2 selector objects and manifest entries identify custom lists with
 For direct HTTP(S), version-3 records retain those identity fields and add an
 explicit `type: "direct"` transport binding; OpenZiti-bound records carry their
 private-route identity instead. See [transport identity](#transport-identity-and-saved-evidence).
-The `endpoint` is the configured URL and `api_version` is text-parser format `"1"`.
-`parameters` is empty and query-time fields are empty strings: a text source
-does not fabricate RIPEstat metadata. All-RIPEstat manifests retain
-`source: "ripestat"`; manifests containing lists use `source: "static"`. Use the
-configured URL with scheme and DNS host normalized to lowercase, preserving
-path and query bytes; redirect destinations do not replace that identity.
-Changing the name or URL requires resolution under a new identity; changing
-only the interval or timeout does not invalidate already validated prefixes.
+The `endpoint` is the configured URL. Text lists retain `api_version: "1"` and
+empty `parameters`, so existing stored text evidence remains readable without
+migration or re-hashing. CSV lists use `api_version: "csv-1"` and canonical
+string-valued parser parameters:
+
+- Always include effective `delimiter`, `header`, and `ip_column`.
+- With a filter, also include `filter_column`, `filter_op`, and `filter_value`;
+  otherwise omit all filter keys.
+- Encode booleans as `true`/`false`, columns as positive decimal integers, and
+  thresholds using `strconv.FormatFloat(value, 'g', -1, 64)` after normalizing
+  signed zero. Unknown, missing, partial, or noncanonical parameters are invalid.
+
+Providers cannot use the CSV parser version. Query-time fields remain empty
+strings for both list parsers; parser parameters are not RIPEstat request or
+timestamp metadata. All-RIPEstat manifests retain `source: "ripestat"`;
+manifests containing lists use `source: "static"`. Use the configured URL with
+scheme and DNS host normalized to lowercase, preserving path and query bytes;
+redirect destinations do not replace that identity.
+
+Changing the name, URL, delimiter, header setting, selected columns, filter
+presence, operator, or threshold requires resolution under a new identity,
+even when resulting prefixes are identical. Timing-only changes do not
+invalidate evidence. These checks apply to fresh reuse, stale fallback,
+candidate admission, persisted recovery, and committed lookup validation.
 
 List objects store that identity, retrieval time, normalized family arrays,
-and content identifiers; RIPEstat query times and API metadata are not invented
-for a text source. Mixed manifests bind the complete required selector set to
+and content identifiers; RIPEstat query times are not invented for a list
+source. Mixed manifests bind the complete required selector set to
 exact objects. A list referenced in multiple include/exclude positions uses one
 object. Different configured names remain distinct selectors even if they use
 the same URL.
@@ -440,9 +493,11 @@ other selectors' own deadlines.
 First start needs every required selector to resolve. Restart and reload may
 use the complete committed fallback only when it covers every required
 identity and still compiles under the candidate configuration; a subset manifest
-preserves its retrieval times. Adding a list or changing its URL cannot fall
-back to an unrelated or previously named endpoint. A failed reload keeps the
-old configuration and its schedule. Disabling/removing the last active reference
+preserves its retrieval times. Adding a list or changing its URL or CSV parsing
+settings cannot fall back to evidence from the old interpretation. An outage
+after a threshold change rejects the candidate, rather than activating old-filter
+data. A failed reload keeps the old configuration, enforcement, and schedule.
+Disabling/removing the last active reference
 stops that list's refresh after commit, without deleting cache evidence still
 required by a retained revision or journal.
 

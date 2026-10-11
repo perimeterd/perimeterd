@@ -36,9 +36,11 @@ Try enforcement only in a disposable VM or isolated network namespace. See
 ## Capabilities
 
 The runtime targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
-RIPEstat-derived geographic/ASN policy, custom HTTP(S) text IP lists in policy
-include/exclude selectors with per-list refresh intervals, direct provider IDs
-resolved dynamically through jsDelivr, and CrowdSec ingress bans. Docker
+RIPEstat-derived geographic/ASN policy, custom HTTP(S) plain-text or
+[CSV IP lists](docs/configuration.md#csv-column-selection) with one-based columns
+and an optional numeric filter, policy include/exclude selectors with per-list
+refresh intervals, direct provider IDs resolved dynamically through jsDelivr,
+and CrowdSec ingress bans. Docker
 coexistence, acknowledged configuration reload, IP/CIDR lookup with source explanations, and
 [optional OpenZiti transport](docs/architecture.md#optional-openziti-upstream-transport)
 for selected CrowdSec/custom-list upstreams are implemented. Direct HTTP(S)
@@ -61,7 +63,7 @@ verify changes.
 | --- | --- |
 | [Architecture](docs/architecture.md) | Component boundaries, writer ownership, revision admission, commit, recovery, and applied-state lookup |
 | [Configuration](docs/configuration.md) | YAML schema, defaults, validation, policy semantics, and examples |
-| [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
+| [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text/CSV lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
 | [Firewall backends](docs/firewall-backends.md) | Packet paths, native ownership, commit/rollback guarantees, and attachments |
 | [Operations](docs/operations.md) | Source-build procedures, health/metrics, lookup CLI contract, and service/package lifecycle |
 | [Development](docs/development.md) | Repository map, commands, verification matrix, measurements, CI, and release requirements |

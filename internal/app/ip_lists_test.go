@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
+	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 )
@@ -199,4 +200,82 @@ policies:
 	if _, err := store.Read(); err != nil {
 		t.Fatalf("committed candidate cannot recover after caller mutation: %v", err)
 	}
+}
+
+func TestCSVCandidateOwnsInterpretationAndRecovers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ip;confidence\n8.8.8.8;1\n9.9.9.9;0.5\n")
+	}))
+	defer server.Close()
+	cfg, err := config.Parse([]byte(fmt.Sprintf(`version: 1
+firewall:
+  backend: nftables
+ip_lists:
+  confidence:
+    url: %s
+    csv:
+      delimiter: ";"
+      header: true
+      ip_column: 1
+      filter:
+        column: 2
+        op: ">="
+        value: 0.75
+policies:
+  - name: confidence
+    priority: 10
+    direction: ingress
+    mode: blocklist
+    traffic: ["any"]
+    include:
+      ip_lists: [confidence]
+`, server.URL)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, store := newTestEngine(t, &recordingBackend{}, nil)
+	defer engine.Close()
+	resolution, err := source.NewResolver(store.Prefixes(), server.Client()).Resolve(t.Context(), cfg, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch, err := engine.Admit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := NewCandidate(epoch, "policy.yaml", cfg, resolution.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list := cfg.IPLists["confidence"]
+	list.CSV.Filter.Value = 0.25
+	cfg.IPLists["confidence"] = list
+	if _, err := NewCandidate(epoch, "changed.yaml", cfg, resolution.Snapshot); err == nil {
+		t.Fatal("changed CSV interpretation admitted with old evidence")
+	}
+	outcome, err := engine.Apply(t.Context(), candidate)
+	if err != nil || !outcome.Committed {
+		t.Fatalf("caller mutation changed CSV candidate: committed=%v error=%v", outcome.Committed, err)
+	}
+	assertSelection := func(current *Engine) {
+		t.Helper()
+		for address, verdict := range map[string]string{"8.8.8.8": "blocked", "9.9.9.9": "not_blocked"} {
+			response := current.Lookup(t.Context(), lookup.Request{Address: address, Direction: "ingress"})
+			if response.Error != nil || response.Verdict != verdict {
+				t.Fatalf("CSV selection for %s = %+v, want %s", address, response, verdict)
+			}
+		}
+	}
+	assertSelection(engine)
+	engine.Close()
+	recovered := NewEngine(store, &recordingBackend{}, nil)
+	defer recovered.Close()
+	active, err := recovered.Recover(t.Context())
+	if err != nil || active == nil {
+		t.Fatalf("recover CSV candidate: active=%+v error=%v", active, err)
+	}
+	if active.Config.IPLists["confidence"].CSV.Filter.Value != 0.75 || active.Manifest != resolution.Snapshot.ManifestID() {
+		t.Fatalf("recovery lost committed CSV interpretation: %+v", active.Config.IPLists["confidence"])
+	}
+	assertSelection(recovered)
 }

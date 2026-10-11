@@ -51,13 +51,24 @@ providers:
 
 groups: {}
 
-# Named HTTP(S) text feeds: one IP/CIDR per line. Unreferenced lists are not fetched.
+# Named HTTP(S) feeds: plain text by default; an optional csv mapping selects CSV.
 # Reference this with include.ip_lists: [zoom] or exclude.ip_lists: [zoom] in a policy.
 ip_lists:
   zoom:
     url: https://cdn.jsdelivr.net/gh/rezmoss/cloud-provider-ip-addresses@main/zoom/zoom_ips.txt
     refresh_interval: 6h
     request_timeout: 30s
+  # Optional third-party CSV example; uncomment only if deliberately selected.
+  # avastel-confident:
+  #   url: https://github.com/antoinevastel/avastel-bot-ips-lists/raw/refs/heads/master/avastel-proxy-bot-ips-blocklist-8days.txt
+  #   csv:
+  #     delimiter: ";"
+  #     header: true
+  #     ip_column: 1       # One-based IP/CIDR column.
+  #     filter:
+  #       column: 3        # One-based confidence column.
+  #       op: ">="
+  #       value: 1
 
 policies: []
 

@@ -471,6 +471,12 @@ func normalizeIPLists(raw map[string]*rawIPList, identities map[string]OpenZitiI
 				return nil, err
 			}
 		}
+		if value.CSV != nil {
+			entry.CSV, err = normalizeRawCSV(*value.CSV, field+".csv")
+			if err != nil {
+				return nil, err
+			}
+		}
 		out[name] = entry
 	}
 	return out, nil

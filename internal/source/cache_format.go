@@ -14,6 +14,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/prefix"
 	"github.com/perimeterd/perimeterd/internal/upstream"
@@ -200,11 +201,21 @@ func canonicalRecord(record Record) (Record, error) {
 				return Record{}, errors.New("provider URL does not match selector")
 			}
 		}
-		if record.APIVersion != listFormatVersion {
+		parameters := cloneParameters(record.Parameters)
+		switch record.APIVersion {
+		case listFormatVersion:
+			if len(parameters) != 0 {
+				return Record{}, fmt.Errorf("%s request metadata is not empty", label)
+			}
+		case csvFormatVersion:
+			if sourceKind != listSourceKind {
+				return Record{}, fmt.Errorf("unsupported %s parser version", label)
+			}
+			if _, err := config.CSVConfigFromParameters(parameters); err != nil {
+				return Record{}, fmt.Errorf("%s CSV metadata is invalid: %w", label, err)
+			}
+		default:
 			return Record{}, fmt.Errorf("unsupported %s parser version", label)
-		}
-		if len(record.Parameters) != 0 {
-			return Record{}, fmt.Errorf("%s request metadata is not empty", label)
 		}
 		if !record.QueryStart.IsZero() || !record.QueryEnd.IsZero() {
 			return Record{}, fmt.Errorf("%s query timestamps are not allowed", label)
@@ -224,7 +235,7 @@ func canonicalRecord(record Record) (Record, error) {
 		return Record{
 			Selector: selector, SourceKind: sourceKind, SourceName: record.SourceName,
 			Endpoint: endpoint, APIVersion: record.APIVersion,
-			Parameters: map[string]string{}, RetrievedAt: retrievedAt,
+			Parameters: parameters, RetrievedAt: retrievedAt,
 			IPv4: v4, IPv6: v6, Transport: transport,
 		}, nil
 	}

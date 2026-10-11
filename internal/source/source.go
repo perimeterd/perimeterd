@@ -20,6 +20,7 @@ const (
 	listSourceKind     = "ip_list"
 	providerSourceKind = "provider"
 	listFormatVersion  = "1"
+	csvFormatVersion   = "csv-1"
 )
 
 // SelectorSpec describes the authoritative source metadata for one canonical
@@ -34,6 +35,7 @@ type SelectorSpec struct {
 	SourceKind      string
 	SourceName      string
 	APIVersion      string
+	Parameters      map[string]string
 }
 
 // DescribeSelector returns the source identity, endpoint, transport, and
@@ -51,6 +53,15 @@ func DescribeSelector(cfg config.Config, selector policy.Selector) (SelectorSpec
 		if err != nil {
 			return SelectorSpec{}, fmt.Errorf("source: custom list %q has invalid URL", selector.Value)
 		}
+		parameters := map[string]string{}
+		version := listFormatVersion
+		if !list.CSV.IsZero() {
+			parameters, err = list.CSV.Parameters()
+			if err != nil {
+				return SelectorSpec{}, fmt.Errorf("source: custom list %q has invalid CSV options: %w", selector.Value, err)
+			}
+			version = csvFormatVersion
+		}
 		return SelectorSpec{
 			RefreshInterval: list.RefreshInterval,
 			RequestTimeout:  list.RequestTimeout,
@@ -58,7 +69,8 @@ func DescribeSelector(cfg config.Config, selector policy.Selector) (SelectorSpec
 			Endpoint:        endpoint,
 			SourceKind:      listSourceKind,
 			SourceName:      selector.Value,
-			APIVersion:      listFormatVersion,
+			APIVersion:      version,
+			Parameters:      parameters,
 		}, nil
 	case policy.Provider:
 		endpoint, err := providerEndpoint(selector.Value)
