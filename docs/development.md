@@ -33,10 +33,10 @@ to the owning reference document rather than a separate implementation plan.
 ```text
 cmd/perimeterd/main.go
 internal/app/                 lifecycle, candidates, serialized writer, HTTP and notifications
-internal/cli/                 command dispatch, validation, lookup, reload and version reporting
+internal/cli/                 command dispatch, validation, lookup, status, reload and version reporting
 internal/config/              YAML schema, defaults and strict validation
 internal/config/catalog/      checked-in country/group/RIR catalogs and ASN validation
-internal/control/             secure shared Unix transport and synchronous reload protocol
+internal/control/             secure shared Unix transport, status and synchronous reload protocols
 internal/crowdsec/            bounded LAPI adapter, authoritative store and timed projection
 internal/lookup/              applied-state evaluation, attribution, query validation and handler
 internal/policy/              immutable snapshots and backend-neutral compiler
@@ -93,9 +93,11 @@ The most useful file boundaries when changing an existing path are:
   deadlines, and maximum-expiry overlap projection.
 - `internal/app/lookup.go`: atomic applied-view publication, invalidation,
   acknowledged dynamic lease evidence, and query completion fencing.
+- `internal/app/status.go`: public applied-policy summary, loaded prefix counts,
+  acknowledged decision expiry/validity, and the same query completion fence.
 - `internal/control/`: secure Unix socket/server/client lifecycle, strict reload
   request/results, and independent reload-handler capacity. Header/body reads
-  retain five seconds; routed lookup writes/evaluation retain five seconds;
+  retain five seconds; routed lookup/status writes/evaluation retain five seconds;
   reload client/server bounds are 75/80 seconds, before systemd's 90 seconds.
 - `internal/lookup/`: complete address/traffic partitions, source explanation,
   strict query protocol/handler, and the daemon client using shared Unix transport.
@@ -231,6 +233,15 @@ limits, independent capacity, strict response/digest validation, and no retries.
 behavior, pre-apply rejection/mismatch, the production client timeout, and missing
 socket failure across nftables and both iptables families. Systemd/role VM surfaces
 also check nonzero reload propagation and exact successful-marker preservation.
+
+Status regressions cover acknowledged static publication, rejected applies
+retaining the previous view, recovery/empty state, nonblocking reads during
+native apply, concurrent epoch/count consistency, dynamic publication retaining
+static metadata, secret omission, and expiry/validity boundaries with metrics
+disabled. Control and CLI coverage distinguishes degraded reports from protocol
+failures and unavailable sockets, including stdout/exit behavior. Native smoke
+verification runs the actual status, lookup and reload CLI against a daemon in
+isolated network/mount namespaces, never against the development host firewall.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent

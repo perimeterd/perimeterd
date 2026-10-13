@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync/atomic"
 	"time"
 
 	metricspkg "github.com/perimeterd/perimeterd/internal/metrics"
@@ -26,7 +25,6 @@ type runtimePublication struct {
 	source        *sourceRuntime
 	logger        *slog.Logger
 	collector     *metricspkg.Collector
-	health        atomic.Bool
 	active        *metricsServer
 	reservation   *runtimeReservation
 	counterCancel context.CancelFunc
@@ -47,12 +45,11 @@ type runtimeReservation struct {
 
 func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger, collector *metricspkg.Collector) *runtimePublication {
 	publication := &runtimePublication{engine: engine, source: source, logger: logger, collector: collector}
-	publication.health.Store(true)
 	return publication
 }
 
 func (p *runtimePublication) metricsHealthy() bool {
-	return p.engine.Healthy() && p.health.Load()
+	return p.engine.Healthy() && p.engine.runtimeHealthy.Load()
 }
 
 func (p *runtimePublication) reserve(result stageResult, ctx context.Context) error {
@@ -87,7 +84,7 @@ func (p *runtimePublication) reserve(result stageResult, ctx context.Context) er
 		refreshErr: result.refreshErr,
 		attempted:  result.attempted,
 		session:    session,
-		prefixes:   prefixCounts(result.candidate.Candidate),
+		prefixes:   result.candidate.prefixes,
 	}
 	if p.active == nil && staged != nil {
 		p.engine.enableCounterTelemetry(ctx)
@@ -170,7 +167,7 @@ func (p *runtimePublication) publishReservation(revision *state.Revision, reserv
 		cancel()
 		if err != nil {
 			retireFailed = true
-			p.health.Store(false)
+			p.engine.runtimeHealthy.Store(false)
 			p.logger.Warn("retiring metrics listener failed", "error", err)
 		}
 	}
@@ -181,7 +178,7 @@ func (p *runtimePublication) publishReservation(revision *state.Revision, reserv
 		p.startCounterSampler()
 	}
 	if !retireFailed {
-		p.health.Store(true)
+		p.engine.runtimeHealthy.Store(true)
 	}
 	return nil
 }

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Timeout bounds control socket reads, lookup writes, and default server shutdown.
+// Timeout bounds control socket reads, lookup/status writes, and default server shutdown.
 const (
 	Timeout = 5 * time.Second
 	// SocketName is the shared control socket filename.
@@ -22,14 +22,17 @@ const (
 	SocketPath = "/run/perimeterd/" + SocketName
 )
 
-func routes(lookup, reload http.Handler) http.Handler {
+func routes(lookup, reload, status http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
 		bound := Timeout
 		handler := lookup
-		if r.URL.Path == ReloadEndpoint {
+		switch r.URL.Path {
+		case ReloadEndpoint:
 			bound = ReloadServerTimeout
 			handler = reload
+		case StatusEndpoint:
+			handler = status
 		}
 		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(bound))
 		handler.ServeHTTP(w, r)
@@ -58,8 +61,8 @@ type socketInode struct {
 // Listen binds a private control API at path. The caller owns the returned
 // server and must close it. Programmatic callers may supply an isolated path;
 // the production CLI uses SocketPath.
-func Listen(path string, lookup, reload http.Handler) (*Server, error) {
-	if lookup == nil || reload == nil {
+func Listen(path string, lookup, reload, status http.Handler) (*Server, error) {
+	if lookup == nil || reload == nil || status == nil {
 		return nil, errors.New("control: nil handler")
 	}
 	if path == "" {
@@ -109,7 +112,7 @@ func Listen(path string, lookup, reload http.Handler) (*Server, error) {
 		inode:    inode,
 	}
 	server.http = &http.Server{
-		Handler:           routes(lookup, reload),
+		Handler:           routes(lookup, reload, status),
 		ReadHeaderTimeout: Timeout,
 		ReadTimeout:       Timeout,
 		WriteTimeout:      ReloadServerTimeout,

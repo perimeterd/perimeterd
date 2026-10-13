@@ -32,6 +32,7 @@ owns native kernel behavior.
   - [Named provider operations](#named-provider-operations)
   - [OpenZiti operations](#openziti-operations)
 - [IP/CIDR lookup](#ipcidr-lookup)
+- [Daemon status](#daemon-status)
 - Installed service and observability
   - [Installed layout](#installed-layout)
   - [systemd service contract](#systemd-service-contract)
@@ -60,6 +61,7 @@ The runtime supports:
   kernel leases, and staged credential/endpoint replacement;
 - explicit Docker `DOCKER-USER` bridge attachments with pre-DNAT port matching;
 - read-only IP/CIDR lookup with source explanations;
+- read-only daemon status with applied-policy metadata and loaded-data counts;
 - backend-owned native processed and terminal-denial counters; and
 - the [Prometheus metrics](#prometheus-metrics) surface, collected in memory.
 
@@ -308,6 +310,86 @@ activations can also leave SDK-internal discovery workers. Restore underlay
 connectivity and, if necessary, perform a controlled daemon restart; do not
 discard durable enforcement or credentials to bypass recovery.
 
+## Daemon status
+
+```sh
+sudo bin/perimeterd status
+sudo bin/perimeterd status --json
+```
+
+`status` reports the running daemon's last coherently acknowledged applied
+state through `GET /v1/status` on `/run/perimeterd/control.sock`. It requires
+root, uses the existing private socket permissions, and bounds a round trip
+to five seconds. It works with `metrics.listen: ""`; it does not parse the
+current YAML, read durable state as an offline fallback, contact sources, or
+inspect the kernel firewall. After upgrading from a binary without this
+endpoint, restart the daemon; configuration reload cannot add an endpoint.
+
+The report includes the running daemon version, uptime and runtime health,
+revision/configuration epoch and source manifest when present, firewall
+backend/families/deny action, policy names/priorities/directions/modes/traffic
+scopes, iptables attachments, loaded prefix counts, and acknowledged CrowdSec
+metadata. Disabled policies are labeled `mode=disabled`. No source URLs,
+credentials, full configuration, or individual prefixes are included.
+
+Applied state is explicit:
+
+- `applied`: one coherent acknowledged revision is available;
+- `empty`: no managed enforcement is applied, confirmed by the writer;
+- `unavailable`: startup/recovery, an in-flight mutation, or uncertainty prevents
+  a coherent answer. It is not an empty policy.
+
+Rejected reloads that retain the old applied view continue to report its
+revision. Native transitions invalidate the view; status never mixes generations.
+A coherent revision can coexist with degraded runtime health. The report is
+an as-of daemon acknowledgement, not an independent audit of kernel rules or
+a guarantee of end-to-end reachability.
+
+Prefix counts reuse Prometheus's family/source/type semantics: unique prefix
+elements within each label combination and enabled family, including built-in
+local ranges. They are not counts of unique protected addresses, packets or
+bytes. There is no grand total across overlapping categories. Native packet
+and byte statistics remain on the [Prometheus surface](#prometheus-metrics).
+
+CrowdSec counts include unexpired decisions from the last acknowledged dynamic
+write for enabled families, not newer fetched decisions awaiting application
+or unique addresses. Its `epoch`, `operation`, and `valid_until` identify that
+acknowledgement. `validity` is `disabled`, `valid`, `stale`, or `unknown`; counts
+are omitted unless valid. An expired validity deadline means stale, never zero.
+An acknowledged empty write can be valid with zero counts and no deadline.
+
+Human-readable reports and JSON go to stdout, including degraded/unavailable
+reports. Operational errors go to stderr; an unreachable daemon produces no
+report and never falls back to disk.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Healthy coherent report, including confirmed empty enforcement |
+| `1` | Degraded/unavailable state, stale/unknown enabled CrowdSec state, transport/protocol failure, or output failure |
+| `2` | Invalid command usage |
+
+Example loaded-data portion with one global IPv4 blocklist prefix:
+
+```text
+Firewall: backend=nftables families=ipv4,ipv6 deny_action=drop
+Loaded prefix elements (per family/source/type; not unique IPs or packet counts):
+  family=ipv4 source=global type=blocklist count=1
+  family=ipv4 source=local type=local count=5
+  family=ipv6 source=local type=local count=3
+CrowdSec: disabled
+```
+
+JSON retains full identifiers and uses `schema_version: 1`. For example, select
+the same applied summary without parsing human-readable labels:
+
+```sh
+sudo bin/perimeterd status --json |
+  jq '{state: .applied.state, revision: .applied.revision,
+       firewall: .applied.details.firewall,
+       prefix_counts: .applied.details.prefix_counts,
+       crowdsec: .applied.details.crowdsec}'
+```
+
 ## IP/CIDR lookup
 
 Lookup explains perimeterd's applied policy and contributing sources, not
@@ -479,6 +561,7 @@ and inspect the service:
 sudo /usr/bin/perimeterd validate --config /etc/perimeterd/perimeterd.yaml
 sudo systemctl start perimeterd.service
 sudo systemctl status perimeterd.service
+sudo /usr/bin/perimeterd status
 sudo journalctl -u perimeterd.service -f
 ```
 

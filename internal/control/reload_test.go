@@ -15,7 +15,7 @@ import (
 func testServer(t *testing.T, handler ReloadHandler) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "control.sock")
-	server, err := Listen(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "lookup available") }), ReloadHTTPHandler(handler))
+	server, err := Listen(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "lookup available") }), ReloadHTTPHandler(handler), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}

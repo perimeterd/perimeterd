@@ -65,8 +65,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return runLookup(args[1:], stdout, stderr)
 	case "reload":
 		return runReload(args[1:], stdout, stderr)
+	case "status":
+		return runStatus(args[1:], stdout, stderr)
 	default:
-		return usageError(stderr, fmt.Sprintf("unsupported command %q (available commands: version, validate, run, cleanup, lookup, reload)", args[0]))
+		return usageError(stderr, fmt.Sprintf("unsupported command %q (available commands: version, validate, run, cleanup, lookup, reload, status)", args[0]))
 	}
 }
 
@@ -196,6 +198,7 @@ const usageText = `Usage:
   perimeterd cleanup
   perimeterd lookup IP_OR_CIDR [flags]
   perimeterd reload [--expect-config-sha256 HEX]
+  perimeterd status [--json]
   perimeterd version
   perimeterd validate [--config PATH]
 
@@ -204,6 +207,7 @@ Commands:
   cleanup   remove recorded owned firewall state (root only)
   lookup    explain applied policy through the running daemon
   reload    wait for configuration application through the running daemon (root only)
+  status    report daemon-owned last-acknowledged state (root only; not a kernel audit)
   version   print version, commit, and build time
   validate  parse and locally validate a YAML configuration
 

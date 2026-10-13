@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/perimeterd/perimeterd/internal/control"
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/metrics"
@@ -53,6 +54,9 @@ type Engine struct {
 	refreshSequence uint64
 	closing         atomic.Bool
 	healthy         atomic.Bool
+	runtimeHealthy  atomic.Bool
+	version         string
+	startedAt       time.Time
 
 	// queryView is published only after a complete native/durable transition.
 	// Queries load it without taking mu or applyMu and evaluate its immutable
@@ -63,12 +67,14 @@ type Engine struct {
 	queryFallback *lookupView
 	queryBase     *lookupView
 	stagedQuery   *lookup.Static
+	stagedStatus  *control.StatusDetails
 }
 
 // NewEngine constructs a fenced engine. Recovery must be called before normal
 // admissions; health is therefore initially false.
 func NewEngine(store *state.Store, backend firewall.Backend, checkpoint func(string) error) *Engine {
-	engine := &Engine{store: store, backend: backend, checkpoint: checkpoint}
+	engine := &Engine{store: store, backend: backend, checkpoint: checkpoint, version: "dev", startedAt: time.Now()}
+	engine.runtimeHealthy.Store(true)
 	engine.crowd = newCrowdRuntime(engine)
 	if backend == nil {
 		engine.backend = firewall.NewNative(func(family policy.Family, generation string) error {
@@ -209,6 +215,7 @@ func (e *Engine) apply(ctx context.Context, candidate Candidate, session *upstre
 	e.mu.Lock()
 	defer func() {
 		e.stagedQuery = nil
+		e.stagedStatus = nil
 		e.mu.Unlock()
 	}()
 	e.crowd.grantAt = time.Time{}
@@ -284,6 +291,7 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 		return Outcome{Active: previous, Degraded: e.degraded()}, fmt.Errorf("build lookup state: %w", err)
 	}
 	e.stagedQuery = static
+	e.stagedStatus = buildStatusDetails(candidate, candidateTarget)
 	var admission, activation *firewall.DynamicState
 	if candidate.cfg.CrowdSec.Enabled {
 		if selected == nil || selected.store == nil {

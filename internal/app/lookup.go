@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
+	"github.com/perimeterd/perimeterd/internal/control"
 	"github.com/perimeterd/perimeterd/internal/lookup"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
@@ -21,6 +22,7 @@ type lookupView struct {
 	configEpoch uint64
 	manifest    string
 	token       uint64
+	status      *control.StatusDetails
 }
 
 // Lookup normalizes and evaluates one read-only query against the last
@@ -80,13 +82,14 @@ func (e *Engine) restoreLookupLocked() {
 	if fallback == nil {
 		return
 	}
-	e.publishLookupLocked(fallback.static, fallback.dynamic, fallback.revision, fallback.manifest, fallback.configEpoch)
+	e.publishLookupLocked(fallback.static, fallback.status, fallback.dynamic, fallback.revision, fallback.manifest, fallback.configEpoch)
 }
 
-func (e *Engine) publishLookupLocked(static *lookup.Static, dynamic lookup.Dynamic, revision, manifest string, configEpoch uint64) {
+func (e *Engine) publishLookupLocked(static *lookup.Static, status *control.StatusDetails, dynamic lookup.Dynamic, revision, manifest string, configEpoch uint64) {
 	token := e.queryVersion.Add(1)
 	view := &lookupView{
 		static:      static,
+		status:      status,
 		dynamic:     dynamic,
 		revision:    revision,
 		configEpoch: configEpoch,
@@ -125,7 +128,7 @@ func (e *Engine) publishDynamicLookupLocked(s *crowdState, revision, manifest st
 	if current.revision != revision || current.manifest != manifest {
 		return
 	}
-	e.publishLookupLocked(current.static, dynamicFromCrowdState(s), current.revision, current.manifest, current.configEpoch)
+	e.publishLookupLocked(current.static, current.status, dynamicFromCrowdState(s), current.revision, current.manifest, current.configEpoch)
 }
 
 func (e *Engine) publishCandidateLookupLocked(candidate Candidate, revision *state.Revision) error {
@@ -147,7 +150,11 @@ func (e *Engine) publishCandidateLookupLocked(candidate Candidate, revision *sta
 		}
 		dynamic = dynamicFromCrowdState(e.crowd.active)
 	}
-	e.publishLookupLocked(static, dynamic, revision.ID, revision.Manifest, revision.Epoch)
+	status := e.stagedStatus
+	if status == nil {
+		status = buildStatusDetails(candidate, revision.Target)
+	}
+	e.publishLookupLocked(static, status, dynamic, revision.ID, revision.Manifest, revision.Epoch)
 	return nil
 }
 
@@ -172,7 +179,9 @@ func (e *Engine) publishRecoveredLookupLocked(revision *state.Revision) error {
 	if err != nil {
 		return fmt.Errorf("build recovered lookup state: %w", err)
 	}
-	e.publishLookupLocked(static, dynamicFromCrowdState(e.crowd.active), revision.ID, revision.Manifest, revision.Epoch)
+	candidate := Candidate{cfg: revision.Config, snapshot: snapshot}
+	candidate.prefixes = prefixCounts(candidate)
+	e.publishLookupLocked(static, buildStatusDetails(candidate, revision.Target), dynamicFromCrowdState(e.crowd.active), revision.ID, revision.Manifest, revision.Epoch)
 	return nil
 }
 
@@ -181,6 +190,6 @@ func (e *Engine) publishEmptyLookupLocked() error {
 	if err != nil {
 		return fmt.Errorf("build empty lookup state: %w", err)
 	}
-	e.publishLookupLocked(static, lookup.Dynamic{}, "", "", 0)
+	e.publishLookupLocked(static, nil, lookup.Dynamic{}, "", "", 0)
 	return nil
 }

@@ -31,7 +31,7 @@ func TestListenRejectsSymlinkSocketWithoutDeletingTarget(t *testing.T) {
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := control.Listen(path, HTTPHandler(func(context.Context, Request) Response { return Unknown(Request{}, "x", "x") }), http.NotFoundHandler()); err == nil {
+	if _, err := control.Listen(path, HTTPHandler(func(context.Context, Request) Response { return Unknown(Request{}, "x", "x") }), http.NotFoundHandler(), http.NotFoundHandler()); err == nil {
 		t.Fatal("Listen accepted symlink socket path")
 	}
 	if _, err := os.Stat(target); err != nil {
@@ -43,7 +43,7 @@ func TestListenHardensRuntimeDirectoryAndSocket(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "runtime")
 	server, err := control.Listen(filepath.Join(dir, "control.sock"), HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestLookupTransportRoundTrip(t *testing.T) {
 				Reason:     "no matching denial",
 			}},
 		}
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestLookupTransportClosePreservesReplacementPath(t *testing.T) {
 	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestLookupTransportRejectsDuplicateUnknownAndTrailingJSON(t *testing.T) {
 	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestLookupTransportRequestLimit(t *testing.T) {
 	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestLookupTransportCloseCancelsActiveEvaluation(t *testing.T) {
 		<-ctx.Done()
 		close(canceled)
 		return Unknown(request, "canceled", "lookup canceled")
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestLookupCloseInterruptsIncompleteRequestBody(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Unknown(request, "unexpected", "incomplete body reached evaluator")
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}

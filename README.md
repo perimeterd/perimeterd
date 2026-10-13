@@ -27,7 +27,8 @@ bin/perimeterd validate --config configs/perimeterd.yaml
 
 Validation requires neither root nor network access. It checks local syntax and
 semantics, not source availability or kernel enforcement. Root-only `run`,
-`cleanup`, daemon-backed [lookup](docs/operations.md#ipcidr-lookup), and
+`cleanup`, daemon-backed [lookup](docs/operations.md#ipcidr-lookup),
+[status](docs/operations.md#daemon-status), and
 [acknowledged reload](docs/operations.md#reload-recover-and-cleanup) are available
 for the [runtime capabilities](docs/operations.md#runtime-capabilities).
 Try enforcement only in a disposable VM or isolated network namespace. See
@@ -41,7 +42,8 @@ RIPEstat-derived geographic/ASN policy, custom HTTP(S) plain-text or
 and an optional numeric filter, policy include/exclude selectors with per-list
 refresh intervals, direct provider IDs resolved dynamically through jsDelivr,
 and CrowdSec ingress bans. Docker
-coexistence, acknowledged configuration reload, IP/CIDR lookup with source explanations, and
+coexistence, acknowledged configuration reload, applied-state status with loaded-data counts,
+IP/CIDR lookup with source explanations, and
 [optional OpenZiti transport](docs/architecture.md#optional-openziti-upstream-transport)
 for selected CrowdSec/custom-list upstreams are implemented. Direct HTTP(S)
 remains the default, with no Ziti prerequisite. Prometheus observability,
@@ -65,7 +67,7 @@ verify changes.
 | [Configuration](docs/configuration.md) | YAML schema, defaults, validation, policy semantics, and examples |
 | [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text/CSV lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
 | [Firewall backends](docs/firewall-backends.md) | Packet paths, native ownership, commit/rollback guarantees, and attachments |
-| [Operations](docs/operations.md) | Source-build procedures, health/metrics, lookup CLI contract, and service/package lifecycle |
+| [Operations](docs/operations.md) | Source-build procedures, health/metrics, status and lookup CLI contracts, and service/package lifecycle |
 | [Development](docs/development.md) | Repository map, commands, verification matrix, measurements, CI, and release requirements |
 
 Each contract has one owner. Other documents summarize it and link to that owner

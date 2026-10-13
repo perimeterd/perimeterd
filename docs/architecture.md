@@ -349,6 +349,19 @@ evidence must not be silently replaced with newer cache objects. Known stale
 static feeds remain explainable when their committed policy remains enforced;
 report retrieval age rather than interpreting staleness as an empty set.
 
+`perimeterd status` uses this same publication token and invalidation boundary.
+`internal/app/status.go` prepares public static metadata and prefix counts once
+per candidate; recovery rebuilds them from the selected revision and manifest.
+The immutable summary travels with the applied view, including through dynamic
+updates and safe compensation. Requests copy only the small public metadata,
+count unexpired acknowledged decisions at one captured time, and recheck the
+publication fence before returning. Neither status nor lookup takes the apply
+lock, rereads YAML or durable records, samples native counters, or scrapes metrics.
+Runtime health is shared with the existing metrics health check; no metrics
+listener is required. [Operations](operations.md#daemon-status) owns status
+output, statistics, validity and exit semantics.
+
+
 ### Pure evaluator and provenance
 
 The production backend-neutral evaluator in `internal/lookup` evaluates compiled
@@ -386,8 +399,9 @@ semantics. The endpoint returns the versioned result described in
 the unauthenticated metrics listener or a TCP port.
 The socket is root-owned mode `0600` inside the existing root-owned `0700`
 runtime directory. The same control API accepts acknowledged reload requests
-via `POST /v1/reload`. Access is root-only; remote access, delegated group
-access, and arbitrary socket paths are outside this feature.
+via `POST /v1/reload` and read-only status requests via `GET /v1/status`.
+Access is root-only; remote access, delegated group access, and arbitrary
+CLI socket paths are outside these features.
 
 At startup, `run` acquires the existing lifecycle lock before managing the
 socket. Only that owner may remove a verified stale socket at the fixed path; a
@@ -404,7 +418,7 @@ reconciliation, invoke backend inspection/mutation, reset counters, or change
 readiness. A stopped daemon yields unavailable even if retained static rules
 still exist. There is no implicit offline or configuration-file fallback.
 
-The implementation bounds each request body to 4 KiB, each complete encoded
+Lookup bounds each request body to 4 KiB, each complete encoded
 response to 4 MiB, and each query to 4,096 combined outcome/evidence records.
 It admits at most four concurrent evaluations; excess requests fail busy rather
 than grow an unbounded queue. The client deadline is five seconds, with bounded

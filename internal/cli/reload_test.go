@@ -75,7 +75,7 @@ func TestReloadCLIUsesActualUnixAcknowledgement(t *testing.T) {
 			t.Errorf("wire digest=%s", request.ExpectConfigSHA256)
 		}
 		return control.ReloadResult{SchemaVersion: 1, Outcome: "applied", Revision: "committed", ConfigSHA256: digest}
-	}))
+	}), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
+	"github.com/perimeterd/perimeterd/internal/metrics"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
 )
@@ -22,6 +23,7 @@ type Candidate struct {
 	cfg      config.Config
 	model    policy.State
 	snapshot source.Snapshot
+	prefixes []metrics.PrefixCount
 }
 
 // NewCandidate validates and compiles cfg without reading sources or touching
@@ -39,7 +41,9 @@ func NewCandidate(epoch uint64, path string, cfg config.Config, snapshot source.
 	if err != nil {
 		return Candidate{}, err
 	}
-	return Candidate{epoch: epoch, path: path, cfg: owned, model: model, snapshot: snapshot}, nil
+	candidate := Candidate{epoch: epoch, path: path, cfg: owned, model: model, snapshot: snapshot}
+	candidate.prefixes = prefixCounts(candidate)
+	return candidate, nil
 }
 
 func cloneConfig(value config.Config) config.Config {

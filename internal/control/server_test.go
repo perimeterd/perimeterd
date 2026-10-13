@@ -27,12 +27,12 @@ func TestSocketActiveRefusalAndLifecycleLockIndependence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lock.Close() }()
-	server, err := Listen(path, http.NotFoundHandler(), ReloadHTTPHandler(func(context.Context, ReloadRequest) ReloadResult { return applied() }))
+	server, err := Listen(path, http.NotFoundHandler(), ReloadHTTPHandler(func(context.Context, ReloadRequest) ReloadResult { return applied() }), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = server.Close(context.Background()) }()
-	if _, err := Listen(path, http.NotFoundHandler(), http.NotFoundHandler()); err == nil {
+	if _, err := Listen(path, http.NotFoundHandler(), http.NotFoundHandler(), http.NotFoundHandler()); err == nil {
 		t.Fatal("replaced active socket")
 	}
 	if got := ReloadPath(context.Background(), path, ReloadRequest{}); got.Outcome != "applied" {
@@ -42,7 +42,7 @@ func TestSocketActiveRefusalAndLifecycleLockIndependence(t *testing.T) {
 
 func TestSocketInodeCleanupAndListenerFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "control.sock")
-	server, err := Listen(path, http.NotFoundHandler(), http.NotFoundHandler())
+	server, err := Listen(path, http.NotFoundHandler(), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestLookupEvaluationRetainsShortContextBound(t *testing.T) {
 		defer cancel()
 		<-ctx.Done()
 		w.WriteHeader(http.StatusServiceUnavailable)
-	}), http.NotFoundHandler())
+	}), http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -84,6 +84,7 @@ func Run(ctx context.Context, options Options) error {
 		ctx = context.Background()
 	}
 	opts := normalizeOptions(options)
+	startedAt := time.Now()
 	collector := metrics.New(opts.Version, opts.Commit, opts.BuildTime)
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
@@ -134,6 +135,10 @@ func Run(ctx context.Context, options Options) error {
 		return errors.Join(err, stopNotifier())
 	}
 	engine := NewEngine(store, opts.Backend, opts.Checkpoint)
+	engine.startedAt = startedAt
+	if opts.Version != "" {
+		engine.version = opts.Version
+	}
 	engine.setTelemetry(collector)
 	engine.ConfigureCrowdSecTransport(opts.SourceClient)
 	defer engine.Close()
@@ -144,7 +149,7 @@ func Run(ctx context.Context, options Options) error {
 	}
 	controlPath := filepath.Join(filepath.Dir(opts.LockPath), control.SocketName)
 	bridge := newReloadBridge(runCtx.Done())
-	controlServer, err := control.Listen(controlPath, lookup.HTTPHandler(engine.Lookup), control.ReloadHTTPHandler(bridge.handle))
+	controlServer, err := control.Listen(controlPath, lookup.HTTPHandler(engine.Lookup), control.ReloadHTTPHandler(bridge.handle), control.StatusHTTPHandler(engine.Status))
 	if err != nil {
 		return errors.Join(fmt.Errorf("control listener: %w", err), stopNotifier())
 	}
@@ -432,7 +437,7 @@ func Run(ctx context.Context, options Options) error {
 			}
 		case metricsErr := <-publication.metricsErrors():
 			if metricsErr != nil {
-				publication.health.Store(false)
+				engine.runtimeHealthy.Store(false)
 				publication.logger.Error("metrics listener failed", "error", metricsErr)
 				return errors.Join(metricsErr, stopService())
 			}
