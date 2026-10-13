@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Freshness-gate decisions against an isolated GitHub ref API."""
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/release-freshness.py"
 spec = importlib.util.spec_from_file_location("release_freshness", SCRIPT)
@@ -139,6 +139,7 @@ class ReleaseFreshness(unittest.TestCase):
             env=process_env,
             text=True,
             capture_output=True,
+            check=False,
             timeout=10,
         )
         return result, output.read_text(encoding="utf-8"), summary.read_text(encoding="utf-8")

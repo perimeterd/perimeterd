@@ -5,13 +5,12 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from urllib.parse import quote
-
 
 BINARY_MEMBER = "usr/bin/perimeterd"
 APPLICATION_MODULE = "github.com/perimeterd/perimeterd"
@@ -29,8 +28,7 @@ def _run_bsdtar(arguments, archive_data=None):
         result = subprocess.run(
             ["bsdtar", *arguments],
             input=archive_data,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
     except FileNotFoundError as error:
@@ -171,8 +169,7 @@ def _syft_document(syft, target):
     try:
         result = subprocess.run(
             [syft, str(target), "--output", "spdx-json"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
         )
     except FileNotFoundError as error:

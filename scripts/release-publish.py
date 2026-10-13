@@ -3,7 +3,6 @@
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
@@ -11,6 +10,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 STABLE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.ASCII)
 PRERELEASE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-dev\.([1-9][0-9]*)\.g([0-9a-f]{12})", re.ASCII)

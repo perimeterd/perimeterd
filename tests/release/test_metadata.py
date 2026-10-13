@@ -4,14 +4,14 @@ import importlib.util
 import io
 import json
 import os
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 import subprocess
 import tempfile
 import threading
 import unittest
 import urllib.parse
 import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/release-metadata.py"
 spec = importlib.util.spec_from_file_location("release_metadata", SCRIPT)

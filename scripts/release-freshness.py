@@ -57,7 +57,7 @@ class GitHubAPI:
             parsed = urllib.parse.urlsplit(raw_base)
             hostname = parsed.hostname
             # Accessing .port also validates malformed port values.
-            parsed.port
+            _ = parsed.port
         except ValueError as error:
             raise FreshnessError("GITHUB_API_URL is invalid") from error
         if (not hostname or parsed.username or parsed.password or parsed.query or parsed.fragment

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Behavioral release recovery tests against an isolated GitHub API boundary."""
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
-from pathlib import Path
 import re
 import tempfile
 import threading
 import unittest
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/release-publish.py"
 spec = importlib.util.spec_from_file_location("release_publish", SCRIPT)

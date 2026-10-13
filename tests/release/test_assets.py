@@ -6,13 +6,13 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
 import unittest
-from urllib.parse import quote
 import zipfile
+from pathlib import Path
+from urllib.parse import quote
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/release-assets.py"
 spec = importlib.util.spec_from_file_location("release_assets", SCRIPT)
@@ -29,10 +29,10 @@ ARCHIVES = (
     f"perimeterd_{SNAPSHOT_VERSION}_linux_arm64.tar.gz",
 )
 PACKAGE_ARTIFACTS = (
-    f"perimeterd_0.0.1-dev.e7152d2-1_amd64.deb",
-    f"perimeterd_0.0.1-dev.e7152d2-1_arm64.deb",
-    f"perimeterd-0.0.1-dev.e7152d2-1.x86_64.rpm",
-    f"perimeterd-0.0.1-dev.e7152d2-1.aarch64.rpm",
+    "perimeterd_0.0.1-dev.e7152d2-1_amd64.deb",
+    "perimeterd_0.0.1-dev.e7152d2-1_arm64.deb",
+    "perimeterd-0.0.1-dev.e7152d2-1.x86_64.rpm",
+    "perimeterd-0.0.1-dev.e7152d2-1.aarch64.rpm",
 )
 SOURCE_ARCHIVE = f"perimeterd-source-{SNAPSHOT_VERSION}.tar.gz"
 REQUIRED_SUBJECTS = (*ARCHIVES, *PACKAGE_ARTIFACTS, SOURCE_ARCHIVE)
@@ -181,16 +181,18 @@ class ReleaseAssetStaging(unittest.TestCase):
     @staticmethod
     def _tar_bytes(members):
         result = io.BytesIO()
-        with gzip.GzipFile(fileobj=result, mode="wb", filename="", mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-                for name, data in sorted(members.items()):
-                    info = tarfile.TarInfo(name)
-                    info.size = len(data)
-                    info.mode = 0o755 if name.endswith("perimeterd") else 0o644
-                    info.mtime = 0
-                    info.uid = info.gid = 0
-                    info.uname = info.gname = ""
-                    archive.addfile(info, io.BytesIO(data))
+        with (
+            gzip.GzipFile(fileobj=result, mode="wb", filename="", mtime=0) as compressed,
+            tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as archive,
+        ):
+            for name, data in sorted(members.items()):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mode = 0o755 if name.endswith("perimeterd") else 0o644
+                info.mtime = 0
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                archive.addfile(info, io.BytesIO(data))
         return result.getvalue()
 
     @staticmethod
@@ -407,7 +409,7 @@ class ReleaseAssetStaging(unittest.TestCase):
         )
 
     def assert_rejected_by(self, message):
-        with self.assertRaisesRegex(ValueError, message):
+        with self.assertRaisesRegex((TypeError, ValueError), message):
             release.stage(self.source, self.destination)
         self.assertFalse(self.destination.exists())
         self.assertEqual(list(self.root.glob(".release-assets-staging-*")), [])

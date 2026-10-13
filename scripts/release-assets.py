@@ -4,12 +4,12 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from urllib.parse import parse_qsl, unquote
 
 CHECKSUMS_NAME = "checksums.txt"
@@ -164,7 +164,7 @@ def _parse_spdx(path, artifact_name):
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{artifact_name}: malformed SPDX document: {error}") from error
     if not isinstance(document, dict):
-        raise ValueError(f"{artifact_name}: malformed SPDX document: expected an object")
+        raise TypeError(f"{artifact_name}: malformed SPDX document: expected an object")
     if document.get("spdxVersion") != "SPDX-2.3":
         raise ValueError(f"{artifact_name}: unsupported or missing SPDX version")
     if document.get("dataLicense") != "CC0-1.0":
@@ -188,7 +188,7 @@ def _parse_spdx(path, artifact_name):
     files = document.get("files", [])
     snippets = document.get("snippets", [])
     if not isinstance(packages, list) or not isinstance(files, list) or not isinstance(snippets, list):
-        raise ValueError(f"{artifact_name}: malformed SPDX package/file collections")
+        raise TypeError(f"{artifact_name}: malformed SPDX package/file collections")
     identifiers = {"SPDXRef-DOCUMENT"}
     packages_by_id = {}
     for collection, field in ((packages, "package"), (files, "file"), (snippets, "snippet")):
@@ -208,7 +208,7 @@ def _parse_spdx(path, artifact_name):
                     raise ValueError(f"{artifact_name}: malformed SPDX {key}")
             for checksum in entry.get("checksums", []):
                 if not isinstance(checksum, dict) or not isinstance(checksum.get("algorithm"), str) or not isinstance(checksum.get("checksumValue"), str):
-                    raise ValueError(f"{artifact_name}: malformed SPDX checksum")
+                    raise TypeError(f"{artifact_name}: malformed SPDX checksum")
             for external_ref in entry.get("externalRefs", []):
                 if not isinstance(external_ref, dict) or any(
                     not isinstance(external_ref.get(key), str) or not external_ref[key]
@@ -218,11 +218,11 @@ def _parse_spdx(path, artifact_name):
 
     relationships = document.get("relationships")
     if not isinstance(relationships, list):
-        raise ValueError(f"{artifact_name}: malformed SPDX relationships")
+        raise TypeError(f"{artifact_name}: malformed SPDX relationships")
     relationship_set = set()
     for relationship in relationships:
         if not isinstance(relationship, dict):
-            raise ValueError(f"{artifact_name}: malformed SPDX relationship")
+            raise TypeError(f"{artifact_name}: malformed SPDX relationship")
         source = relationship.get("spdxElementId")
         target = relationship.get("relatedSpdxElement")
         kind = relationship.get("relationshipType")

@@ -154,7 +154,7 @@ def download_saved(identity, env):
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise ValueError("GitHub returned malformed workflow artifact metadata") from error
         if not isinstance(response, dict) or not isinstance(response.get("artifacts"), list):
-            raise ValueError("GitHub returned malformed workflow artifact listing")
+            raise TypeError("GitHub returned malformed workflow artifact listing")
         current_total = response.get("total_count")
         if type(current_total) is not int or current_total < 0:
             raise ValueError("GitHub returned an invalid workflow artifact count")

@@ -435,6 +435,10 @@ activation beyond 90 seconds without waiting for the 75-minute deadline. Run
 
 #### Supporting-file gate
 
+Run `ruff check .` from the repository root to lint the Python release scripts
+and tests. `make test-release` exercises release admission, metadata recovery,
+freshness decisions, SBOM extraction, and publication.
+
 Run `make support-check` on Linux amd64 for the lightweight supporting-file
 gate; the first invocation downloads checksum-verified tools and may need
 network access. Install `bsdtar` first (`libarchive-tools` on Ubuntu,

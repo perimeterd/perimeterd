@@ -2,10 +2,10 @@
 """Real archive-decoder regressions for the shared release payload extractor."""
 import importlib.util
 import io
-from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/release_sbom.py"
 spec = importlib.util.spec_from_file_location("release_sbom", SCRIPT)
