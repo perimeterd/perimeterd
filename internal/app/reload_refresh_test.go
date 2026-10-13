@@ -48,7 +48,7 @@ func TestBackgroundRefreshCannotCompleteReloadWaiter(t *testing.T) {
 	awaitSourcePolicy(t, backend.policies, "8.8.8.8/32")
 	result := make(chan control.ReloadResult, 1)
 	go func() {
-		result <- control.ReloadPath(context.Background(), filepath.Join(stateDir, "run", "lookup.sock"), control.ReloadRequest{})
+		result <- control.ReloadPath(context.Background(), filepath.Join(stateDir, "run", "control.sock"), control.ReloadRequest{})
 	}()
 	awaitReloadBoundary(t, "reload:after-read", entered, result)
 	sourceAddress.Store("9.9.9.9/32")
@@ -85,7 +85,7 @@ func TestDigestMismatchSkipsSourcesAndSourceFailureKeepsPolicy(t *testing.T) {
 	awaitRunApply(t, backend.applied)
 	previous := backend.selection()
 	writeGeoRunConfig(t, path, address, "1h")
-	socket := filepath.Join(stateDir, "run", "lookup.sock")
+	socket := filepath.Join(stateDir, "run", "control.sock")
 	got := control.ReloadPath(context.Background(), socket, control.ReloadRequest{ExpectConfigSHA256: "0000000000000000000000000000000000000000000000000000000000000000"})
 	if got.Code != "config_mismatch" || calls.Load() != 0 || backend.selection() != previous {
 		t.Fatalf("mismatch=%#v source calls=%d", got, calls.Load())

@@ -363,8 +363,8 @@ sudo bin/perimeterd lookup 2001:4860:4860::8888 --json
 
 No `--config`, offline mode, or source refresh is part of this command. Editing
 YAML without an accepted reload cannot change its answer. Lookup uses the
-running owner's socket at `/run/perimeterd/lookup.sock`, independently of
-whether metrics are enabled.
+running owner's shared control socket at `/run/perimeterd/control.sock`,
+independently of whether metrics are enabled.
 
 ### Lookup results and errors
 
@@ -412,7 +412,7 @@ Unavailable enforcement, missing/refused daemon connection, incompatible
 protocol version, busy/deadline failure, and response/work limits exit `1`
 with explicit diagnostics. With `--json`, report a structured error rather than
 a partial success. A failed or limited lookup cannot default to `not_blocked`.
-The [transport bounds](architecture.md#private-query-transport-and-lifecycle)
+The [transport bounds](architecture.md#private-control-transport-and-lifecycle)
 apply equally to human and JSON output; narrow the prefix or traffic scope
 after a limit error.
 
@@ -530,7 +530,7 @@ The command is:
 perimeterd reload [--expect-config-sha256 HEX]
 ```
 
-It requires root and contacts the existing `/run/perimeterd/lookup.sock`; it
+It requires root and contacts the existing `/run/perimeterd/control.sock`; it
 does not take the lifecycle lock, read durable state, accept a configuration path,
 or submit YAML. The daemon reads its own configured file once, hashes those exact
 bytes, and parses the same bytes. To correlate a deployment with rendered content:
@@ -652,12 +652,19 @@ install these paths or create a service:
 - `/var/lib/perimeterd/`: `root:root`, mode `0700`, for state and cache;
 - `/run/perimeterd/`: `root:root`, mode `0700`, for runtime state;
 - `/run/perimeterd/owner.lock`: root-owned mode `0600` lifecycle lock;
-- `/run/perimeterd/lookup.sock`: daemon-created root-owned mode `0600` private
-  lookup socket, not a tmpfiles-created node;
+- `/run/perimeterd/control.sock`: daemon-created root-owned mode `0600` private
+  control socket shared by lookup and reload, not a tmpfiles-created node;
 - `/run/xtables.lock`: root-owned mode `0600` shared by iptables and
   ip6tables; and
 - a packaged tmpfiles declaration and `perimeterd.service` in the distribution
   system-unit directory.
+
+The control socket replaces the former `lookup.sock` with no legacy listener,
+alias, or client fallback. When upgrading from a binary using the old path,
+replace the binary and restart the daemon (`sudo systemctl restart
+perimeterd.service` for a package installation); a configuration reload cannot
+activate this socket rename. The CLI and running daemon must use the same
+socket contract.
 
 The package must preserve the lifecycle-lock inode across service stop/restart,
 create the state/runtime directories, and provision the shared xtables lock

@@ -13,10 +13,13 @@ import (
 	"time"
 )
 
-// Timeout bounds socket reads, lookup writes, and default server shutdown.
+// Timeout bounds control socket reads, lookup writes, and default server shutdown.
 const (
-	Timeout    = 5 * time.Second
-	SocketPath = "/run/perimeterd/lookup.sock"
+	Timeout = 5 * time.Second
+	// SocketName is the shared control socket filename.
+	SocketName = "control.sock"
+	// SocketPath is the production control socket path used by CLI clients.
+	SocketPath = "/run/perimeterd/" + SocketName
 )
 
 func routes(lookup, reload http.Handler) http.Handler {
@@ -35,7 +38,7 @@ func routes(lookup, reload http.Handler) http.Handler {
 
 const runtimeDirectoryMode os.FileMode = 0o700
 
-// Server is the private HTTP-over-Unix lookup endpoint.
+// Server is the private HTTP-over-Unix control API.
 type Server struct {
 	path      string
 	listener  net.Listener
@@ -52,26 +55,26 @@ type socketInode struct {
 	ino uint64
 }
 
-// Listen binds a private lookup endpoint at path. The caller owns the returned
+// Listen binds a private control API at path. The caller owns the returned
 // server and must close it. Programmatic callers may supply an isolated path;
 // the production CLI uses SocketPath.
 func Listen(path string, lookup, reload http.Handler) (*Server, error) {
 	if lookup == nil || reload == nil {
-		return nil, errors.New("lookup: nil handler")
+		return nil, errors.New("control: nil handler")
 	}
 	if path == "" {
-		return nil, errors.New("lookup: empty socket path")
+		return nil, errors.New("control: empty socket path")
 	}
 	dir := filepath.Dir(path)
 	if err := ensureRuntimeDirectory(dir); err != nil {
-		return nil, fmt.Errorf("lookup runtime directory: %w", err)
+		return nil, fmt.Errorf("control runtime directory: %w", err)
 	}
 	if err := removeStaleSocket(path); err != nil {
 		return nil, err
 	}
 	unixListener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
-		return nil, fmt.Errorf("lookup listen %q: %w", path, err)
+		return nil, fmt.Errorf("control listen %q: %w", path, err)
 	}
 	unixListener.SetUnlinkOnClose(false)
 	listener := net.Listener(unixListener)
@@ -85,7 +88,7 @@ func Listen(path string, lookup, reload http.Handler) (*Server, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("lookup socket stat: %w", err)
+		return nil, fmt.Errorf("control socket stat: %w", err)
 	}
 	inode, err = inodeOf(info)
 	if err != nil {
@@ -94,7 +97,7 @@ func Listen(path string, lookup, reload http.Handler) (*Server, error) {
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
 		cleanup()
-		return nil, fmt.Errorf("lookup socket permissions: %w", err)
+		return nil, fmt.Errorf("control socket permissions: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
@@ -214,10 +217,10 @@ func removeStaleSocket(path string) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("lookup socket stat: %w", err)
+		return fmt.Errorf("control socket stat: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("lookup socket path %q is not a socket", path)
+		return fmt.Errorf("control socket path %q is not a socket", path)
 	}
 	if err := checkSocketOwner(info); err != nil {
 		return err
@@ -225,10 +228,10 @@ func removeStaleSocket(path string) error {
 	conn, dialErr := net.DialTimeout("unix", path, 100*time.Millisecond)
 	if dialErr == nil {
 		_ = conn.Close()
-		return fmt.Errorf("lookup socket %q is already in use", path)
+		return fmt.Errorf("control socket %q is already in use", path)
 	}
 	if !errors.Is(dialErr, syscall.ECONNREFUSED) {
-		return fmt.Errorf("lookup socket %q is unavailable: %w", path, dialErr)
+		return fmt.Errorf("control socket %q is unavailable: %w", path, dialErr)
 	}
 	before, err := inodeOf(info)
 	if err != nil {
@@ -239,14 +242,14 @@ func removeStaleSocket(path string) error {
 		return err
 	}
 	if current.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("lookup socket path %q changed to an unsafe file", path)
+		return fmt.Errorf("control socket path %q changed to an unsafe file", path)
 	}
 	now, err := inodeOf(current)
 	if err != nil || now != before {
-		return errors.New("lookup stale socket changed during verification")
+		return errors.New("control stale socket changed during verification")
 	}
 	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("remove stale lookup socket: %w", err)
+		return fmt.Errorf("remove stale control socket: %w", err)
 	}
 	return nil
 }
@@ -263,7 +266,7 @@ func removeOwnedSocket(path string, expected socketInode) error {
 		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
-		return fmt.Errorf("lookup socket path %q changed to an unsafe file", path)
+		return fmt.Errorf("control socket path %q changed to an unsafe file", path)
 	}
 	if err := checkSocketOwner(info); err != nil {
 		return err
@@ -273,7 +276,7 @@ func removeOwnedSocket(path string, expected socketInode) error {
 		return err
 	}
 	if actual != expected {
-		return errors.New("lookup socket inode is no longer owned by this server")
+		return errors.New("control socket inode is no longer owned by this server")
 	}
 	return os.Remove(path)
 }
@@ -281,7 +284,7 @@ func removeOwnedSocket(path string, expected socketInode) error {
 func checkSocketOwner(info os.FileInfo) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || int64(stat.Uid) != int64(os.Geteuid()) {
-		return errors.New("lookup socket is owned by another user")
+		return errors.New("control socket is owned by another user")
 	}
 	return nil
 }
@@ -289,7 +292,7 @@ func checkSocketOwner(info os.FileInfo) error {
 func inodeOf(info os.FileInfo) (socketInode, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return socketInode{}, errors.New("lookup socket has unavailable inode metadata")
+		return socketInode{}, errors.New("control socket has unavailable inode metadata")
 	}
 	return socketInode{dev: uint64(stat.Dev), ino: uint64(stat.Ino)}, nil
 }

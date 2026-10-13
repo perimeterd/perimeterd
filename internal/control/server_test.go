@@ -21,7 +21,7 @@ func TestSocketActiveRefusalAndLifecycleLockIndependence(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	lock, err := state.AcquireLock(filepath.Join(dir, "owner.lock"))
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +41,7 @@ func TestSocketActiveRefusalAndLifecycleLockIndependence(t *testing.T) {
 }
 
 func TestSocketInodeCleanupAndListenerFailure(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "lookup.sock")
+	path := filepath.Join(t.TempDir(), "control.sock")
 	server, err := Listen(path, http.NotFoundHandler(), http.NotFoundHandler())
 	if err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestReloadSlowUploadRetainsShortReadBound(t *testing.T) {
 }
 
 func TestLookupEvaluationRetainsShortContextBound(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "lookup.sock")
+	path := filepath.Join(t.TempDir(), "control.sock")
 	server, err := Listen(path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), Timeout)
 		defer cancel()

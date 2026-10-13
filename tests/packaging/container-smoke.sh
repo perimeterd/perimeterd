@@ -101,7 +101,7 @@ check_payload() {
     check_mode /run/perimeterd 700
     check_mode /run/perimeterd/owner.lock 600
     check_mode /run/xtables.lock 600
-    [[ ! -e /run/perimeterd/lookup.sock ]] || fail 'tmpfiles unexpectedly created the daemon-owned lookup socket'
+    [[ ! -e /run/perimeterd/control.sock ]] || fail 'tmpfiles unexpectedly created the daemon-owned control socket'
     check_mode /usr/lib/systemd/system/perimeterd.service 644
     check_mode /usr/lib/tmpfiles.d/perimeterd.conf 644
     check_mode /usr/share/doc/perimeterd/README.md 644

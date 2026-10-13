@@ -68,7 +68,7 @@ func TestReloadCLIUsesActualUnixAcknowledgement(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("private command requires root")
 	}
-	path := filepath.Join(t.TempDir(), "lookup.sock")
+	path := filepath.Join(t.TempDir(), "control.sock")
 	digest := strings.Repeat("a", 64)
 	server, err := control.Listen(path, http.NotFoundHandler(), control.ReloadHTTPHandler(func(_ context.Context, request control.ReloadRequest) control.ReloadResult {
 		if request.ExpectConfigSHA256 != digest {

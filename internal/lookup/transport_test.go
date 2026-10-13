@@ -27,7 +27,7 @@ func TestListenRejectsSymlinkSocketWithoutDeletingTarget(t *testing.T) {
 	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	if err := os.Symlink(target, path); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestListenRejectsSymlinkSocketWithoutDeletingTarget(t *testing.T) {
 
 func TestListenHardensRuntimeDirectoryAndSocket(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "runtime")
-	server, err := control.Listen(filepath.Join(dir, "lookup.sock"), HTTPHandler(func(_ context.Context, request Request) Response {
+	server, err := control.Listen(filepath.Join(dir, "control.sock"), HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
 	}), http.NotFoundHandler())
 	if err != nil {
@@ -55,7 +55,7 @@ func TestListenHardensRuntimeDirectoryAndSocket(t *testing.T) {
 	if dirInfo.Mode().Perm() != 0o700 {
 		t.Fatalf("runtime directory mode = %o, want 700", dirInfo.Mode().Perm())
 	}
-	socketInfo, err := os.Stat(filepath.Join(dir, "lookup.sock"))
+	socketInfo, err := os.Stat(filepath.Join(dir, "control.sock"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestListenHardensRuntimeDirectoryAndSocket(t *testing.T) {
 
 func TestLookupTransportRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{
 			SchemaVersion: SchemaVersion,
@@ -99,7 +99,7 @@ func TestLookupTransportRoundTrip(t *testing.T) {
 
 func TestLookupTransportClosePreservesReplacementPath(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
 	}), http.NotFoundHandler())
@@ -115,7 +115,7 @@ func TestLookupTransportClosePreservesReplacementPath(t *testing.T) {
 	if err := server.Close(context.Background()); err == nil {
 		t.Fatal("Close succeeded after socket path replacement")
 	}
-	data, err := fs.ReadFile(os.DirFS(dir), "lookup.sock")
+	data, err := fs.ReadFile(os.DirFS(dir), "control.sock")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestLookupTransportClosePreservesReplacementPath(t *testing.T) {
 
 func TestLookupTransportRejectsDuplicateUnknownAndTrailingJSON(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
 	}), http.NotFoundHandler())
@@ -167,7 +167,7 @@ func TestLookupTransportRejectsDuplicateUnknownAndTrailingJSON(t *testing.T) {
 
 func TestLookupTransportRequestLimit(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Response{SchemaVersion: SchemaVersion, Query: request, Flow: "new", Verdict: "not_blocked"}
 	}), http.NotFoundHandler())
@@ -187,7 +187,7 @@ func TestLookupTransportRequestLimit(t *testing.T) {
 
 func TestLookupTransportCloseCancelsActiveEvaluation(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "lookup.sock")
+	path := filepath.Join(dir, "control.sock")
 	started := make(chan struct{})
 	canceled := make(chan struct{})
 	var once sync.Once
@@ -233,7 +233,7 @@ func unixClient(path string) *http.Client {
 }
 
 func TestLookupCloseInterruptsIncompleteRequestBody(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "lookup.sock")
+	path := filepath.Join(t.TempDir(), "control.sock")
 	server, err := control.Listen(path, HTTPHandler(func(_ context.Context, request Request) Response {
 		return Unknown(request, "unexpected", "incomplete body reached evaluator")
 	}), http.NotFoundHandler())

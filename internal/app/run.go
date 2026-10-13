@@ -142,18 +142,18 @@ func Run(ctx context.Context, options Options) error {
 	if err != nil {
 		return errors.Join(err, stopNotifier())
 	}
-	lookupPath := filepath.Join(filepath.Dir(opts.LockPath), "lookup.sock")
+	controlPath := filepath.Join(filepath.Dir(opts.LockPath), control.SocketName)
 	bridge := newReloadBridge(runCtx.Done())
-	lookupServer, err := control.Listen(lookupPath, lookup.HTTPHandler(engine.Lookup), control.ReloadHTTPHandler(bridge.handle))
+	controlServer, err := control.Listen(controlPath, lookup.HTTPHandler(engine.Lookup), control.ReloadHTTPHandler(bridge.handle))
 	if err != nil {
-		return errors.Join(fmt.Errorf("lookup listener: %w", err), stopNotifier())
+		return errors.Join(fmt.Errorf("control listener: %w", err), stopNotifier())
 	}
-	defer func() { _ = lookupServer.Close(context.Background()) }()
-	lookupFailures := make(chan error, 1)
+	defer func() { _ = controlServer.Close(context.Background()) }()
+	controlFailures := make(chan error, 1)
 	go func() {
-		for listenerErr := range lookupServer.Errors() {
+		for listenerErr := range controlServer.Errors() {
 			if listenerErr != nil {
-				lookupFailures <- listenerErr
+				controlFailures <- listenerErr
 				cancelRun()
 				return
 			}
@@ -362,8 +362,8 @@ func Run(ctx context.Context, options Options) error {
 			recoveryTimer.Stop()
 			recoveryTimer = nil
 		}
-		if err := lookupServer.Close(context.Background()); err != nil {
-			publication.logger.Error("closing lookup listener failed", "error", err)
+		if err := controlServer.Close(context.Background()); err != nil {
+			publication.logger.Error("closing control listener failed", "error", err)
 			return err
 		}
 		if err := publication.close(); err != nil {
@@ -380,13 +380,13 @@ func Run(ctx context.Context, options Options) error {
 		select {
 		case <-runCtx.Done():
 			select {
-			case lookupErr := <-lookupFailures:
-				return errors.Join(lookupErr, stopService())
+			case controlErr := <-controlFailures:
+				return errors.Join(controlErr, stopService())
 			default:
 				return stopService()
 			}
-		case lookupErr := <-lookupFailures:
-			return errors.Join(fmt.Errorf("lookup listener failed: %w", lookupErr), stopService())
+		case controlErr := <-controlFailures:
+			return errors.Join(fmt.Errorf("control listener failed: %w", controlErr), stopService())
 		case request := <-bridge.requests:
 			admitReload(request)
 		case <-sources.events():

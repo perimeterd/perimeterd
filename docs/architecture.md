@@ -373,10 +373,10 @@ acknowledged dynamic evidence. It is a side explanation of the rule result,
 not a second enforcement algorithm. Include/exclude matches and shadowed
 memberships must not be presented as independently deciding rules.
 
-### Private query transport and lifecycle
+### Private control transport and lifecycle
 
-The running daemon exposes a separate HTTP-over-Unix-domain-socket endpoint,
-`POST /v1/lookup`, at `/run/perimeterd/lookup.sock`. The request is a JSON
+The running daemon exposes a shared HTTP-over-Unix-domain-socket control API
+at `/run/perimeterd/control.sock`. The `POST /v1/lookup` request is a JSON
 object with required string `address` and optional `direction`, `protocol`, and
 integer `port`, using the operator contract's values and omission semantics.
 The server rejects unknown fields, duplicate keys, invalid types, trailing JSON,
@@ -385,9 +385,9 @@ semantics. The endpoint returns the versioned result described in
 [operations](operations.md#lookup-results-and-errors). It is not exposed on
 the unauthenticated metrics listener or a TCP port.
 The socket is root-owned mode `0600` inside the existing root-owned `0700`
-runtime directory. Initial access is root-only; remote access, delegated group
-access, arbitrary socket paths, and administrative mutation methods are outside
-this feature.
+runtime directory. The same control API accepts acknowledged reload requests
+via `POST /v1/reload`. Access is root-only; remote access, delegated group
+access, and arbitrary socket paths are outside this feature.
 
 At startup, `run` acquires the existing lifecycle lock before managing the
 socket. Only that owner may remove a verified stale socket at the fixed path; a
@@ -395,7 +395,7 @@ symlink, non-socket, or unexpected owner is an error, not permission to unlink
 arbitrary files. The listener binds before readiness, answers unavailable until
 a coherent view is published, and remains across configuration reloads. Failure
 to bind prevents successful startup. Before releasing lifecycle ownership,
-shutdown stops admission, drains/cancels queries, and removes only the socket
+shutdown stops admission, drains/cancels handlers, and removes only the socket
 inode this process created. It never unlinks or replaces `owner.lock`.
 
 The CLI connects without taking the lifecycle lock or opening the durable store.
@@ -492,7 +492,7 @@ on shutdown. Startup still withholds readiness until required recovery completes
 
 `internal/control` owns secure Unix-socket lifecycle and the reload protocol;
 `internal/lookup` owns lookup evaluation, validation, and its HTTP handler. Both
-operations reuse `/run/perimeterd/lookup.sock`. Reload handlers validate and submit
+operations reuse `/run/perimeterd/control.sock`. Reload handlers validate and submit
 requests, but only the event loop admits epochs, applies candidates, and publishes.
 Startup readiness is explicitly synchronized; a bound socket does not imply reload
 admission is ready. After initial publication and final startup checks, admission

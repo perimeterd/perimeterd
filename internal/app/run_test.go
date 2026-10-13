@@ -96,7 +96,7 @@ func TestRunReadinessNotificationFailureReleasesOwnership(t *testing.T) {
 	if !errors.Is(err, notificationErr) {
 		t.Fatalf("startup error: got %v, want %v", err, notificationErr)
 	}
-	if _, err := os.Lstat(filepath.Join(stateDir, "run", "lookup.sock")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(filepath.Join(stateDir, "run", "control.sock")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("startup failure retained control socket: %v", err)
 	}
 	lock, err := state.AcquireLock(lockPath)

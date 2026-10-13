@@ -34,7 +34,7 @@ func startReloadFixture(t *testing.T, checkpoint func(string) error) *reloadFixt
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	f := &reloadFixture{path: filepath.Join(dir, "policy.yaml"), stateDir: filepath.Join(dir, "state"), address: runAddress(t), backend: &runBackend{recordingBackend: &recordingBackend{}, applied: make(chan struct{}, 32)}}
-	f.socket = filepath.Join(f.stateDir, "run", "lookup.sock")
+	f.socket = filepath.Join(f.stateDir, "run", "control.sock")
 	writeRunConfig(t, f.path, f.address, "8.8.8.8/32")
 	var ready chan string
 	f.cancel, f.signals, ready, f.done = startRun(t, f.path, f.stateDir, f.backend, checkpoint)
@@ -514,7 +514,7 @@ func TestStartupUnixReloadFailsWithoutDeferredExecution(t *testing.T) {
 		}
 	}()
 	awaitBoundary(t, reached)
-	got := control.ReloadPath(context.Background(), filepath.Join(stateDir, "run", "lookup.sock"), control.ReloadRequest{})
+	got := control.ReloadPath(context.Background(), filepath.Join(stateDir, "run", "control.sock"), control.ReloadRequest{})
 	if got.Outcome != "rejected" || got.Code != "not_ready" {
 		t.Fatal(got)
 	}

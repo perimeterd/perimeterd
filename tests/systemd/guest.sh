@@ -621,11 +621,11 @@ exercise_reload_acknowledgement() {
   if reload_packet; then
     fail 'digest mismatch stopped enforcing the previous policy'
   fi
-  mv "$RUNTIME_DIR/lookup.sock" "$RUNTIME_DIR/lookup.saved.sock"
+  mv "$RUNTIME_DIR/control.sock" "$RUNTIME_DIR/control.saved.sock"
   if /usr/bin/perimeterd reload; then
     fail 'missing socket was acknowledged'
   fi
-  mv "$RUNTIME_DIR/lookup.saved.sock" "$RUNTIME_DIR/lookup.sock"
+  mv "$RUNTIME_DIR/control.saved.sock" "$RUNTIME_DIR/control.sock"
   [[ $(reload_revision) == "$revision_before" ]] || fail 'unavailable endpoint mutated selection'
   if [[ "$include_timeout" == yes ]]; then
     write_reload_config '[9.9.9.9/32]' "http://127.0.0.1:$SOURCE_PORT/reload-stall"
