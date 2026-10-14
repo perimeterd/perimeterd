@@ -695,6 +695,30 @@ and its bans. The default update frequency is `10s`; request deadlines are at
 most `30s`. Failures do not extend a decision's absolute expiry. Lease renewal
 continues from retained authority while the writer can safely reconcile it.
 
+CrowdSec streams have separate **256 MiB (268,435,456-byte) wire and decoded
+limits**. Both count actual reads, including chunked bodies and trailing
+whitespace; gzip must finish with a valid checksum. These are fixed safety
+ceilings, not configurable response sizes or process-RSS guarantees. Static
+provider/list decoded limits remain 32 MiB.
+
+Startup, reload, and background synchronization failures retain a secret-safe
+category:
+
+| Diagnostic category | Operator check |
+| --- | --- |
+| `HTTP 401` / `HTTP 403` | Check the registered bouncer and the root-readable key file; an HTTP response proves the server was reached, not that authentication succeeded. |
+| Other numeric HTTP status | Inspect LAPI/proxy health and server-side logs; the daemon never reads or prints an error body. |
+| `wire size limit exceeded` / `decoded size limit exceeded` with `268435456 bytes` | Measure the stream's wire/expanded size using isolated credentials. A larger valid stream is outside the supported ceiling; do not infer authentication or LAPI failure from a reset caused by the client closing it. |
+| Unsupported encoding, malformed/truncated gzip, malformed envelope/decision data | Check proxy encoding/truncation and LAPI response integrity. Even a valid decision prefix is discarded when the tail fails validation. |
+| DNS, connection, TLS, timeout, canceled, or generic transport/read failure | Check the selected direct/OpenZiti route, DNS where applicable, application TLS trust, and the unchanged 30-second request budget. Generic errors deliberately omit arbitrary lower-level text. |
+
+Do not paste API keys, complete URLs/query strings, response bodies, or decision
+metadata into diagnostics. The versioned `perimeterd/<build version>` User-Agent
+is accepted by the pinned LAPI and records the running build as the bouncer
+version. After a failed reload/poll, use `perimeterd status` to inspect
+acknowledged state and representative `lookup`/packet probes to distinguish
+retained enforcement from connectivity; decisions and finite leases still expire.
+
 The known upstream database-query behavior is accepted: a successful-looking
 empty or partial full snapshot may remove CrowdSec bans. Restoration may
 require a later full synchronization; static global and geo policy are

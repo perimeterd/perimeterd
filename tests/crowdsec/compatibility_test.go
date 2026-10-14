@@ -4,6 +4,7 @@ package crowdsec_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/netip"
@@ -15,13 +16,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/perimeterd/perimeterd/internal/buildinfo"
 	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/crowdsec"
 )
 
 const (
 	crowdSecImage = "docker.io/crowdsecurity/crowdsec:v1.8.1@sha256:0f2523fa61ef507f15d953045cface490cc880670c62f2755ced17524107f71a"
-	crowdSecKey   = "perimeterd-real-lapi-compatibility-key"
 )
 
 type lapiHarness struct {
@@ -38,6 +39,32 @@ func TestRealLAPICompatibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	t.Cleanup(func() {
+		// This container and API key belong only to this test. Its only bouncer
+		// traffic is the real client exercised below, including readiness polls.
+		logs, err := lapiLogs(h.name)
+		if err != nil {
+			t.Errorf("read isolated LAPI logs: %v\n%s", err, logs)
+			return
+		}
+		if strings.Contains(strings.ToLower(string(logs)), "bad user agent") {
+			t.Errorf("LAPI rejected a User-Agent from the exercised client:\n%s", logs)
+		}
+	})
+
+	t.Run("build_version_is_recognized_by_lapi", func(t *testing.T) {
+		original := buildinfo.Version
+		defer func() { buildinfo.Version = original }()
+		for _, version := range []string{"v1.2.3", "0.0.2-dev.18.g8a1af5acc7cf", "branch/feature build 雪"} {
+			t.Run(version, func(t *testing.T) {
+				buildinfo.Version = version
+				client := newClient(t, h.endpoint, h.keyPath)
+				defer client.Close()
+				poll(t, client, ctx, true)
+				assertBouncerIdentity(t, h)
+			})
+		}
+	})
 	clearDecisions(t, h)
 	t.Run("dedup_false_preserves_all_ids_for_one_prefix", func(t *testing.T) {
 		const value = "198.51.100.13"
@@ -179,7 +206,8 @@ func startLAPI(t *testing.T) *lapiHarness {
 
 	root := t.TempDir()
 	keyPath := filepath.Join(root, "api-key")
-	if err := os.WriteFile(keyPath, []byte(crowdSecKey+"\n"), 0o600); err != nil {
+	key := fmt.Sprintf("perimeterd-real-lapi-%d-%d", os.Getpid(), time.Now().UnixNano())
+	if err := os.WriteFile(keyPath, []byte(key+"\n"), 0o600); err != nil {
 		t.Fatalf("write LAPI key: %v", err)
 	}
 	dataPath := filepath.Join(root, "data")
@@ -198,7 +226,7 @@ func startLAPI(t *testing.T) *lapiHarness {
 	args := []string{
 		"run", "--pull=missing", "--detach", "--rm", "--name", name, "--network", network,
 		"-p", "127.0.0.1::8080",
-		"-e", "BOUNCER_KEY_PERIMETERD=" + crowdSecKey,
+		"-e", "BOUNCER_KEY_PERIMETERD=" + key,
 		"-e", "CROWDSEC_BYPASS_DB_VOLUME_CHECK=true",
 		"-e", "DISABLE_AGENT=true",
 		"-e", "DISABLE_ONLINE_API=true",
@@ -272,6 +300,42 @@ func poll(t *testing.T, client *crowdsec.Client, ctx context.Context, startup bo
 		t.Fatalf("poll real LAPI startup=%t: %v", startup, err)
 	}
 	return batch
+}
+
+func assertBouncerIdentity(t *testing.T, h *lapiHarness) {
+	t.Helper()
+	output, err := runDocker(context.Background(), "exec", h.name, "cscli", "-c", "/etc/crowdsec/config.yaml", "bouncers", "list", "-o", "json")
+	if err != nil {
+		t.Fatalf("inspect real LAPI bouncer metadata: %v\n%s", err, output)
+	}
+	var bouncers []struct {
+		Name     string     `json:"name"`
+		Type     string     `json:"type"`
+		Version  string     `json:"version"`
+		LastPull *time.Time `json:"last_pull"`
+	}
+	if err := json.Unmarshal(output, &bouncers); err != nil {
+		t.Fatalf("decode LAPI bouncer metadata: %v\n%s", err, output)
+	}
+	// An isolated server with a unique key makes this persisted identity
+	// attributable to our actual Poll, rather than a header echo or another client.
+	if len(bouncers) != 1 {
+		t.Fatalf("isolated LAPI has %d bouncers, want exactly our client", len(bouncers))
+	}
+	bouncer := bouncers[0]
+	wantVersion := strings.TrimPrefix(buildinfo.UserAgent(), "perimeterd/")
+	if bouncer.Type != "perimeterd" || bouncer.Version != wantVersion || bouncer.LastPull == nil {
+		t.Fatalf("LAPI bouncer %q identity = %q/%q, last pull = %v; want perimeterd/%s with an acknowledged pull", bouncer.Name, bouncer.Type, bouncer.Version, bouncer.LastPull, wantVersion)
+	}
+}
+
+func lapiLogs(name string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Container log streams may use either stdout or stderr, even on success.
+	// #nosec G204 -- runtime and container name belong to this isolated harness.
+	cmd := exec.CommandContext(ctx, containerRuntime(), "logs", name)
+	return cmd.CombinedOutput()
 }
 
 func clearDecisions(t *testing.T, h *lapiHarness) {

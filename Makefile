@@ -16,7 +16,7 @@ GOFUMPT := $(GO) tool gofumpt
 GOIMPORTS := $(GO) tool goimports -local $(MODULE)
 GOLANGCI := $(GO) tool golangci-lint
 GOVULNCHECK := $(GO) tool govulncheck
-LDFLAGS := -s -w -X '$(MODULE)/internal/cli.Version=$(VERSION)' -X '$(MODULE)/internal/cli.Commit=$(COMMIT)' -X '$(MODULE)/internal/cli.BuildTime=$(BUILD_TIME)'
+LDFLAGS := -s -w -X '$(MODULE)/internal/buildinfo.Version=$(VERSION)' -X '$(MODULE)/internal/buildinfo.Commit=$(COMMIT)' -X '$(MODULE)/internal/buildinfo.BuildTime=$(BUILD_TIME)'
 GO_SOURCES := $(GO) list -tags=e2e,crowdsec -f '{{range .GoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .TestGoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .XTestGoFiles}}{{$$.Dir}}/{{.}} {{end}}' ./...
 E2E_TEST_BINARY := bin/perimeterd-e2e
 E2E_SUDO ?=
@@ -86,7 +86,7 @@ test-crowdsec:
 		command -v "$(CROWDSEC_CONTAINER_RUNTIME)" >/dev/null 2>&1 || { \
 			printf 'test-crowdsec requires %s in PATH\n' "$(CROWDSEC_CONTAINER_RUNTIME)" >&2; exit 1; \
 		}
-	CROWDSEC_CONTAINER_RUNTIME="$(CROWDSEC_CONTAINER_RUNTIME)" $(GO) test -tags crowdsec -count=1 -run '^TestRealLAPICompatibility$$' ./tests/crowdsec
+	CROWDSEC_CONTAINER_RUNTIME="$(CROWDSEC_CONTAINER_RUNTIME)" $(GO) test -tags crowdsec -count=1 -v -run '^Test(RealLAPICompatibility|LargeLAPISnapshot)$$' ./tests/crowdsec
 
 # Requires pinned real OpenZiti and CrowdSec binaries; no host tunneler or
 # production controller/LAPI is used. The fixture runs in private namespaces.

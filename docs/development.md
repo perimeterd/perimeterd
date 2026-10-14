@@ -177,8 +177,11 @@ matrix](#verification-matrix), not a percentage, is the release gate.
 build is needed; for example, `GOARCH=arm64 make build` cross-compiles the
 Linux binary. The current CI build matrix checks Linux `amd64` and `arm64`;
 other local `GOARCH` values are not release-support claims. Version metadata
-defaults to `dev`/`unknown`/`unknown`; override `VERSION`, `COMMIT`, and
-`BUILD_TIME` at build time. CI supplies its revision and UTC build timestamp.
+is owned by `internal/buildinfo` and defaults to `dev`/`unknown`/`unknown`;
+override `VERSION`, `COMMIT`, and `BUILD_TIME` at build time. Make and GoReleaser
+inject that shared package's linker variables. CI supplies its revision and UTC
+build timestamp. CLI, metrics, and status retain the raw version; CrowdSec uses
+the same version in its sanitized `perimeterd/<version>` User-Agent.
 
 `perimeterd validate` is an offline local check. It does not fetch sources or
 touch the firewall. `make verify` runs `go mod verify`, `fmt-check`, `lint`,
@@ -346,7 +349,26 @@ It runs a digest-pinned CrowdSec v1.8.1 container on an isolated network with
 an ephemeral loopback port, private SQLite data, and the normal chunked stream.
 The compatibility cases cover duplicate-prefix IDs, incremental updates without
 retransmitting the active snapshot, deletion of the longer overlap, reconnect,
-and authoritative emptiness. The fixture is destroyed afterward.
+and authoritative emptiness. Actual release/development clients must also update
+the uniquely attributable bouncer's recorded type/version without a
+`bad user agent` warning. The fixture is destroyed afterward.
+
+The same CI `make test-crowdsec` gate runs `TestLargeLAPISnapshot` against local
+HTTP with a generated **400,000-decision stream exceeding 100 MiB** (and the
+observed 98,499,095-byte production snapshot). It retains realistic metadata and
+both new/deleted entries, checks IDs, normalization, startup/incremental behavior,
+and expiry boundaries, and reports elapsed time, allocations, and process peak
+RSS. Generation streams one record at a time; no giant fixture blob is retained.
+Small limits, unknown-length/chunked reads, gzip integrity, nesting, partial
+admission, secrecy, cancellation, and close regressions remain in normal
+`internal/crowdsec`/`internal/app` tests.
+
+The native CI `make test-e2e` gate includes `TestE2ECrowdSecLargeSnapshot`: actual
+daemon startup with the same >100 MiB generator, acknowledged status/lookup,
+IPv4/IPv6 enforcement, truncated/over-limit poll retention without partial
+updates, authoritative resynchronization, and sanitized HTTP/size startup
+failures. It reports daemon-only peak RSS separately from the generator. Existing
+native backend and real OpenZiti/LAPI scenarios remain required.
 
 The known query-error behavior in
 [crowdsecurity/crowdsec#4691](https://github.com/crowdsecurity/crowdsec/issues/4691)
@@ -544,11 +566,12 @@ RSS, or throughput threshold.
 
 The benchmark scope and reported quantities are:
 
-- `internal/crowdsec`: `BenchmarkLAPISnapshotAdmission` builds complete LAPI
-  JSON with SDK-matching decision metadata for one and 250,000 decisions. It
-  reports serialized input bytes, decision count, time/op, allocations/op,
-  admitted operations, capacity-rejected operations, and Linux `/proc`
-  `VmHWM` when available. `BenchmarkAuthorityProjection` measures
+- `internal/crowdsec`: `BenchmarkLAPISnapshotAdmission` streams complete LAPI
+  JSON with SDK-matching metadata for one, 250,000, and 400,000 decisions
+  (`large-100MiB`). It reports serialized input bytes, decision count, time/op,
+  allocations/op, admitted operations, and Linux `/proc` `VmHWM` when available.
+  All three profiles must be admitted; unexpected rejection fails the benchmark.
+  `BenchmarkAuthorityProjection` measures
   authoritative-store admission and timed projection for one and 100,000
   decisions. `BenchmarkCrowdSecReconnectRenewalRefresh` measures
   authority-only cold startup/reconnect, unchanged renewal projection, and
@@ -565,20 +588,29 @@ The benchmark scope and reported quantities are:
   projection size, so the benchmark measures state reads,
   admission/reconciliation, and lease bookkeeping without native commands.
 
-The LAPI safety fence caps both the raw HTTP response read and, when
-compressed, the decompressed response read at 32 MiB. The 250,000-decision
-fixture intentionally retains realistic metadata and may be rejected at
-admission when its serialized envelope exceeds that limit. Such a capacity
-rejection is reported as `capacity-rejected/op`; malformed or other unexpected
-errors fail the benchmark rather than being treated as support for the
-workload. These LAPI wire/read limits are separate from encoded-state and
-native backend input/inspection budgets; those operational limits are described
-in the [operator sequence](operations.md#operator-sequence).
+The LAPI safety fence independently caps wire and decoded reads at
+**256 MiB (268,435,456 bytes)**. The realistic 250,000-decision fixture must now
+fit and be admitted, not count as an expected capacity rejection. The larger
+400,000-decision profile also exceeds the observed 98,499,095-byte snapshot.
+Run all admission profiles explicitly with:
 
-`-benchmem` allocations and the optional `VmHWM` sample are process
-measurements, not peak kernel memory, native set memory, or end-to-end RSS
-attribution. `VmHWM` is cumulative for the process, including fixture setup
-and earlier profiles, so it cannot be attributed to one dispatch.
+```sh
+GOTOOLCHAIN=auto go test -run '^$' -bench '^BenchmarkLAPISnapshotAdmission$' -benchtime=1x -benchmem ./internal/crowdsec
+```
+
+These wire/read ceilings are separate from encoded-state and native backend
+input/inspection budgets; those operational limits are described in the
+[operator sequence](operations.md#operator-sequence). They bound input, not
+output-state memory or total RSS. Admission retains the output batch and one
+decision at a time, not complete wire/decoded/`RawMessage` envelope copies.
+
+`-benchmem` allocations and optional `VmHWM` are process measurements, not peak
+kernel memory, native set memory, or end-to-end RSS attribution. Generator CPU
+and per-record allocations are included, but the serialized fixture is not
+retained. `VmHWM` is cumulative across setup and earlier profiles, so run one
+sub-benchmark in a fresh process for attributable comparisons. The local HTTP
+gate includes its server/generator; the isolated daemon gate measures daemon RSS
+without generator memory.
 
 Native execution is a separate, explicit measurement and runs only inside the
 existing namespace fixture:

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/perimeterd/perimeterd/internal/buildinfo"
 )
 
 type failingWriter struct{}
@@ -33,23 +35,27 @@ func TestRunFailsWhenCommandHelpCannotBeDelivered(t *testing.T) {
 }
 
 func TestRunVersion(t *testing.T) {
-	oldVersion, oldCommit, oldBuildTime := Version, Commit, BuildTime
+	oldVersion, oldCommit, oldBuildTime := buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime
 	t.Cleanup(func() {
-		Version, Commit, BuildTime = oldVersion, oldCommit, oldBuildTime
+		buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime = oldVersion, oldCommit, oldBuildTime
 	})
-	Version, Commit, BuildTime = "v1.2.3", "abc123", "2026-09-09T12:00:00Z"
-
-	var stdout, stderr bytes.Buffer
-	if code := Run([]string{"version"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("Run(version) exit code = %d, want 0; stderr = %q", code, stderr.String())
-	}
-	for _, want := range []string{"v1.2.3", "abc123", "2026-09-09T12:00:00Z"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Errorf("version output %q does not contain metadata %q", stdout.String(), want)
-		}
-	}
-	if stderr.Len() != 0 {
-		t.Errorf("version wrote to stderr: %q", stderr.String())
+	for _, version := range []string{"v1.2.3", "0.0.2-dev.18.g8a1af5acc7cf", "branch/feature build 雪", ""} {
+		t.Run(version, func(t *testing.T) {
+			buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime = version, "abc123", "2026-09-09T12:00:00Z"
+			// Producing the wire identifier must not change truthful CLI output.
+			_ = buildinfo.UserAgent()
+			var stdout, stderr bytes.Buffer
+			if code := Run([]string{"version"}, &stdout, &stderr); code != 0 {
+				t.Fatalf("Run(version) exit code = %d, want 0; stderr = %q", code, stderr.String())
+			}
+			want := "version: " + version + "\ncommit: abc123\nbuild time: 2026-09-09T12:00:00Z\n"
+			if stdout.String() != want {
+				t.Errorf("version output = %q, want %q", stdout.String(), want)
+			}
+			if stderr.Len() != 0 {
+				t.Errorf("version wrote to stderr: %q", stderr.String())
+			}
+		})
 	}
 }
 

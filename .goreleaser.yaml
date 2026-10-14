@@ -17,7 +17,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w -X github.com/perimeterd/perimeterd/internal/cli.Version={{ .Version }} -X github.com/perimeterd/perimeterd/internal/cli.Commit={{ .FullCommit }} -X github.com/perimeterd/perimeterd/internal/cli.BuildTime={{ .Date }}
+      - -s -w -X github.com/perimeterd/perimeterd/internal/buildinfo.Version={{ .Version }} -X github.com/perimeterd/perimeterd/internal/buildinfo.Commit={{ .FullCommit }} -X github.com/perimeterd/perimeterd/internal/buildinfo.BuildTime={{ .Date }}
 
 nfpms:
   - id: packages

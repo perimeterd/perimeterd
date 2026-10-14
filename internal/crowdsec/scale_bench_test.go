@@ -1,10 +1,7 @@
 package crowdsec
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
@@ -15,6 +12,7 @@ import (
 	"time"
 
 	"github.com/perimeterd/perimeterd/internal/config"
+	"github.com/perimeterd/perimeterd/internal/testutil/crowdsecfixture"
 )
 
 const (
@@ -23,71 +21,27 @@ const (
 	benchmarkCombinedDecisions = 100_000
 )
 
-// benchmarkDecision matches the fields emitted by models.Decision in the
-// pinned CrowdSec SDK. No benchmark-only fields are added: the serialized
-// input size must represent the real LAPI decision envelope.
-type benchmarkDecision struct {
-	Duration  string `json:"duration"`
-	ID        int64  `json:"id"`
-	Origin    string `json:"origin"`
-	Scenario  string `json:"scenario"`
-	Scope     string `json:"scope"`
-	Simulated bool   `json:"simulated"`
-	Type      string `json:"type"`
-	Until     string `json:"until"`
-	UUID      string `json:"uuid"`
-	Value     string `json:"value"`
-}
-
-// benchmarkLAPIWire models the complete decision metadata emitted by a LAPI
-// stream. The metadata is deliberately retained here: measuring a compact
-// hand-written decision object would understate the stream safety boundary.
-func benchmarkLAPIWire(count int) []byte {
-	var out bytes.Buffer
-	out.Grow(count*256 + 32)
-	out.WriteString(`{"new":[`)
-	until := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	for index := range count {
-		if index != 0 {
-			out.WriteByte(',')
-		}
-		address := netip.AddrFrom4([4]byte{198, byte(index >> 16), byte(index >> 8), byte(index)})
-		decision := benchmarkDecision{
-			Duration: "24h", ID: int64(index + 1), Origin: "cscli",
-			Scenario: "crowdsecurity/http-probing", Scope: "Ip", Type: "ban", Until: until,
-			UUID: fmt.Sprintf("00000000-0000-4000-8000-%012x", index+1), Value: address.String(),
-		}
-		encoded, err := json.Marshal(decision)
-		if err != nil {
-			panic(err)
-		}
-		out.Write(encoded)
-	}
-	out.WriteString(`],"deleted":[]}`)
-	return out.Bytes()
-}
-
 type benchmarkRoundTripper struct {
-	body []byte
+	snapshot crowdsecfixture.Snapshot
 }
 
 func (t benchmarkRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Status:     "200 OK",
-		Body:       io.NopCloser(bytes.NewReader(t.body)),
+		Body:       io.NopCloser(t.snapshot.Reader()),
 		Header:     make(http.Header),
 		Request:    req,
 	}, nil
 }
 
-func benchmarkClient(b *testing.B, body []byte) *Client {
+func benchmarkClient(b *testing.B, snapshot crowdsecfixture.Snapshot) *Client {
 	b.Helper()
 	keyPath := b.TempDir() + "/lapi-key"
 	if err := os.WriteFile(keyPath, []byte("benchmark-key"), 0o600); err != nil {
 		b.Fatal(err)
 	}
-	client, err := NewClient(config.CrowdSecConfig{Enabled: true, LAPIURL: "http://lapi.example", APIKeyFile: keyPath}, benchmarkRoundTripper{body: body})
+	client, err := NewClient(config.CrowdSecConfig{Enabled: true, LAPIURL: "http://lapi.example", APIKeyFile: keyPath}, benchmarkRoundTripper{snapshot: snapshot})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -123,43 +77,36 @@ func BenchmarkLAPISnapshotAdmission(b *testing.B) {
 	}{
 		{name: "baseline", count: benchmarkBaselineDecisions},
 		{name: "large-250k", count: benchmarkLargeDecisions},
+		{name: "large-100MiB", count: crowdsecfixture.LargeCount},
 	} {
 		b.Run(profile.name, func(b *testing.B) {
-			body := benchmarkLAPIWire(profile.count)
-			client := benchmarkClient(b, body)
-			// Poll deliberately redacts SDK/transport errors. Observe the real
-			// response gate so capacity rejection cannot hide an unrelated error.
-			var admissionErr error
-			httpClient := client.bouncer.APIClient.GetClient()
-			transport := httpClient.Transport
-			httpClient.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				response, err := transport.RoundTrip(request)
-				admissionErr = err
-				return response, err
-			})
+			snapshot := crowdsecfixture.Snapshot{Count: profile.count, Until: time.Now().Add(24 * time.Hour)}
+			size, err := io.Copy(io.Discard, snapshot.Reader())
+			if err != nil {
+				b.Fatal(err)
+			}
+			client := benchmarkClient(b, snapshot)
+			// Generator CPU and small per-record allocations are included; no
+			// serialized fixture is retained. VmHWM is process-wide, not a delta.
 			b.ReportAllocs()
 			b.ResetTimer()
-			admitted, rejected := 0, 0
 			for range b.N {
 				batch, err := client.Poll(context.Background(), true)
 				if err != nil {
-					if len(body) <= bodyLimit || admissionErr == nil || admissionErr.Error() != "crowdsec response body exceeded safety limits" {
-						b.Fatalf("snapshot admission: %v (response gate: %v)", err, admissionErr)
-					}
-					rejected++
-					continue
+					b.Fatalf("snapshot admission: %v", err)
 				}
-				if len(batch.New) != profile.count {
-					b.Fatalf("admitted %d decisions, want %d", len(batch.New), profile.count)
+				want := profile.count
+				if want >= 4 {
+					want-- // ID 4 is already expired.
 				}
-				admitted++
+				if len(batch.New) != want || len(batch.Deleted) != 1 {
+					b.Fatalf("admitted %d new/%d deleted decisions, want %d/1", len(batch.New), len(batch.Deleted), want)
+				}
 			}
 			b.StopTimer()
-			b.ReportMetric(float64(len(body)), "input-bytes/op")
+			b.ReportMetric(float64(size), "input-bytes/op")
 			b.ReportMetric(float64(profile.count), "decisions/op")
-			iterations := float64(b.N)
-			b.ReportMetric(float64(admitted)/iterations, "admitted/op")
-			b.ReportMetric(float64(rejected)/iterations, "capacity-rejected/op")
+			b.ReportMetric(1, "admitted/op")
 			reportPeakRSS(b)
 		})
 	}

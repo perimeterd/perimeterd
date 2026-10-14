@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"sync"
@@ -60,6 +61,7 @@ type crowdState struct {
 
 type crowdRuntime struct {
 	engine        *Engine
+	logger        *slog.Logger
 	transport     http.RoundTripper
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -577,8 +579,12 @@ func (c *crowdRuntime) pollLoop(ctx context.Context, s *crowdState, full bool) {
 				c.connected.Store(false)
 			}
 		}
+		logger := c.logger
 		c.engine.mu.Unlock()
 		if err != nil {
+			if logger != nil {
+				logger.Warn("CrowdSec synchronization failed", "error", err)
+			}
 			successes = 0
 			if !waitCrowd(ctx, crowdRetryWait(backoff)) {
 				return

@@ -12,18 +12,11 @@ import (
 	"strings"
 
 	"github.com/perimeterd/perimeterd/internal/app"
+	"github.com/perimeterd/perimeterd/internal/buildinfo"
 	"github.com/perimeterd/perimeterd/internal/config"
 )
 
 const defaultConfigPath = "/etc/perimeterd/perimeterd.yaml"
-
-// Version, Commit, and BuildTime are replaced by release builds through ldflags.
-// Their development values remain useful when running an untagged local build.
-var (
-	Version   = "dev"
-	Commit    = "unknown"
-	BuildTime = "unknown"
-)
 
 // Run dispatches one perimeterd command and returns a process exit status.
 // The validate command is deliberately limited to config.Load: it does not
@@ -123,9 +116,9 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	if err := app.Run(context.Background(), app.Options{
 		ConfigPath: *configPath,
 		Stderr:     stderr,
-		Version:    Version,
-		Commit:     Commit,
-		BuildTime:  BuildTime,
+		Version:    buildinfo.Version,
+		Commit:     buildinfo.Commit,
+		BuildTime:  buildinfo.BuildTime,
 	}); err != nil {
 		return commandError(stderr, fmt.Errorf("run: %w", err))
 	}
@@ -166,7 +159,7 @@ func runVersion(args []string, stdout, stderr io.Writer) int {
 		return exitCode
 	}
 
-	if _, err := fmt.Fprintf(stdout, "version: %s\ncommit: %s\nbuild time: %s\n", Version, Commit, BuildTime); err != nil {
+	if _, err := fmt.Fprintf(stdout, "version: %s\ncommit: %s\nbuild time: %s\n", buildinfo.Version, buildinfo.Commit, buildinfo.BuildTime); err != nil {
 		return commandError(stderr, fmt.Errorf("write version output: %w", err))
 	}
 	return 0

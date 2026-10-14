@@ -1,8 +1,6 @@
 package crowdsec
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"errors"
 	"io"
@@ -64,6 +62,9 @@ func TestClientPollInjectsDedupAndExplicitStartup(t *testing.T) {
 	query := got.URL.Query()
 	if query.Get("dedup") != "false" || query.Get("startup") != "false" || query.Get("scopes") != "ip,range" {
 		t.Fatalf("stream query was not adapted safely: %v", query)
+	}
+	if got.URL.Path != "/base/v1/decisions/stream" || query.Get("community_pull") != "false" || query.Get("additional_pull") != "false" {
+		t.Fatalf("stream endpoint or SDK pull options changed: %s", got.URL.Redacted())
 	}
 	if got.Header.Get("X-Api-Key") != "test-api-key" {
 		t.Fatalf("API key header missing")
@@ -245,30 +246,6 @@ func TestClientPollRejectsScopedAddresses(t *testing.T) {
 				t.Fatalf("partial batch escaped validation: %#v", batch)
 			}
 		})
-	}
-}
-
-func TestGateResponseBoundsGzipAndNormalizesHeaders(t *testing.T) {
-	var compressed bytes.Buffer
-	writer := gzip.NewWriter(&compressed)
-	if _, err := writer.Write([]byte(`{"new":[],"deleted":[]}`)); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	h := make(http.Header)
-	h.Set("Content-Encoding", "gzip")
-	resp := response(http.StatusOK, bytes.NewReader(compressed.Bytes()), h)
-	if err := gateResponse(resp); err != nil {
-		t.Fatal(err)
-	}
-	if resp.Header.Get("Content-Encoding") != "" || resp.ContentLength <= 0 {
-		t.Fatalf("gate did not normalize response metadata: %#v", resp.Header)
-	}
-	decoded, err := io.ReadAll(resp.Body)
-	if err != nil || string(decoded) != `{"new":[],"deleted":[]}` {
-		t.Fatalf("unexpected decoded response: %q, %v", decoded, err)
 	}
 }
 

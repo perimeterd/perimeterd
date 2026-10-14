@@ -778,9 +778,9 @@ verification or substitute mutable SDK `main` for a pinned tested release.
 
 The implemented adapter uses the MIT-licensed
 [`github.com/crowdsecurity/go-cs-bouncer`](https://github.com/crowdsecurity/go-cs-bouncer)
-for authenticated API client setup and its stream-mode data types, not its
-point-query protocol. The adapter owns the polling loop and calls the exposed
-`APIClient.Decisions.GetStream` with explicit `DecisionsStreamOpts.Startup`.
+for authenticated API client setup, not its point-query protocol or full-response
+decoder. The adapter owns the polling loop and issues stream GETs directly
+through the SDK-authenticated HTTP client.
 It must not delegate recovery to `StreamBouncer.Run`: the current
 [implementation](https://raw.githubusercontent.com/crowdsecurity/go-cs-bouncer/main/stream_bouncer.go)
 keeps `Startup=false` after post-start errors and does not implement this
@@ -808,15 +808,19 @@ documented below; it does not block support for this server release.
 
 Every request to `/v1/decisions/stream` uses `dedup=false`, including the
 initial `startup=true` request, every reconnect `startup=true` request, and each
-incremental `startup=false` poll. The go-cs-bouncer API does not expose this
-option, so the adapter wraps the HTTP transport with a narrow pre-dispatch
-query injector. For that stream endpoint only, it parses the existing URL query
-and sets the single `dedup` value to `false`; it preserves `startup`, IP/range
-scope filters, cursors, all other SDK options, the configured endpoint path,
-authentication headers, and request context. It does not append a second
-ad-hoc query string or inject `dedup` into unrelated LAPI requests.
+incremental `startup=false` poll. Each request explicitly sets `startup`,
+`scopes=ip,range`, and `dedup=false`, preserving the configured base-URL path
+prefix, API-key authentication, and request context. The retained SDK option
+defaults are sent as `community_pull=false` and `additional_pull=false`.
+Redirects remain refused; direct and OpenZiti transports share this request path.
 Authentication material and complete URLs containing credentials remain
 excluded from logs and diagnostics.
+
+The User-Agent is `perimeterd/<build version>`, derived from the same build
+metadata reported by `perimeterd version`. Unsafe product-token characters
+(including extra slashes and whitespace) become `-` in the header only; raw
+CLI/metrics version provenance is unchanged. Pinned LAPI requires exactly one
+slash and records the resulting bouncer type and version.
 
 The explicit `dedup=false` contract preserves every applicable decision ID and
 its independent expiry/provenance. Server-side deduplication can collapse
@@ -853,47 +857,54 @@ and renewable lease protections remain unchanged.
 
 ### Response-envelope validation
 
-`GetStream` has an EOF-masking hazard if an empty body is turned into a
-zero-value response. The adapter therefore installs a response-body gate on
-the HTTP transport before the client's typed decoder. Disable the underlying
-Go transport's automatic decompression so the gate can bound both wire-entity
-and decompressed bytes. Limit actual reads rather than trusting
-`Content-Length`: both limits are 32 MiB, using a one-byte overflow sentinel.
-Accept identity and bounded gzip decoding; reject unsupported or malformed
-content encodings. The gate returns the validated decoded body with consistent
-encoding/length metadata, so no second layer decompresses it again. Disable
-the dependency's HTTP debug/body-dump features even when perimeterd's own
-logging level is debug; validation is not permission to log a body or headers.
+Successful streams are decoded in one pass from bounded readers, without a
+complete wire, decompressed, or `RawMessage` envelope copy. Independent wire
+and decoded ceilings are **256 MiB (268,435,456 bytes) each**, including trailing
+whitespace. Exactly the limit is accepted; a one-byte probe rejects overflow.
+Limits apply to actual reads, not `Content-Length`, including unknown lengths
+and chunked bodies. These internal safety ceilings are not YAML settings and do
+not change static providers' 32 MiB decoded-response limit.
 
-The gate must validate one complete JSON envelope before returning bytes to
-`APIClient.Decisions.GetStream`:
+The underlying Go transport's automatic decompression is disabled so wire
+accounting remains meaningful. Identity and gzip are supported. Unsupported or
+stacked encodings, malformed/truncated gzip, invalid checksums, trailing JSON,
+and transport read failures reject the whole stream. Successful admission
+requires EOF, including gzip integrity checks. Non-200 responses report the
+numeric HTTP status promptly and close the body without reading error content.
+The retained SDK's raw HTTP/header/body diagnostics remain suppressed even when
+perimeterd logging is set to debug.
+
+The parser validates one complete envelope before publishing its batch:
 
 - the body is non-empty and its top-level value is exactly one object;
 - after that object's closing `}`, only JSON whitespace is allowed; a second
   value, any other trailing byte, or an incomplete document is an error;
 - lowercase `new` and `deleted` each occur exactly once and each value is either
-  an array or JSON `null` (null is normalized to an empty array); missing,
-  duplicate, malformed, or other-typed required fields are errors. Case variants
-  such as `New` and `Deleted` are also errors, not ignored extensions, because
-  the SDK's case-insensitive decoder could use them to overwrite validated
-  fields; and
-- unknown members may be ignored only after their complete JSON values have
-  been parsed, so malformed data cannot be hidden in an unexamined suffix.
+  an array or JSON `null` (null is normalized to an empty array). Missing,
+  duplicate, wrong-typed, or case-aliased members such as `New`/`DELETED` are
+  rejected; member order may vary; and
+- unknown extension values are skipped incrementally after syntax validation,
+  with at most **64 nested object/array containers** within each value. Deeper
+  extensions are rejected rather than risking unbounded recursive traversal.
 
-`{"new":[],"deleted":[]}` is a valid empty envelope, distinct from an empty
-body, which is malformed and never means "no decisions". It becomes an
-authoritative empty snapshot only under the supported LAPI contract and the
-successful full-synchronization path below. Only after the envelope succeeds
-does the client perform its typed decode, followed by validation of every
-applicable decision. No per-decision decoder or item-by-item loop may bypass
-the envelope gate, and decoder EOF or any typed-decode error is a
-malformed-response failure rather than an empty projection. Debug diagnostics
-may include bounded status and size metadata and an error category, but never
-the body, raw JSON, or decision payload.
+One SDK decision model is decoded, validated, and converted at a time into an
+unpublished batch; full SDK decision slices are not retained. The batch becomes
+visible only after the entire envelope, transport, encoding, and size checks
+succeed. `{"new":[],"deleted":[]}` is valid authoritative emptiness only on the
+successful full-synchronization path; an empty body is never an empty snapshot.
+Any failure discards all accumulated additions and deletions, retaining prior
+authority and expiry processing when present.
 
-Any envelope, typed-decode, or decision-validation failure discards the response
-and preserves the prior authoritative store and its expiry processing when one
-exists; it never installs an empty candidate.
+Memory scales with accepted decisions and the largest individual decision/token,
+not additional complete-envelope copies. JSON token parsing may still allocate
+a large individual string/number. Byte ceilings bound input, not process RSS,
+the authoritative store, or native backend capacity.
+
+Diagnostics distinguish numeric HTTP status, wire/decoded overflow with the byte
+limit, encoding/gzip integrity, malformed envelope/decision data, and safely
+classified DNS, connection, TLS, timeout, cancellation, or generic transport/read
+failure. They never expose raw URLs, credentials, response bodies, decision
+metadata, or arbitrary SDK/transport/parser messages.
 
 ### Decision acceptance and expiry
 

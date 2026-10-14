@@ -45,6 +45,9 @@ type runtimeReservation struct {
 
 func newRuntimePublication(engine *Engine, source *sourceRuntime, logger *slog.Logger, collector *metricspkg.Collector) *runtimePublication {
 	publication := &runtimePublication{engine: engine, source: source, logger: logger, collector: collector}
+	engine.mu.Lock()
+	engine.crowd.logger = logger
+	engine.mu.Unlock()
 	return publication
 }
 
@@ -144,6 +147,9 @@ func (p *runtimePublication) publishReservation(revision *state.Revision, reserv
 	}
 	reservation.session = nil
 	p.logger = reservation.logger
+	p.engine.mu.Lock()
+	p.engine.crowd.logger = reservation.logger
+	p.engine.mu.Unlock()
 	if p.collector != nil {
 		p.collector.SetPrefixes(reservation.prefixes)
 	}

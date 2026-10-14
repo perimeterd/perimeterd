@@ -1,18 +1,13 @@
 package crowdsec
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,12 +17,14 @@ import (
 	csbouncer "github.com/crowdsecurity/go-cs-bouncer"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/perimeterd/perimeterd/internal/buildinfo"
 	"github.com/perimeterd/perimeterd/internal/config"
 )
 
 const (
 	requestLimit    = 30 * time.Second
-	bodyLimit       = 32 << 20
+	wireLimit       = 256 << 20
+	decodedLimit    = 256 << 20
 	credentialLimit = 4 << 10
 	deadlineSlack   = time.Second
 )
@@ -44,6 +41,7 @@ type Client struct {
 	bouncer   *csbouncer.StreamBouncer
 	endpoint  string
 	transport http.RoundTripper
+	streamURL *url.URL
 
 	mu             sync.Mutex
 	closed         bool
@@ -74,7 +72,7 @@ func NewClient(cfg config.CrowdSecConfig, transport http.RoundTripper) (*Client,
 		APIKey:    apiKey,
 		APIUrl:    baseURL.String(),
 		Scopes:    []string{"ip", "range"},
-		UserAgent: "perimeterd",
+		UserAgent: buildinfo.UserAgent(),
 	}
 	if cfg.UpdateFrequency > 0 {
 		bouncer.TickerInterval = cfg.UpdateFrequency.String()
@@ -98,11 +96,8 @@ func NewClient(cfg config.CrowdSecConfig, transport http.RoundTripper) (*Client,
 	if err != nil {
 		return nil, errors.New("crowdsec stream URL initialization failed")
 	}
-	apiHTTP.Transport = &streamTransport{
-		base:       auth,
-		baseURL:    baseURL,
-		streamPath: streamURL.Path,
-	}
+	// Retain SDK API-key authentication, not its full-response decoder.
+	apiHTTP.Transport = auth
 	apiHTTP.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
@@ -110,6 +105,7 @@ func NewClient(cfg config.CrowdSecConfig, transport http.RoundTripper) (*Client,
 		bouncer:   bouncer,
 		endpoint:  endpoint,
 		transport: baseTransport,
+		streamURL: streamURL,
 		close:     make(chan struct{}),
 	}, nil
 }
@@ -179,23 +175,9 @@ func (c *Client) Poll(ctx context.Context, startup bool) (Batch, error) {
 	requestCtx, stopClose := contextWithClose(requestCtx, c.close)
 	defer stopClose()
 
-	c.bouncer.Opts.Startup = startup
-	data, resp, err := c.bouncer.APIClient.Decisions.GetStream(requestCtx, c.bouncer.Opts)
-	if err != nil {
-		if requestCtx.Err() != nil {
-			if c.isClosed() {
-				return Batch{}, errClientClosed
-			}
-			return Batch{}, requestCtx.Err()
-		}
-		return Batch{}, errors.New("crowdsec stream request failed")
-	}
-	if resp == nil || resp.Response == nil || resp.Response.StatusCode != http.StatusOK || data == nil {
-		return Batch{}, errors.New("crowdsec stream response was invalid")
-	}
-	batch, err := decodeBatch(data, startup, started)
-	if err != nil {
-		return Batch{}, err
+	batch, err := c.pollStream(requestCtx, startup, started)
+	if err != nil || requestCtx.Err() != nil {
+		return Batch{}, sanitizeStreamError(err, requestCtx.Err(), c.isClosed())
 	}
 	success = true
 	return batch, nil
@@ -288,211 +270,6 @@ func secureTransport(transport http.RoundTripper) http.RoundTripper {
 		return clone
 	}
 	return transport
-}
-
-type streamTransport struct {
-	base       http.RoundTripper
-	baseURL    *url.URL
-	streamPath string
-}
-
-func (t *streamTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req == nil || req.URL == nil {
-		return nil, errors.New("crowdsec request is invalid")
-	}
-	copyReq := req.Clone(req.Context())
-	copyURL := *req.URL
-	copyReq.URL = &copyURL
-	if !t.isStream(copyReq) {
-		return t.base.RoundTrip(copyReq)
-	}
-	query := copyReq.URL.Query()
-	query.Set("dedup", "false")
-	if _, ok := query["startup"]; !ok {
-		query.Set("startup", "false")
-	}
-	copyReq.URL.RawQuery = query.Encode()
-	resp, err := t.base.RoundTrip(copyReq)
-	if err != nil {
-		return resp, err
-	}
-	if resp == nil {
-		return nil, errors.New("crowdsec transport returned no response")
-	}
-	if err := gateResponse(resp); err != nil {
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (t *streamTransport) CloseIdleConnections() {
-	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
-		closer.CloseIdleConnections()
-		return
-	}
-	if auth, ok := t.base.(*apiclient.APIKeyTransport); ok {
-		if closer, ok := auth.Transport.(interface{ CloseIdleConnections() }); ok {
-			closer.CloseIdleConnections()
-		}
-	}
-}
-
-func (t *streamTransport) isStream(req *http.Request) bool {
-	return req.Method == http.MethodGet && req.URL.Scheme == t.baseURL.Scheme && req.URL.Host == t.baseURL.Host && req.URL.Path == t.streamPath
-}
-
-func gateResponse(resp *http.Response) error {
-	if resp.Body == nil {
-		if resp.StatusCode == http.StatusOK {
-			return errors.New("crowdsec response body is empty")
-		}
-		resp.Body = http.NoBody
-		return nil
-	}
-	wire, err := readBounded(resp.Body, bodyLimit)
-	_ = resp.Body.Close()
-	if err != nil {
-		return errors.New("crowdsec response body exceeded safety limits")
-	}
-	decoded, err := decodeContentEncoding(resp.Header.Get("Content-Encoding"), wire)
-	if err != nil {
-		return errors.New("crowdsec response content encoding is invalid")
-	}
-	if resp.StatusCode == http.StatusOK {
-		if err := validateEnvelope(decoded); err != nil {
-			return errors.New("crowdsec response envelope is malformed")
-		}
-	}
-	if resp.Header == nil {
-		resp.Header = make(http.Header)
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(decoded))
-	resp.ContentLength = int64(len(decoded))
-	resp.Header.Del("Content-Encoding")
-	resp.Header.Set("Content-Length", strconv.Itoa(len(decoded)))
-	resp.Uncompressed = false
-	return nil
-}
-
-func readBounded(reader io.Reader, limit int) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(reader, int64(limit)+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(data) > limit {
-		return nil, errors.New("CrowdSec response exceeds byte limit")
-	}
-	return data, nil
-}
-
-func decodeContentEncoding(encoding string, wire []byte) ([]byte, error) {
-	encoding = strings.TrimSpace(strings.ToLower(encoding))
-	if encoding == "" || encoding == "identity" {
-		if len(wire) > bodyLimit {
-			return nil, errors.New("body limit exceeded")
-		}
-		return wire, nil
-	}
-	if encoding != "gzip" {
-		return nil, errors.New("unsupported content encoding")
-	}
-	reader, err := gzip.NewReader(bytes.NewReader(wire))
-	if err != nil {
-		return nil, err
-	}
-	decoded, readErr := readBounded(reader, bodyLimit)
-	closeErr := reader.Close()
-	if readErr != nil {
-		return nil, readErr
-	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-	return decoded, nil
-}
-
-func validateEnvelope(body []byte) error {
-	if len(body) == 0 {
-		return errors.New("empty envelope")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	first, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delim, ok := first.(json.Delim)
-	if !ok || delim != '{' {
-		return errors.New("envelope is not an object")
-	}
-	seenNew, seenDeleted := false, false
-	for decoder.More() {
-		key, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		name, ok := key.(string)
-		if !ok {
-			return errors.New("envelope member name is invalid")
-		}
-		var value json.RawMessage
-		if err := decoder.Decode(&value); err != nil {
-			return err
-		}
-		// The SDK matches these fields case-insensitively. An alias cannot be
-		// treated as an ignored extension: it could overwrite validated data.
-		switch {
-		case strings.EqualFold(name, "new"):
-			if name != "new" || seenNew || !arrayOrNull(value) {
-				return errors.New("new member is invalid")
-			}
-			seenNew = true
-		case strings.EqualFold(name, "deleted"):
-			if name != "deleted" || seenDeleted || !arrayOrNull(value) {
-				return errors.New("deleted member is invalid")
-			}
-			seenDeleted = true
-		}
-	}
-	last, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	if close, ok := last.(json.Delim); !ok || close != '}' || !seenNew || !seenDeleted {
-		return errors.New("required envelope members are missing")
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return errors.New("trailing JSON value")
-		}
-		return err
-	}
-	return nil
-}
-
-func arrayOrNull(value []byte) bool {
-	value = bytes.TrimSpace(value)
-	return len(value) > 0 && (value[0] == '[' || bytes.Equal(value, []byte("null")))
-}
-
-func decodeBatch(data *models.DecisionsStreamResponse, startup bool, requestStart time.Time) (Batch, error) {
-	batch := Batch{Startup: startup}
-	for i, decision := range data.Deleted {
-		if decision == nil || decision.ID <= 0 {
-			return Batch{}, fmt.Errorf("crowdsec deleted decision %d is invalid", i)
-		}
-		batch.Deleted = append(batch.Deleted, decision.ID)
-	}
-	for i, decision := range data.New {
-		converted, ok, err := convertDecision(decision, requestStart, !startup)
-		if err != nil {
-			return Batch{}, fmt.Errorf("crowdsec new decision %d is invalid", i)
-		}
-		if ok {
-			batch.New = append(batch.New, converted)
-		}
-	}
-	return batch, nil
 }
 
 func convertDecision(decision *models.Decision, requestStart time.Time, retainExpired bool) (Decision, bool, error) {
