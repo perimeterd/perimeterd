@@ -478,12 +478,7 @@ func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []
 	return fetched, nil
 }
 
-func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector policy.Selector) (Record, error) {
-	requestSource := selectorMetricSource(selector.Kind)
-	success := false
-	if r.observeRequest != nil {
-		defer func() { r.observeRequest(requestSource, success) }()
-	}
+func (r *Resolver) fetchAttempt(parent context.Context, cfg config.Config, selector policy.Selector) (Record, error) {
 	spec, err := DescribeSelector(cfg, selector)
 	if err != nil {
 		return Record{}, err
@@ -498,7 +493,7 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	case r.slots <- struct{}{}:
 		defer func() { <-r.slots }()
 	case <-ctx.Done():
-		return Record{}, ctx.Err()
+		return Record{}, retryableFetchFailure(ctx.Err(), ctx.Err())
 	}
 
 	text := selector.Kind == policy.IPList || selector.Kind == policy.Provider
@@ -572,25 +567,26 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		requestErr := fmt.Errorf("request: %w", err)
 		if text {
-			requestErr := classifyListRequestError(err)
+			requestErr = classifyListRequestError(err)
 			if selector.Kind == policy.Provider {
-				return Record{}, fmt.Errorf("%s request: %w", sourceLabel, requestErr)
+				requestErr = fmt.Errorf("%s request: %w", sourceLabel, requestErr)
 			}
-			return Record{}, requestErr
 		}
-		return Record{}, fmt.Errorf("request: %w", err)
+		return Record{}, retryableFetchFailure(requestErr, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if text {
-		if resp.StatusCode != http.StatusOK {
-			if selector.Kind == policy.Provider {
-				return Record{}, fmt.Errorf("%s: HTTP status %d", sourceLabel, resp.StatusCode)
-			}
-			return Record{}, fmt.Errorf("HTTP status %d", resp.StatusCode)
+	if (text && resp.StatusCode != http.StatusOK) || resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		statusErr := fmt.Errorf("HTTP status %d", resp.StatusCode)
+		if selector.Kind == policy.Provider {
+			statusErr = fmt.Errorf("%s: %w", sourceLabel, statusErr)
 		}
-	} else if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return Record{}, fmt.Errorf("HTTP status %d", resp.StatusCode)
+		switch resp.StatusCode {
+		case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			statusErr = &retryableFetchError{statusErr}
+		}
+		return Record{}, statusErr
 	}
 	var decoded io.Reader = resp.Body
 	if encoding := resp.Header.Get("Content-Encoding"); encoding != "" && !resp.Uncompressed {
@@ -599,17 +595,17 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		}
 		reader, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return Record{}, fmt.Errorf("decode gzip response: %w", err)
+			return Record{}, retryableFetchFailure(fmt.Errorf("decode gzip response: %w", err), err)
 		}
 		defer func() { _ = reader.Close() }()
 		decoded = reader
 	}
 	body, err := io.ReadAll(io.LimitReader(decoded, maxBodyBytes+1))
-	if err != nil {
-		return Record{}, fmt.Errorf("read response: %w", err)
-	}
 	if len(body) > maxBodyBytes {
 		return Record{}, fmt.Errorf("response exceeds %d-byte limit", maxBodyBytes)
+	}
+	if err != nil {
+		return Record{}, retryableFetchFailure(fmt.Errorf("read response: %w", err), err)
 	}
 	var record Record
 	if spec.APIVersion == csvFormatVersion {
@@ -625,7 +621,6 @@ func (r *Resolver) fetchOne(parent context.Context, cfg config.Config, selector 
 		return Record{}, err
 	}
 	record.Transport = binding
-	success = true
 	return record, nil
 }
 

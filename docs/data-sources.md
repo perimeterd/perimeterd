@@ -157,7 +157,8 @@ assignments cover all 249 supported ISO country codes exactly once.
    country/ASN selectors. Reject a configuration exceeding 512 unique expanded
    selectors before issuing requests.
 2. Fetch missing or stale selectors with at most four requests in flight and
-   the configured per-request timeout (`30s` by default).
+   the configured timeout per attempt (`30s` by default), including bounded
+   transient retries as described below.
 3. Cap each decoded HTTP response at 32 MiB. Crossing the limit fails that
    selector; the body is never partially accepted.
 4. Require a successful HTTP response, RIPEstat API status `ok`, and the
@@ -184,6 +185,22 @@ assignments cover all 249 supported ISO country codes exactly once.
 7. Validate each selector result completely, including query times, endpoint/API
    version, and all decoded prefix arrays. Assemble one immutable
    `PrefixSnapshot` referring to one complete manifest.
+
+RIPEstat, custom IP lists, and named-provider feeds make at most **three GET
+attempts** for temporary network failures, per-attempt timeouts, interrupted
+reads, and HTTP **408, 500, 502, 503, or 504**. Wait **1s**, then **2s**, before
+retrying. Each attempt gets the configured `request_timeout`; all attempts and
+waits remain subject to caller cancellation and the startup deadline. With the
+default timeout, a selector's HTTP budgets and retry waits can total 93 seconds,
+rather than a single 30-second attempt.
+
+Do not retry invalid data, oversized responses, certificate verification errors,
+or other HTTP statuses (including rate-limiting 429). Close the failed response
+and release its request slot before waiting; no partial body or prefix result
+is reused. Exhausting retries fails the selector and leaves the existing
+complete-snapshot/fallback rules unchanged. Retry counts/delays are internal
+constants, not new configuration fields; CrowdSec keeps its separate existing
+reconnect policy.
 
 The snapshot is all-or-nothing. A failed, truncated, malformed, mismatched, or
 partial response never becomes an empty valid selector. A candidate revision is
@@ -318,8 +335,8 @@ successfully; stale data cannot satisfy a newly introduced selector. On first
 start, with no active manifest, every required selector must succeed before new
 policy mutation or readiness. Snapshot age uses the oldest retrieval time among
 required selectors, never the manifest creation time, so reusing stale data
-cannot make it appear fresh. Report refresh failure and retry at the next
-normal schedule.
+cannot make it appear fresh. After bounded request retries are exhausted,
+report refresh failure and retry at the next normal schedule.
 
 ## Custom HTTP(S) IP lists
 
@@ -391,16 +408,17 @@ examples. Named providers remain plain text.
 ### HTTP transport
 
 Fetch with HTTP GET. Require a final HTTP 200 and a fully read, validated body;
-204, unsolicited 304, other statuses, transport errors, truncated reads, or
-timeouts fail resolution. Use the configured text or CSV parser regardless of
+transient failures use the [bounded static-source retries](#normative-resolution-steps).
+204, unsolicited 304, other non-retryable statuses, invalid data, or exhausted
+retries fail resolution. Use the configured text or CSV parser regardless of
 MIME type or filename extension; neither autodetects nor restricts the format.
 CSV requests advertise `Accept: text/csv, text/plain`; text requests use
 `Accept: text/plain`.
 
-Use the list's `request_timeout` for the entire fetch, including redirects and
-body reading. Enforce the existing 32 MiB decoded-response cap, including after
-decompression. Across static providers, at most four requests may be in flight;
-list workers do not get an additional independent concurrency allowance.
+Use the list's `request_timeout` for each complete attempt, including redirects
+and body reading. Enforce the existing 32 MiB decoded-response cap, including
+after decompression. Across static providers, at most four requests may be in
+flight; list workers do not get an additional independent concurrency allowance.
 Reject a candidate with more than 512 distinct required static selectors
 (expanded country/ASN selectors plus named list identities) before requests.
 
@@ -535,9 +553,10 @@ or a bundled classification database. The initial configuration exposes timing
 settings only; custom `ip_lists` remain available for alternate URLs or pinned
 revisions. Do not silently fail over to another origin or branch.
 
-The required file is the existence check: issue one bounded content GET per
-missing/due provider, not a preliminary HEAD request, repository listing,
-GitHub API lookup, `summary.json` catalog fetch, or metadata request. The
+The required file is the existence check: perform a bounded content GET fetch
+per missing/due provider, with the same transient retries as other static sources,
+not a preliminary HEAD request, repository listing, GitHub API lookup,
+`summary.json` catalog fetch, or metadata request. The
 repository and path template are fixed source configuration; provider names
 are not compiled-in membership. IDs not known when perimeterd was built must
 still resolve if a valid feed is now served at the mapped URL.
@@ -545,7 +564,7 @@ still resolve if a valid feed is now served at the mapped URL.
 Require a final HTTP 200 with a non-empty, fully validated body under the existing
 [text format](#text-format-and-validation) and [transport rules](#http-transport).
 Reuse UTF-8/IP/CIDR normalization, invalid-line rejection, TLS verification,
-redirect limits, HTTPS downgrade rejection, whole-request timeout, and the
+redirect limits, HTTPS downgrade rejection, per-attempt timeout, and the
 32 MiB decoded-body cap. Each distinct provider counts toward the shared
 512-selector cap and uses the same four-request allowance as other static
 sources. Fetch both address families and validate the whole file even when one

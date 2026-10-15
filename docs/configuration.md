@@ -143,17 +143,17 @@ and are always validated; only the selected backend is applied.
 | `attachments[].output_interfaces` | list | `[]` | Output matches |
 | `attachments[].original_destination` | bool | `false` | Pre-DNAT ports |
 | `geo.refresh_interval` | duration | `24h` | Positive |
-| `geo.request_timeout` | duration | `30s` | Positive, per request |
+| `geo.request_timeout` | duration | `30s` | Positive, per request attempt |
 | `geo.refresh_jitter` | duration | `10m` | Positive upper delay |
 | `groups` | map | `{}` | Lowercase name to countries |
 | `ip_lists` | map | `{}` | List name to HTTP(S) text or explicitly configured CSV source |
 | `ip_lists.<name>.url` | URL | — | Required absolute HTTP(S) URL |
 | `ip_lists.<name>.refresh_interval` | duration | `24h` | Positive per-list interval |
-| `ip_lists.<name>.request_timeout` | duration | `30s` | Positive timeout for a complete fetch |
+| `ip_lists.<name>.request_timeout` | duration | `30s` | Positive timeout for each complete fetch attempt |
 | `ip_lists.<name>.transport` | map | direct | Optional [transport binding](#optional-openziti-configuration) |
 | `ip_lists.<name>.csv` | map | absent (plain text) | Optional [CSV column selection and numeric filter](#csv-column-selection) |
 | `providers.refresh_interval` | duration | `24h` | Positive interval shared by named-provider sources |
-| `providers.request_timeout` | duration | `30s` | Positive timeout for a complete provider fetch |
+| `providers.request_timeout` | duration | `30s` | Positive timeout for each complete provider-fetch attempt |
 | `policies` | list | `[]` | Policy declarations, ordered by direction and priority |
 | `crowdsec.enabled` | bool | `false` | Enable the supported LAPI stream integration |
 | `crowdsec.lapi_url` | URL | `http://127.0.0.1:8080` | Absolute HTTP(S) LAPI URL |
@@ -488,8 +488,11 @@ application authority and HTTPS verification. [Transport rules](data-sources.md#
 and [saved cache identity](data-sources.md#transport-identity-and-saved-evidence)
 define routing and persisted evidence. There is no `ziti://` URL,
 implicit hostname-to-service mapping, TLS verification bypass, or replacement
-for `crowdsec.api_key_file`. Existing request/refresh timeouts remain authoritative;
-there is no independent retry budget that can extend them.
+for `crowdsec.api_key_file`. Each static-source attempt keeps its configured
+request timeout; [bounded retries](data-sources.md#normative-resolution-steps)
+may repeat a transiently failed attempt but never extend caller cancellation
+or the startup deadline. Refresh scheduling and CrowdSec's separate request
+budgets remain unchanged.
 
 ### Mixed-transport example
 
