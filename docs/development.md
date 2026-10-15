@@ -263,6 +263,18 @@ They cover real reload traffic, stable witness identity, absent-table
 reconstruction, missing-witness refusal and explicit old-state rejection by
 both `run` and `cleanup`, before and after cleanup.
 
+`TestE2ECrowdSecNFTInventoryCapacity` runs supported and over-budget fixtures
+in separate disposable namespaces. The supported 340,000-static /
+319,000-dynamic prefix combination must be admitted, completely inspected,
+and recovered by a fresh backend with nil dynamic activation. Packet probes
+verify static IPv6 and dynamic IPv4 enforcement after recovery. The
+460,000-static / 319,000-dynamic fixture first proves that each payload fits
+independently, then requires a combined-inventory `CapacityError` whose scope
+is `inventory` and required bytes exceed its limit. Rejection must preserve
+prior enforcement and permit a later admissible replacement, renewal,
+dynamic removal, and owned cleanup. These are native capacity/recovery
+boundaries, not assumptions about an obsolete output ceiling.
+
 Internal durable records use version 2 while the configuration schema remains
 version 1. There is no legacy layout migration or old-binary fixture requirement.
 The state-version regression supplies a checksum-valid version-1 owner envelope

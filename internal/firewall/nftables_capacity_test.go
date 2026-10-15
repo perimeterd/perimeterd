@@ -177,6 +177,16 @@ func TestNFTCapacityIncludesRetainedLiveLeases(t *testing.T) {
 	if err := capacity.observe(t.Context(), target.Table, inventory); err != nil {
 		t.Fatal(err)
 	}
+	// Existing native JSON plus one element-command allowance must fit without
+	// applying the command-to-inventory expansion factor a second time.
+	observedBudget := before + int64(len(encoded)) + 1024
+	if err := capacity.check(maxNFTInput, observedBudget); err != nil {
+		t.Fatalf("already-native leases charged representation expansion twice: %v", err)
+	}
+	var boundary *CapacityError
+	if err := capacity.check(maxNFTInput, observedBudget-1); !errors.As(err, &boundary) || boundary.Scope != "inventory" {
+		t.Fatalf("observed inventory exceeded its finite budget: %v", err)
+	}
 	var exceeded *CapacityError
 	if err := capacity.check(maxNFTInput, before); !errors.As(err, &exceeded) || exceeded.DynamicGenerations != 2 {
 		t.Fatalf("old live authority was omitted from transition: %v", err)

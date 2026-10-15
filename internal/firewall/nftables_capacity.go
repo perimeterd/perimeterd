@@ -299,17 +299,20 @@ func (c *nftCapacity) observe(ctx context.Context, tableName string, inventory *
 func (t *nftTableCapacity) estimate() int64 {
 	encoded := int64(len(`{"nftables":[]}`))
 	commands := int64(len(t.objects))
+	var elements int64
 	for _, object := range t.objects {
 		encoded += object.bytes
 		if object.dynamic {
-			size := max(object.projectedBytes, object.observedBytes)
+			// Projected command JSON needs representation headroom. Observed
+			// elements are already native inventory JSON: charge them once.
+			size := max(2*object.projectedBytes, object.observedBytes)
 			if size != 0 {
-				encoded += size
+				elements += size
 				commands++
 			}
 		}
 	}
-	return 2*encoded + 1024*commands + 4096
+	return 2*encoded + elements + 1024*commands + 4096
 }
 
 func (t *nftTableCapacity) capacityError(scope string, required, limit int64) *CapacityError {

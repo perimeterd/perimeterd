@@ -213,7 +213,10 @@ count once; genuinely distinct generations count separately even when their
 prefixes happen to match. Conflicting immutable metadata under one identity
 fails closed. Static and dynamic identities are accounted independently.
 Inspection also accounts for live timed elements, which are deliberately not
-serialized in durable targets.
+serialized in durable targets. Already-native element JSON is charged at its
+observed size; only projected command JSON receives representation headroom.
+An atomic dynamic replacement reserves the larger normalized old/new cost,
+not their sum.
 
 The coordinated internal nft limits are finite and not YAML settings:
 
