@@ -28,6 +28,7 @@ type startupNotifier struct {
 	done     chan struct{}
 	errMu    sync.Mutex
 	err      error
+	status   string
 	once     sync.Once
 }
 
@@ -40,6 +41,7 @@ func newStartupNotifier(fn notifyFunc, deadline time.Time) *startupNotifier {
 		deadline: deadline,
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
+		status:   "starting",
 	}
 	go n.run()
 	return n
@@ -47,20 +49,22 @@ func newStartupNotifier(fn notifyFunc, deadline time.Time) *startupNotifier {
 
 func (n *startupNotifier) run() {
 	defer close(n.done)
-	n.sendExtension("starting")
+	n.sendExtension()
 	ticker := time.NewTicker(notifyExtendInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			n.sendExtension("starting")
+			n.sendExtension()
 		case <-n.stop:
 			return
 		}
 	}
 }
 
-func (n *startupNotifier) sendExtension(status string) {
+func (n *startupNotifier) sendExtension() {
+	n.errMu.Lock()
+	defer n.errMu.Unlock()
 	remaining := time.Until(n.deadline)
 	if remaining <= 0 {
 		return
@@ -70,13 +74,22 @@ func (n *startupNotifier) sendExtension(status string) {
 	}
 	// EXTEND_TIMEOUT_USEC is an integer number of microseconds. Round down so
 	// the advertised extension never exceeds the actual startup deadline.
-	message := fmt.Sprintf("EXTEND_TIMEOUT_USEC=%d\nSTATUS=%s", remaining.Microseconds(), status)
+	message := fmt.Sprintf("EXTEND_TIMEOUT_USEC=%d\nSTATUS=%s", remaining.Microseconds(), n.status)
 	if err := n.fn(message); err != nil {
-		n.errMu.Lock()
 		if n.err == nil {
 			n.err = fmt.Errorf("systemd notification: %w", err)
 		}
-		n.errMu.Unlock()
+	}
+}
+
+// Status publishes progress immediately and retains it for subsequent extensions.
+// Callers supply only fixed local diagnostics, never external error text.
+func (n *startupNotifier) Status(status string) {
+	n.errMu.Lock()
+	defer n.errMu.Unlock()
+	n.status = status
+	if err := n.fn("STATUS=" + status); err != nil && n.err == nil {
+		n.err = fmt.Errorf("systemd notification: %w", err)
 	}
 }
 

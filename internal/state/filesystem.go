@@ -19,10 +19,10 @@ func readOptional(path string) (data []byte, retErr error) {
 		return nil, err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("unsafe record %q", path)
+		return nil, validationError(fmt.Errorf("unsafe record %q", path))
 	}
 	if info.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("record %q has unsafe permissions", path)
+		return nil, validationError(fmt.Errorf("record %q has unsafe permissions", path))
 	}
 	file, err := os.OpenFile(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0) // #nosec G304 -- path is a state record selected by the store; O_NOFOLLOW prevents symlink traversal.
 	if err != nil {
@@ -40,7 +40,7 @@ func readOptional(path string) (data []byte, retErr error) {
 		return nil, err
 	}
 	if len(data) > maxRecordBytes {
-		return nil, errors.New("state: record is oversized")
+		return nil, validationError(errors.New("state: record is oversized"))
 	}
 	return data, nil
 }
@@ -51,7 +51,7 @@ func readRequired(path string) ([]byte, error) {
 		return nil, err
 	}
 	if data == nil {
-		return nil, os.ErrNotExist
+		return nil, validationError(os.ErrNotExist)
 	}
 	return data, nil
 }

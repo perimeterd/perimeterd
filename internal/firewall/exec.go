@@ -19,26 +19,42 @@ func executeNative(ctx context.Context, command string, args []string, input []b
 	cmd.Stdin = bytes.NewReader(input)
 	stdout, stderr := boundedBuffer{limit: outputLimit}, boundedBuffer{limit: outputLimit}
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+	runErr := cmd.Run()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if stdout.overflow != nil {
+		return nil, stdout.overflow
+	}
+	if stderr.overflow != nil {
+		return nil, stderr.overflow
+	}
+	if runErr != nil {
 		if message := strings.TrimSpace(stderr.String()); message != "" {
-			return nil, fmt.Errorf("%s %s: %w: %s", command, strings.Join(args, " "), err, message)
+			return nil, fmt.Errorf("%s %s: %w: %s", command, strings.Join(args, " "), runErr, message)
 		}
-		return nil, fmt.Errorf("%s %s: %w", command, strings.Join(args, " "), err)
+		return nil, fmt.Errorf("%s %s: %w", command, strings.Join(args, " "), runErr)
 	}
 	return stdout.Bytes(), nil
 }
 
+type nativeOutputLimitError struct{ required, limit int }
+
+func (e *nativeOutputLimitError) Error() string {
+	return fmt.Sprintf("command output exceeds %d bytes", e.limit)
+}
+func (*nativeOutputLimitError) RecoveryRetryable() bool { return false }
+
 type boundedBuffer struct {
-	buffer bytes.Buffer
-	limit  int
+	buffer   bytes.Buffer
+	limit    int
+	overflow *nativeOutputLimitError
 }
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
 	if len(value) > b.limit-b.buffer.Len() {
-		return 0, fmt.Errorf("command output exceeds %d bytes", b.limit)
+		b.overflow = &nativeOutputLimitError{required: b.buffer.Len() + len(value), limit: b.limit}
+		return 0, b.overflow
 	}
 	return b.buffer.Write(value)
 }

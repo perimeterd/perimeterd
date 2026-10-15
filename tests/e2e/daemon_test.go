@@ -89,7 +89,13 @@ func startDaemon(t *testing.T, configPath, table string) *daemonProcess {
 
 func startDaemonProcess(t *testing.T, configPath, readinessDescription string, enforcementReady func() bool) *daemonProcess {
 	t.Helper()
-	binary := e2eBinary(t)
+	// #nosec G204 -- the validated E2E binary is launched only by this test harness.
+	cmd := exec.Command(e2eBinary(t), "run", "--config", configPath)
+	return startDaemonCommand(t, cmd, readinessDescription, enforcementReady, 45*time.Second)
+}
+
+func startDaemonCommand(t *testing.T, cmd *exec.Cmd, readinessDescription string, enforcementReady func() bool, startupBound time.Duration) *daemonProcess {
+	t.Helper()
 	output := new(lockedBuffer)
 	notifyPath := filepath.Join(t.TempDir(), "ready.sock")
 	notify, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: notifyPath, Net: "unixgram"})
@@ -100,9 +106,7 @@ func startDaemonProcess(t *testing.T, configPath, readinessDescription string, e
 		_ = notify.Close()
 		_ = os.Remove(notifyPath)
 	})
-	// #nosec G204 -- the validated E2E binary is launched only by this test harness.
-	cmd := exec.Command(binary, "run", "--config", configPath)
-	cmd.Env = append(os.Environ(), "NOTIFY_SOCKET="+notifyPath)
+	cmd.Env = append(cmd.Environ(), "NOTIFY_SOCKET="+notifyPath)
 	cmd.Stdout = output
 	cmd.Stderr = output
 	if err := cmd.Start(); err != nil {
@@ -117,7 +121,7 @@ func startDaemonProcess(t *testing.T, configPath, readinessDescription string, e
 		close(d.done)
 	}()
 	t.Cleanup(func() { d.stop(t) })
-	deadline := time.Now().Add(45 * time.Second)
+	deadline := time.Now().Add(startupBound)
 	ready := false
 	for time.Now().Before(deadline) {
 		select {

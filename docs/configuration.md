@@ -1059,6 +1059,14 @@ non-empty target, and stages then applies a backend reconcile. Reload repeats
 this full staging path; initial readiness additionally requires the decision
 projection to be applied and its durable active revision committed.
 
+Recovery uses typed permanent/transient failures before current YAML is loaded:
+deterministic capacity or ownership/state validation failures exit promptly;
+unknown transient failures retry only within the original bounded startup
+deadline. See [operations](operations.md#recovery-before-validation) for early
+diagnostics and [backend capacity](firewall-backends.md#capacity-and-complete-inspection)
+for the finite internal nft limits. These changes add no configuration fields
+and require no durable-state migration.
+
 The runtime supports RIPEstat-backed country/ASN policy and CrowdSec ingress
 bans on both nftables and iptables/ipset. CrowdSec enablement additionally
 requires the operator-verified remote deployment prerequisite. A configuration with

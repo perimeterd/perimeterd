@@ -99,7 +99,7 @@ func (s *Store) read() (View, error) {
 		return View{}, err
 	}
 	if owner.Owner != s.owner {
-		return View{}, errors.New("state: owner identity changed")
+		return View{}, validationError(errors.New("state: owner identity changed"))
 	}
 	view := View{Owner: s.owner, Revisions: make(map[string]*Revision)}
 	activeBytes, err := readOptional(filepath.Join(s.dir, "active.json"))
@@ -156,26 +156,26 @@ func (s *Store) read() (View, error) {
 			if journal.Previous != "" {
 				revision := view.Revisions[journal.Previous]
 				if revision == nil || revision.Manifest != journal.PreviousManifest {
-					return View{}, errors.New("state: apply journal previous manifest mismatch")
+					return View{}, validationError(errors.New("state: apply journal previous manifest mismatch"))
 				}
 			}
 			if journal.Candidate != "" {
 				revision := view.Revisions[journal.Candidate]
 				if revision == nil || revision.Manifest != journal.CandidateManifest {
-					return View{}, errors.New("state: apply journal candidate manifest mismatch")
+					return View{}, validationError(errors.New("state: apply journal candidate manifest mismatch"))
 				}
 			}
 		}
 		if journal.Operation == "apply" && journal.Previous != "" && view.Active == nil {
-			return View{}, errors.New("state: apply journal has previous revision but active record is absent")
+			return View{}, validationError(errors.New("state: apply journal has previous revision but active record is absent"))
 		}
 		for _, selection := range journal.FamilySelections {
 			if !recordedFamilySelection(view, selection) {
-				return View{}, errors.New("state: family selection names an unrecorded generation")
+				return View{}, validationError(errors.New("state: family selection names an unrecorded generation"))
 			}
 		}
 		if journal.Operation == "apply" && view.Active != nil && view.Active.ID != journal.Previous && view.Active.ID != journal.Candidate {
-			return View{}, errors.New("state: active record does not match apply journal")
+			return View{}, validationError(errors.New("state: active record does not match apply journal"))
 		}
 	}
 	return view, nil
@@ -591,7 +591,7 @@ func (s *Store) ensureRevisionMatches(revision *Revision) error {
 		return err
 	}
 	if !bytes.Equal(storedBytes, expected) {
-		return fmt.Errorf("state: immutable revision %s differs", revision.ID)
+		return validationError(fmt.Errorf("state: immutable revision %s differs", revision.ID))
 	}
 	if _, err := s.readRevision(revision.ID); err != nil {
 		return err
@@ -614,7 +614,7 @@ func (s *Store) writeImmutableRevision(revision *Revision) error {
 			return err
 		}
 		if !bytes.Equal(existing, data) {
-			return fmt.Errorf("state: immutable revision %s already differs", revision.ID)
+			return validationError(fmt.Errorf("state: immutable revision %s already differs", revision.ID))
 		}
 		return syncRegular(path)
 	}
@@ -634,7 +634,7 @@ func (s *Store) readRevision(id string) (*Revision, error) {
 		return nil, err
 	}
 	if revision.ID != id {
-		return nil, errors.New("state: revision filename and identity differ")
+		return nil, validationError(errors.New("state: revision filename and identity differ"))
 	}
 	if err := s.validateRevision(&revision); err != nil {
 		return nil, err

@@ -597,6 +597,13 @@ The journal's referenced revisions retain the full ownership and target metadata
 including nftables hook definitions when priority changes. Family progress helps
 recovery inspect interrupted work; it is not the commit point.
 
+Restart reconciliation may legitimately prepare the active revision as both
+previous and candidate, with the same manifest and one revision-map entry.
+That is an idempotent recovery shape, not evidence of an unfinished distinct
+generation. nft capacity checks count its native objects once; true old/new
+static and dynamic identities remain independently accounted for. No state
+format migration or journal deletion is needed for this case.
+
 Source-cache loading and pruning share one manifest decoder for raw bindings,
 canonical wire decoding, and semantic validation. Filesystem storage separately
 enforces bounded reads, content-address checks, and durable publication barriers.
@@ -676,6 +683,18 @@ An explicit cleanup intent instead resumes deletion of all recorded owned
 targets; it never restores a policy being intentionally removed. Remove its
 active record only after owned artifacts are gone. Partial cleanup retains
 the journal and metadata for the next invocation.
+
+Typed capacity, target/ownership validation, and durable-evidence failures are
+permanent; unchanged recovery retries cannot repair them. Wrapped or joined
+causes preserve that classification. Missing executables/required files and
+permission failures also exit promptly. Unknown transient failures, including
+native-command child timeouts while the recovery context is live, retain bounded
+exponential retries under the original startup deadline. Lifecycle cancellation
+or deadline expiry admits no further attempt. Neither failure class discards
+the active revision, prepared journal, manifests, or required native objects.
+Early safe logging and systemd phase/failure status are available before YAML
+or control-socket publication; [operations](operations.md#recovery-before-validation)
+owns the diagnostic and notification-lifetime contract.
 
 ### Internal state format
 

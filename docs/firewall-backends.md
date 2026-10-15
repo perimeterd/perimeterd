@@ -14,6 +14,7 @@ publication, recovery, and the cross-target migration algorithm;
 - [nftables](#nftables)
   - [Same-table priority reload](#same-table-priority-reload)
   - [Static generations and dynamic updates](#static-generations-and-dynamic-updates)
+  - [Capacity and complete inspection](#capacity-and-complete-inspection)
 - [iptables and ipset](#iptables-and-ipset)
   - [Per-family commit and rollback](#per-family-commit-and-rollback)
   - [ipset prefix representation](#ipset-prefix-representation)
@@ -189,9 +190,55 @@ large-list renewal. Timed elements use integer-second native timeouts and
 remain bounded after daemon shutdown. This native replacement does not change
 the incremental LAPI stream protocol.
 
+An explicit reload still stages a full authoritative CrowdSec synchronization.
+For direct-LAPI nft reloads with unchanged CrowdSec settings, canonical endpoint,
+and captured API key, the replacement client may reuse the existing dynamic
+containers. Unchanged static content also retains its static generation.
+Container reuse does not reuse the old client epoch or skip synchronization:
+the selected new projection replaces the contents, and failed activation
+restores the previous authority's unexpired projection without rebasing leases.
+Changed credentials/settings, OpenZiti reloads, and non-nft backends retain
+distinct-container replacement semantics.
+
 Changing the table name is a target migration, not an in-place update: build
 and apply the new table, commit it, then retire recorded old ownership. The
 old table is never removed first.
+
+### Capacity and complete inspection
+
+Capacity admission counts the union of retained native objects per table,
+owner, object kind, name, and rule role, not the number of target arguments.
+Previous and candidate references to the same static or dynamic generation
+count once; genuinely distinct generations count separately even when their
+prefixes happen to match. Conflicting immutable metadata under one identity
+fails closed. Static and dynamic identities are accounted independently.
+Inspection also accounts for live timed elements, which are deliberately not
+serialized in durable targets.
+
+The coordinated internal nft limits are finite and not YAML settings:
+
+| Boundary | Limit | Purpose |
+| --- | --- | --- |
+| Encoded mutation input | 32 MiB (33,554,432 bytes) | Bound each generated native batch. |
+| Per-table inventory budget | 96 MiB (100,663,296 bytes) | Admit the conservative unique-object estimate and bound the observed inventory. |
+| Captured native output | 128 MiB (134,217,728 bytes) | Bound complete inspection output, including representation overhead. |
+
+The estimator encodes only small command metadata and counts canonical prefix
+representations in cancellation-aware chunks; it does not marshal full batches
+or allocate element maps to estimate them. These byte limits are not daemon,
+native-child, or kernel RSS guarantees. iptables/ipset limits are unchanged.
+
+Inspection decodes one native object at a time rather than retaining multiple
+complete JSON envelopes. It still requires a complete, bounded, structurally
+valid inventory and all existing ownership/content/reference checks. Truncation,
+overflow, malformed JSON, missing witnesses, and foreign objects never authorize
+partial-inventory cleanup or mutation.
+
+Capacity failures carry a typed cause with safe numeric required/limit bytes
+and retained static/dynamic generation counts where known. An unchanged retry
+cannot repair them; see [startup recovery diagnostics](operations.md#recovery-before-validation).
+In particular, a retained-generation capacity error does not prove that stale
+kernel objects exist.
 
 ## iptables and ipset
 

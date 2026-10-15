@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	maxNFTOutput          = 64 << 20
+	maxNFTOutput          = 128 << 20
 	maxNFTInput           = 32 << 20
-	maxNFTInventoryBudget = 48 << 20
+	maxNFTInventoryBudget = 96 << 20
 )
 
 type nftExecutor func(context.Context, []string, []byte) ([]byte, error)
@@ -39,46 +39,10 @@ func nativeNFTExecutor(ctx context.Context, args []string, input []byte) ([]byte
 
 func validateNFTTarget(target *Target) error {
 	if target != nil && target.IPTables != nil {
-		return errors.New("nft backend: iptables target is not supported")
+		return &ValidationError{Err: errors.New("nft backend: iptables target is not supported")}
 	}
-	return ValidateTarget(target)
-}
-
-// validateNFTCapacity bounds the complete recoverable state, not just an
-// incremental switch. Native JSON adds handles, counter values and whitespace;
-// allow twice the encoded full installation plus 1 KiB per object for that
-// expansion, with another 16 MiB of capture headroom. Prefixes can become host
-// strings or merged ranges, neither larger than this allowance. Sum both full
-// generations in each table because they coexist until durable retirement.
-// The projection is used only for candidate admission/capacity accounting.
-func validateNFTCapacity(previous, candidate *Target, dynamic *DynamicState) error {
-	budgets := make(map[string]int)
-	for index, target := range []*Target{previous, candidate} {
-		if target == nil {
-			continue
-		}
-		if err := validateNFTTarget(target); err != nil {
-			return err
-		}
-		var projection *DynamicState
-		if index == 1 {
-			projection = dynamic
-		}
-		batch, err := commandBatch(target, nil, projection)
-		if err != nil {
-			return err
-		}
-		data, err := json.Marshal(batch)
-		if err != nil {
-			return fmt.Errorf("nft backend: encode capacity estimate: %w", err)
-		}
-		if len(data) > maxNFTInput {
-			return errors.New("nft backend: complete target exceeds input limit")
-		}
-		budgets[target.Table] += nftInspectionBudget(len(data), len(batch.Nftables))
-		if budgets[target.Table] > maxNFTInventoryBudget {
-			return errors.New("nft backend: retained generations exceed inspection capacity")
-		}
+	if err := ValidateTarget(target); err != nil {
+		return &ValidationError{Err: err}
 	}
 	return nil
 }
@@ -165,7 +129,12 @@ func (n *NFT) run(ctx context.Context, args []string, input []byte) ([]byte, err
 	}
 	commandCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	return n.exec(commandCtx, args, input)
+	output, err := n.exec(commandCtx, args, input)
+	var overflow *nativeOutputLimitError
+	if errors.As(err, &overflow) {
+		return nil, &CapacityError{Scope: "output", RequiredBytes: int64(overflow.required), LimitBytes: int64(overflow.limit)}
+	}
+	return output, err
 }
 
 func (n *NFT) listTables(ctx context.Context) ([]nftObject, error) {
@@ -173,7 +142,7 @@ func (n *NFT) listTables(ctx context.Context) ([]nftObject, error) {
 	if err != nil {
 		return nil, err
 	}
-	return decodeNFTObjects(data)
+	return decodeNFTObjects(ctx, data, maxNFTOutput)
 }
 
 func (n *NFT) listTable(ctx context.Context, table string) ([]nftObject, int, error) {
@@ -188,7 +157,7 @@ func (n *NFT) listTable(ctx context.Context, table string) ([]nftObject, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	objects, err := decodeNFTObjects(data)
+	objects, err := decodeNFTObjects(ctx, data, maxNFTOutput)
 	return objects, len(data), err
 }
 
@@ -271,41 +240,54 @@ func (n *NFT) inspect(ctx context.Context, table string, targets ...*Target) (*n
 	return inventory, nil
 }
 
-func decodeNFTObjects(data []byte) ([]nftObject, error) {
-	if len(data) == 0 || len(data) > maxNFTOutput {
-		return nil, errors.New("nft backend: empty or oversized JSON output")
+// Decode one native object at a time. Capture remains bounded and complete, but
+// no RawMessage copy of the entire envelope or nftables array is retained.
+func decodeNFTObjects(ctx context.Context, data []byte, limit int) (objects []nftObject, resultErr error) {
+	defer func() {
+		if resultErr == nil || ctx.Err() != nil {
+			return
+		}
+		var capacity *CapacityError
+		if !errors.As(resultErr, &capacity) {
+			resultErr = &ValidationError{Err: resultErr}
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(data) > limit {
+		return nil, &CapacityError{Scope: "output", RequiredBytes: int64(len(data)), LimitBytes: int64(limit)}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
-	var envelopeMap map[string]json.RawMessage
-	if err := decoder.Decode(&envelopeMap); err != nil {
-		return nil, fmt.Errorf("nft backend: decode JSON: %w", err)
+	first, err := decoder.Token()
+	if err != nil || first != json.Delim('{') {
+		return nil, errors.New("nft backend: invalid JSON inventory envelope")
 	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return nil, errors.New("nft backend: trailing JSON")
-	}
-	raw, ok := envelopeMap["nftables"]
-	if !ok || len(envelopeMap) != 1 {
+	key, err := decoder.Token()
+	if err != nil || key != "nftables" {
 		return nil, errors.New("nft backend: missing or unknown top-level property")
 	}
-	var envelope []map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, fmt.Errorf("nft backend: nftables is not an array: %w", err)
+	first, err = decoder.Token()
+	if err != nil || first != json.Delim('[') {
+		return nil, errors.New("nft backend: nftables is not an array")
 	}
-	objects := make([]nftObject, 0, len(envelope))
-	for _, item := range envelope {
-		if len(item) == 0 {
-			return nil, errors.New("nft backend: empty JSON object")
+	for decoder.More() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var item map[string]json.RawMessage
+		if err := decoder.Decode(&item); err != nil {
+			return nil, fmt.Errorf("nft backend: decode JSON object: %w", err)
+		}
+		if len(item) != 1 {
+			return nil, errors.New("nft backend: empty or ambiguous JSON object")
 		}
 		if raw, ok := item["metainfo"]; ok {
-			if len(item) != 1 || len(raw) == 0 {
+			if len(raw) == 0 {
 				return nil, errors.New("nft backend: malformed metainfo")
 			}
 			continue
-		}
-		if len(item) != 1 {
-			return nil, errors.New("nft backend: ambiguous JSON object")
 		}
 		for kind, raw := range item {
 			object, err := decodeNFTObject(kind, raw)
@@ -314,6 +296,20 @@ func decodeNFTObjects(data []byte) ([]nftObject, error) {
 			}
 			objects = append(objects, object)
 		}
+	}
+	last, err := decoder.Token()
+	if err != nil || last != json.Delim(']') {
+		return nil, errors.New("nft backend: incomplete JSON inventory")
+	}
+	last, err = decoder.Token()
+	if err != nil || last != json.Delim('}') {
+		return nil, errors.New("nft backend: duplicate or unknown top-level property")
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return nil, errors.New("nft backend: trailing JSON")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return objects, nil
 }
@@ -522,7 +518,12 @@ func dynamicSetCommands(target *Target, family policy.Family, observed nftObject
 	return commands, nil
 }
 
-func validateInventory(inventory *nftInventory, targets ...*Target) error {
+func validateInventory(inventory *nftInventory, targets ...*Target) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			resultErr = &ValidationError{Err: resultErr}
+		}
+	}()
 	if inventory == nil || !inventory.present {
 		return nil
 	}
@@ -763,7 +764,7 @@ func (n *NFT) readWitness(ctx context.Context, target *Target) error {
 	if err != nil {
 		return fmt.Errorf("nft backend: ownership witness read-back: %w", err)
 	}
-	objects, err := decodeNFTObjects(data)
+	objects, err := decodeNFTObjects(ctx, data, maxNFTOutput)
 	if err != nil {
 		return err
 	}
@@ -801,7 +802,8 @@ func (n *NFT) Preflight(ctx context.Context, previous, candidate *Target, dynami
 	if previous == nil && candidate == nil {
 		return n.probe(ctx)
 	}
-	if err := validateNFTCapacity(previous, candidate, dynamic); err != nil {
+	capacity, err := validateNFTCapacity(ctx, previous, candidate, dynamic)
+	if err != nil {
 		return err
 	}
 	if err := n.probe(ctx); err != nil {
@@ -829,7 +831,11 @@ func (n *NFT) Preflight(ctx context.Context, previous, candidate *Target, dynami
 			continue
 		}
 		seen[target.Table] = struct{}{}
-		if _, err := n.inspect(ctx, target.Table, previous); err != nil {
+		inventory, err := n.inspect(ctx, target.Table, previous)
+		if err != nil {
+			return err
+		}
+		if err := capacity.observe(ctx, target.Table, inventory); err != nil {
 			return err
 		}
 	}
@@ -845,7 +851,8 @@ func (n *NFT) Apply(ctx context.Context, previous, candidate *Target, dynamic *D
 	if previous == nil && candidate == nil {
 		return n.probe(ctx)
 	}
-	if err := validateNFTCapacity(previous, candidate, dynamic); err != nil {
+	capacity, err := validateNFTCapacity(ctx, previous, candidate, dynamic)
+	if err != nil {
 		return err
 	}
 	if candidate == nil {
@@ -859,6 +866,9 @@ func (n *NFT) Apply(ctx context.Context, previous, candidate *Target, dynamic *D
 		if !inventory.present {
 			return nil
 		}
+		if err := capacity.observe(ctx, previous.Table, inventory); err != nil {
+			return err
+		}
 		var batch nftBatch
 		for _, direction := range []policy.Direction{policy.Ingress, policy.Egress} {
 			name := baseChainName(previous, direction)
@@ -870,6 +880,9 @@ func (n *NFT) Apply(ctx context.Context, previous, candidate *Target, dynamic *D
 	}
 	inventory, err := n.inspect(ctx, candidate.Table, previous, candidate)
 	if err != nil {
+		return err
+	}
+	if err := capacity.observe(ctx, candidate.Table, inventory); err != nil {
 		return err
 	}
 	batch, err := commandBatch(candidate, inventory, dynamic)
@@ -891,7 +904,7 @@ func encodeNFTBatch(batch nftBatch) ([]byte, error) {
 		return nil, fmt.Errorf("nft backend: encode batch: %w", err)
 	}
 	if len(data) > maxNFTInput {
-		return nil, errors.New("nft backend: batch exceeds input limit")
+		return nil, &CapacityError{Scope: "input", RequiredBytes: int64(len(data)), LimitBytes: maxNFTInput}
 	}
 	return data, nil
 }
@@ -963,8 +976,9 @@ func (n *NFT) UpdateDynamic(ctx context.Context, target *Target, desired []polic
 	if err != nil {
 		return err
 	}
-	if retainedBytes+nftInspectionBudget(len(data), len(batch.Nftables)) > maxNFTInventoryBudget {
-		return errors.New("nft backend: combined static and dynamic contents exceed inspection capacity")
+	required := int64(retainedBytes) + int64(nftInspectionBudget(len(data), len(batch.Nftables)))
+	if required > maxNFTInventoryBudget {
+		return &CapacityError{Scope: "inventory", RequiredBytes: required, LimitBytes: maxNFTInventoryBudget, StaticGenerations: 1, DynamicGenerations: 1}
 	}
 	_, err = n.run(ctx, []string{"-j", "-f", "-"}, data)
 	return err
@@ -974,10 +988,12 @@ func (n *NFT) UpdateDynamic(ctx context.Context, target *Target, desired []polic
 // migrated table is deleted only after its complete ownership inventory was
 // validated.
 func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
-	for _, target := range []*Target{previous, candidate} {
-		if err := validateNFTTarget(target); err != nil {
-			return err
-		}
+	capacity, err := collectNFTCapacity(ctx, previous, candidate)
+	if err != nil {
+		return err
+	}
+	if err := capacity.check(maxNFTInput, maxNFTInventoryBudget); err != nil {
+		return err
 	}
 	// A nil candidate is the committed empty-state retirement. A nil previous
 	// means a first installation has no obsolete ownership and must be kept.
@@ -988,7 +1004,7 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 		return nil
 	}
 	if candidate == nil {
-		return n.retireSingle(ctx, previous)
+		return n.retireSingle(ctx, previous, capacity)
 	}
 	if previous.Table != candidate.Table {
 		inventory, err := n.inspect(ctx, previous.Table, previous)
@@ -997,6 +1013,9 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 		}
 		if !inventory.present {
 			return nil
+		}
+		if err := capacity.observe(ctx, previous.Table, inventory); err != nil {
+			return err
 		}
 		if n.retirement != nil && n.retirement.enabled() {
 			values, snapshotErr := nftCounterSnapshots(previous, inventory, previous)
@@ -1010,6 +1029,9 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 	}
 	if !inventory.present {
 		return nil
+	}
+	if err := capacity.observe(ctx, previous.Table, inventory); err != nil {
+		return err
 	}
 	var batch nftBatch
 	candidateChains, candidateSets := make(map[string]struct{}), make(map[string]struct{})
@@ -1083,7 +1105,7 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 	return n.applyBatch(ctx, batch)
 }
 
-func (n *NFT) retireSingle(ctx context.Context, target *Target) error {
+func (n *NFT) retireSingle(ctx context.Context, target *Target, capacity *nftCapacity) error {
 	if target == nil {
 		return nil
 	}
@@ -1093,6 +1115,9 @@ func (n *NFT) retireSingle(ctx context.Context, target *Target) error {
 	}
 	if !inventory.present {
 		return nil
+	}
+	if err := capacity.observe(ctx, target.Table, inventory); err != nil {
+		return err
 	}
 	if n.retirement != nil && n.retirement.enabled() {
 		values, snapshotErr := nftCounterSnapshots(target, inventory, target)
@@ -1107,13 +1132,17 @@ func (n *NFT) Cleanup(ctx context.Context, targets []*Target) error {
 	if len(targets) == 0 {
 		return nil
 	}
+	capacity, err := collectNFTCapacity(ctx, targets...)
+	if err != nil {
+		return err
+	}
+	if err := capacity.check(maxNFTInput, maxNFTInventoryBudget); err != nil {
+		return err
+	}
 	byTable := make(map[string][]*Target)
 	for _, target := range targets {
 		if target == nil {
 			continue
-		}
-		if err := validateNFTTarget(target); err != nil {
-			return err
 		}
 		byTable[target.Table] = append(byTable[target.Table], target)
 	}
@@ -1125,6 +1154,9 @@ func (n *NFT) Cleanup(ctx context.Context, targets []*Target) error {
 		}
 		if !inventory.present {
 			continue
+		}
+		if err := capacity.observe(ctx, table, inventory); err != nil {
+			return err
 		}
 		batch.Nftables = append(batch.Nftables, nftCommand{Delete: map[string]any{"table": map[string]any{"family": "inet", "name": table}}})
 	}

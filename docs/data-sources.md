@@ -1042,6 +1042,16 @@ marks enforcement unhealthy and blocks other mutations until recovery succeeds.
 Queued old or staged events cannot mutate either store midway through this
 activation; after publication, ordinary admission rejects the retired epoch.
 
+Client epoch, static generation, and dynamic-container identity are independent.
+An explicit direct-LAPI nft reload with unchanged CrowdSec settings, canonical
+endpoint, and captured API key still performs the full `startup=true`
+synchronization but may replace authority in the existing dynamic containers.
+If static content also matches, its native generation is reused. Publication
+and rollback retain the activation fence above: on failure, restore the old
+store's current unexpired projection, not the staged snapshot or renewed
+deadlines. Changed credentials/settings, OpenZiti reloads, and non-nft backends
+continue to use distinct replacement containers.
+
 Polling is single-flight per client. Use exponential retry delays beginning at
 `1s`, doubling to a `60s` maximum with uniformly sampled jitter between half
 and all of the current delay. Reset after two consecutive successful polls.

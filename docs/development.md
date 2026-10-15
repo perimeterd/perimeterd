@@ -15,6 +15,7 @@ to the owning reference document rather than a separate implementation plan.
 - [Pure compiler API](#pure-compiler-api)
 - [Local commands](#local-commands)
   - [Native namespace gate](#native-namespace-gate)
+    - [Production-scale nft recovery](#production-scale-nft-recovery)
   - [Docker gate](#real-docker-coexistence-gate)
   - [Real-LAPI gate](#real-lapi-compatibility-gate)
   - [OpenZiti gate](#real-openziti-transport-gate)
@@ -277,6 +278,46 @@ native package NVR/architecture, image digest and full VM logs. Embedded HEAD
 and a source archive of HEAD alone do not identify dirty working-tree code.
 Local synthetic GitHub metadata and generated checksums are not independent
 provenance or signing, and local VM passes do not imply hosted CI or publication.
+
+#### Production-scale nft recovery
+
+`make test-e2e` also runs `TestE2ENFTProductionCapacity` in the existing
+privileged firewall CI job. It launches production `app.Run` in a separate
+process with only its country-source HTTP client injected, then drives real
+CLI reload/status requests, native nftables, durable state, and IPv4/IPv6
+TCP/UDP packet probes inside the disposable namespace. It is not a recording
+backend or a mock substitute for the daemon lifecycle.
+
+The deterministic country fixture expands the real `euro-atlantic` group.
+Nonadjacent prefixes prevent coalescing from shrinking the workload: the
+two-policy target contains 368,147 static memberships; adding the priority-10
+CZ/SK TCP+UDP port-22 allowlist ahead of priority-100 ingress/egress geo
+allowlists raises it to 368,151. Both families and both default DROP actions
+remain enabled. The independent LAPI fixture streams 107,938,931 bytes and
+admits 399,999 unexpired decision IDs, with `update_frequency: 10s`. Decision
+IDs, static memberships, projected native elements, and unique IP addresses
+are different quantities.
+
+The scenario verifies initial install, acknowledged SSH reload, unchanged
+static-generation reuse with a fresh authoritative synchronization, scheduled
+changed-country refresh, independent dynamic deletions, clean restart, and
+interrupted recovery for both identical previous/candidate/active revisions
+and distinct old/new generations. Packet probes distinguish DROP from REJECT
+and verify CZ/SK SSH exceptions plus retained CrowdSec enforcement. Transient
+native failure, cancellation, and a durable over-capacity target additionally
+exercise retry/exit behavior, safe status, no premature READY, and retained
+journal/native evidence.
+
+The gate reports fixture generation separately, plus per-stage wall time,
+static memberships, full native inventory bytes, projected dynamic elements,
+daemon-only `/proc` peak RSS and cumulative CPU ticks, and native-child CPU/RSS.
+The scheduled-refresh measurement includes waiting for the fixture's one-minute
+refresh interval; restart measurements may include synchronization and packet
+probes. These are resource observations, not latency thresholds. On a local
+Linux x86-64 / Go 1.27.2 / nftables 1.1.6 run, the complete scenario passed in
+383s, daemon peak RSS reached 931,736 KiB, and the over-capacity startup failed
+in 5.02s with its prepared journal intact and without invoking nft or sending
+READY. This does not qualify untested native versions or hosted runners.
 
 Use the [verification matrix](#verification-matrix) for required behavior and
 the [service and packaging matrix](#service-and-packaging) for shared isolation
@@ -637,6 +678,38 @@ capacity rejection stops that profile; later dependent phases are not
 exercised. Native phase timings have no performance assertions. The native
 input/inspection budgets and capacity errors are correctness boundaries, not
 implicit timing or throughput targets.
+
+The production-shaped static nft capacity probe is separate from those CrowdSec
+profiles:
+
+```sh
+sudo env GOTOOLCHAIN=auto PERIMETERD_CAPACITY_MEASURE=1 \
+  go test ./internal/firewall -run '^TestNFTProductionCapacityMeasurement$' -count=1 -v
+```
+
+It verifies private network isolation before mutation, materializes real
+old/new generations, inspects the complete native table, and reports the old
+argument-sum estimate alongside the current unique-object estimate. The direct
+native generation path is measurement-only, not an alternate daemon admission
+path. The unchanged stage correctly issues no mutation. Local Linux x86-64 /
+Go 1.27.2 / nftables 1.1.6 reference measurements were:
+
+| Stage | Unique inventory estimate (bytes) | Complete native inventory (bytes) | Mutation input (bytes) |
+| --- | --- | --- | --- |
+| Initial | 31,843,266 | 5,511,021 | 15,881,184 |
+| SSH old/new pair | 63,631,868 | 11,013,646 | 15,879,793 |
+| Unchanged | 31,854,936 | 5,513,889 | 0 |
+| Country-refresh old/new pair | 64,661,038 | 11,525,269 | 16,388,543 |
+
+The largest estimate leaves 36,002,258 bytes under the 96 MiB inventory budget;
+the largest conservative full-input estimate, 16,392,698 bytes, fits the
+unchanged 32 MiB input ceiling. Actual complete pair output fits the coordinated
+128 MiB capture ceiling. This native probe has empty dynamic sets; the daemon
+gate above independently exercises the large live authority and its projection.
+The probe's generator heap/RSS includes deliberately materialized comparison
+batches. Native-child `rusage` peak RSS can include inherited pre-exec generator
+memory and is an upper bound, not pure nft RSS. Neither measurement estimates
+kernel memory; the daemon gate's separate `VmHWM` excludes its HTTP generator.
 
 ## Verification matrix
 

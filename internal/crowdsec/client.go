@@ -118,6 +118,13 @@ func (c *Client) Endpoint() string {
 	return c.endpoint
 }
 
+// SameAuthentication compares the captured endpoint and key without exposing
+// credential material. Callers must separately establish transport identity.
+func (c *Client) SameAuthentication(other *Client) bool {
+	return c != nil && other != nil && c.bouncer != nil && other.bouncer != nil &&
+		c.endpoint == other.endpoint && c.bouncer.APIKey == other.bouncer.APIKey
+}
+
 // SetRequestObserver installs an optional callback for completed LAPI polls.
 // The observer receives only whether the stream was accepted, never response
 // contents or error text.

@@ -60,7 +60,7 @@ func TestNFTLargeTimedProjectionFitsBoundedAtomicBatch(t *testing.T) {
 		values[index] = policy.TimedPrefix{Prefix: netip.PrefixFrom(netip.AddrFrom16(bytes), 127), Deadline: now.Add(time.Hour)}
 	}
 	dynamic := &DynamicState{Prefixes: values}
-	if err := validateNFTCapacity(nil, target, dynamic); err != nil {
+	if _, err := validateNFTCapacity(context.Background(), nil, target, dynamic); err != nil {
 		t.Fatalf("100000 timed IPv6 ranges failed bounded preflight: %v", err)
 	}
 	commands, err := dynamicSetCommands(target, policy.IPv6, nftObject{}, values, now)

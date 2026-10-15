@@ -63,3 +63,29 @@ func TestStartupExtensionRoundsDownToDeadline(t *testing.T) {
 		}
 	})
 }
+
+func TestStartupProgressSurvivesExtensionsAndStops(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var messages []string
+		notifier := newStartupNotifier(func(message string) error {
+			messages = append(messages, message)
+			return nil
+		}, time.Now().Add(time.Minute))
+		synctest.Wait()
+		notifier.Status("recovery retry pending")
+		time.Sleep(notifyExtendInterval)
+		synctest.Wait()
+		if got := messages[len(messages)-1]; !strings.Contains(got, "STATUS=recovery retry pending") || !strings.Contains(got, "EXTEND_TIMEOUT_USEC=") {
+			t.Fatalf("extension overwrote recovery progress: %q", got)
+		}
+		if err := notifier.Stop(); err != nil {
+			t.Fatal(err)
+		}
+		count := len(messages)
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		if len(messages) != count {
+			t.Fatalf("stopped notifier emitted more notifications: %v", messages[count:])
+		}
+	})
+}

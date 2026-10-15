@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"reflect"
 
 	"github.com/perimeterd/perimeterd/internal/config"
@@ -80,7 +81,13 @@ type activeRecord struct {
 	ID string `json:"id"`
 }
 
-func (s *Store) validateRevision(revision *Revision) error {
+func (s *Store) validateRevision(revision *Revision) (resultErr error) {
+	validateFailure := true
+	defer func() {
+		if validateFailure {
+			resultErr = validationError(resultErr)
+		}
+	}()
 	if revision == nil {
 		return errors.New("state: nil revision")
 	}
@@ -117,6 +124,10 @@ func (s *Store) validateRevision(revision *Revision) error {
 		}
 		cached, err := s.prefixes.Load(revision.Manifest)
 		if err != nil {
+			// File I/O may recover; decoded immutable cache corruption cannot.
+			// Keep the underlying OS cause recognizable for narrower policy.
+			var filesystem *os.PathError
+			validateFailure = !errors.As(err, &filesystem)
 			return fmt.Errorf("state: revision %s manifest: %w", revision.ID, err)
 		}
 		if err := cached.ValidateConfig(revision.Config); err != nil {
@@ -173,7 +184,8 @@ func encodeRecord(payload any) ([]byte, error) {
 	return data, nil
 }
 
-func decodeRecord(data []byte, target any) error {
+func decodeRecord(data []byte, target any) (resultErr error) {
+	defer func() { resultErr = validationError(resultErr) }()
 	if len(data) == 0 || len(data) > maxRecordBytes {
 		return errors.New("state: record size is invalid")
 	}
@@ -295,7 +307,8 @@ func makeID() string {
 	return hex.EncodeToString(raw[:])
 }
 
-func validateID(value, label string) error {
+func validateID(value, label string) (resultErr error) {
+	defer func() { resultErr = validationError(resultErr) }()
 	if len(value) != idLength {
 		return fmt.Errorf("state: %s identity must be %d lowercase hex characters", label, idLength)
 	}
@@ -307,7 +320,8 @@ func validateID(value, label string) error {
 	return nil
 }
 
-func validateJournal(journal *Journal) error {
+func validateJournal(journal *Journal) (resultErr error) {
+	defer func() { resultErr = validationError(resultErr) }()
 	if journal.Version != recordVersion {
 		return fmt.Errorf("state: journal version %d is unsupported", journal.Version)
 	}

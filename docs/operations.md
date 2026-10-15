@@ -852,6 +852,41 @@ source resolution, backend validation, initial reconcile, durable commit, and
 any required CrowdSec synchronization. `READY=1` is not a revocable
 health assertion; operators must also monitor the enforcement-health metric.
 
+Recovery failures are classified by typed causes, not error-message text.
+Capacity violations, invalid ownership/target metadata, inconsistent durable
+records, and missing executables/files or permission failures stop the attempt
+immediately. Unknown native and other transient failures retain exponential
+retries after `1s`, `2s`, `4s`, `8s`, `16s`, then at most `30s`, within the
+original startup deadline. Native-command child timeouts remain transient while
+the recovery context is live; they never reset or extend the startup budget.
+Cancellation or expiry of the lifecycle context admits no further attempt.
+Permanent runtime recovery failures also terminate the daemon rather than
+leaving an unrecoverable writer retrying indefinitely. systemd's existing
+restart/rate-limit policy remains separate from in-process recovery.
+
+A bootstrap logger reports the first recovery failure before current YAML,
+metrics, or the control socket are available. New recovery diagnostics use
+fixed safe categories, attempt and retry-delay fields, and numeric capacity
+required/limit bytes and static/dynamic generation counts when available.
+They do not echo native output, remote payloads, prefixes, or credentials.
+Timeout diagnostics distinguish a recovery operation timing out from the
+overall startup deadline expiring.
+An old `retained generations exceed inspection budget` message is not evidence
+that there are stale generations: repeated references to one native generation
+must not be charged as distinct objects.
+
+Preserve the active record, journal, immutable revisions, source manifests, and
+native objects when investigating. Collect `systemctl status perimeterd`,
+`journalctl -u perimeterd -b`, the numeric failure context, and read-only native
+inventory for the configured table. `perimeterd status` is available only if a
+daemon has reached its control socket. Deploy a corrected binary and restart
+against the same state/configuration; recovery must complete before current
+YAML can be applied. Do not flush the table, delete the journal, disable a
+family/CrowdSec, trim a country group, or increase the startup timeout to bypass
+capacity checks. A genuinely over-capacity target still fails closed; the
+[finite native limits](firewall-backends.md#capacity-and-complete-inspection)
+are distinct from source-stream limits and total process memory.
+
 ### Bounded startup deadline
 
 The current `run` startup deadline is 75 minutes, measured with a monotonic
@@ -872,6 +907,13 @@ describing the current phase. The notifier is independent of the serialized
 writer so a pending source fetch or apply cannot starve it; notification
 delivery failure is surfaced. Requested extension intervals never exceed the
 remaining deadline.
+
+Phase status distinguishes opening persisted state, recovering persisted
+firewall state, resolving sources, and applying configuration. Extension ticks
+retain the latest phase or safe recovery-failure category rather than replacing
+it with a generic startup message. On failure, extension sending stops before
+the final failed `STATUS` is emitted; no later extension or `READY=1` follows.
+Readiness and normal stop behavior otherwise remain unchanged.
 
 The budget accommodates 512 uncached selectors at concurrency four when every
 successful request takes the default 30s: source fetching can consume up to

@@ -297,17 +297,22 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 		if selected == nil || selected.store == nil {
 			return Outcome{Active: previous}, errors.New("CrowdSec activation was not synchronized")
 		}
-		if selected != e.crowd.active {
+		sameAuthority := previousTarget != nil && previousTarget.Backend() == "nftables" &&
+			candidate.cfg.Firewall.Backend == "nftables" && e.crowd.active != nil &&
+			selected.cfg == e.crowd.active.cfg && selected.cfg.Transport.Type != upstream.TypeOpenZiti &&
+			selected.client.SameAuthentication(e.crowd.active.client)
+		if selected != e.crowd.active && !sameAuthority {
 			candidateTarget.DynamicGeneration = transaction
 			candidateTarget.Generation = transaction
 		}
 		admission = &firewall.DynamicState{Prefixes: selected.store.Projection(time.Now())}
-		if previousTarget == nil || candidateTarget.DynamicGeneration != previousTarget.DynamicGeneration {
+		if previousTarget == nil || candidateTarget.DynamicGeneration != previousTarget.DynamicGeneration || selected != e.crowd.active {
 			activation = admission
 		}
 	}
-	// Capacity admission includes retained authority; activation replaces it only
-	// for a new container. Static refresh must not renew a shared generation.
+	// An explicit reload always synchronizes authority. For an unchanged direct
+	// nft source it atomically replaces contents in the shared lease container;
+	// an ordinary static refresh preserves those contents and their deadlines.
 	if err := firewall.ValidateTarget(candidateTarget); err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, err
 	}
@@ -380,7 +385,14 @@ func (e *Engine) rollbackLocked(ctx context.Context, previous, candidate *state.
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, original
 	}
-	if err := e.applyBackendLocked(ctx, candidateTarget, previousTarget, nil); err != nil {
+	var restore *firewall.DynamicState
+	if previousTarget != nil && candidateTarget != nil && previousTarget.Backend() == "nftables" &&
+		candidateTarget.Backend() == "nftables" && previousTarget.DynamicGeneration != "" &&
+		previousTarget.DynamicGeneration == candidateTarget.DynamicGeneration && e.crowd.active != nil &&
+		e.crowd.staged != e.crowd.active {
+		restore = &firewall.DynamicState{Prefixes: e.crowd.active.store.Projection(time.Now())}
+	}
+	if err := e.applyBackendLocked(ctx, candidateTarget, previousTarget, restore); err != nil {
 		e.healthy.Store(false)
 		return Outcome{Transaction: candidate.ID, Active: previous, Degraded: true}, errors.Join(original, fmt.Errorf("restore previous firewall target: %w", err))
 	}
@@ -553,10 +565,10 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		return nil, nil
 	}
 	if journal.Operation != "apply" {
-		return nil, e.recoveryFailureLocked(fmt.Errorf("unsupported journal operation %q", journal.Operation))
+		return nil, e.recoveryFailureLocked(&state.ValidationError{Err: errors.New("unsupported journal operation")})
 	}
 	if journal.ID != journal.Candidate {
-		return nil, e.recoveryFailureLocked(errors.New("apply journal identity does not match candidate revision"))
+		return nil, e.recoveryFailureLocked(&state.ValidationError{Err: errors.New("apply journal identity does not match candidate revision")})
 	}
 	previous, err := revisionRef(view, journal.Previous)
 	if err != nil {
@@ -567,7 +579,7 @@ func (e *Engine) recoverLocked(ctx context.Context) (*state.Revision, error) {
 		return nil, e.recoveryFailureLocked(err)
 	}
 	if candidate == nil {
-		return nil, e.recoveryFailureLocked(errors.New("apply journal has no candidate revision"))
+		return nil, e.recoveryFailureLocked(&state.ValidationError{Err: errors.New("apply journal has no candidate revision")})
 	}
 	prevTarget, candidateTarget := targetOf(previous), targetOf(candidate)
 	if view.Active != nil && view.Active.ID == journal.ID {
@@ -764,7 +776,7 @@ func revisionRef(view state.View, id string) (*state.Revision, error) {
 	}
 	revision, ok := view.Revisions[id]
 	if !ok || revision == nil {
-		return nil, fmt.Errorf("journal references missing revision %q", id)
+		return nil, &state.ValidationError{Err: fmt.Errorf("journal references missing revision %q", id)}
 	}
 	return revision, nil
 }

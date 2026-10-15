@@ -79,11 +79,12 @@ func normalizeOptions(opts Options) Options {
 // Run acquires lifecycle ownership, recovers durable state before reading YAML,
 // applies the initial candidate, and remains in the foreground until context
 // cancellation or SIGTERM/SIGINT. SIGHUP stages a complete reload.
-func Run(ctx context.Context, options Options) error {
+func Run(ctx context.Context, options Options) (resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	opts := normalizeOptions(options)
+	bootstrapLogger := newLogger(config.Config{}, opts.Stderr)
 	startedAt := time.Now()
 	collector := metrics.New(opts.Version, opts.Commit, opts.BuildTime)
 	runCtx, cancelRun := context.WithCancel(ctx)
@@ -111,6 +112,19 @@ func Run(ctx context.Context, options Options) error {
 		return notifier.Stop()
 	}
 	defer func() { _ = stopNotifier() }()
+	startupComplete := false
+	startupRecoveryFailed := false
+	defer func() {
+		if resultErr != nil && !startupComplete {
+			_ = stopNotifier()
+			cause := recoveryCause(resultErr, startupCtx.Err())
+			bootstrapLogger.Error("startup failed", "cause", cause)
+			resultErr = errors.Join(resultErr, opts.Notify("STATUS=startup failed: "+cause))
+			if startupRecoveryFailed {
+				resultErr = &startupRecoveryError{err: resultErr, contextErr: startupCtx.Err()}
+			}
+		}
+	}()
 	if err := startupCtx.Err(); err != nil {
 		return errors.Join(err, stopNotifier())
 	}
@@ -130,6 +144,7 @@ func Run(ctx context.Context, options Options) error {
 		_ = manager.Close(closeCtx)
 	}()
 
+	notifier.Status("opening persisted state")
 	store, err := state.Open(opts.StateDir, opts.Checkpoint)
 	if err != nil {
 		return errors.Join(err, stopNotifier())
@@ -143,8 +158,10 @@ func Run(ctx context.Context, options Options) error {
 	engine.ConfigureCrowdSecTransport(opts.SourceClient)
 	defer engine.Close()
 
-	recovered, err := recoverUntilReady(startupCtx, engine, nil)
+	notifier.Status("recovering persisted firewall state")
+	recovered, err := recoverUntilReady(startupCtx, engine, recoveryReporter(startupCtx, bootstrapLogger, notifier))
 	if err != nil {
+		startupRecoveryFailed = true
 		return errors.Join(err, stopNotifier())
 	}
 	controlPath := filepath.Join(filepath.Dir(opts.LockPath), control.SocketName)
@@ -202,6 +219,7 @@ func Run(ctx context.Context, options Options) error {
 	publication := newRuntimePublication(engine, sources, newLogger(cfg, opts.Stderr), collector)
 	defer func() { _ = publication.close() }()
 
+	notifier.Status("resolving source configuration")
 	initial := stageSource(startupCtx, opts, resolver, epoch, 0, cfg, sources.manifest(), session)
 	if initial.err != nil {
 		initial.candidate.close()
@@ -216,6 +234,7 @@ func Run(ctx context.Context, options Options) error {
 		initial.candidate.close()
 		return errors.Join(err, stopNotifier())
 	}
+	notifier.Status("applying firewall configuration")
 	outcome, applyErr := engine.applyStaged(startupCtx, initial.candidate)
 	if outcome.Degraded {
 		if err := publication.retain(outcome.Transaction); err != nil {
@@ -226,10 +245,9 @@ func Run(ctx context.Context, options Options) error {
 		if outcome.Committed {
 			expected = "startup recovery did not retain committed candidate"
 		}
-		recovered, recoverErr := recoverUntilReady(startupCtx, engine, func(recoverErr error) {
-			publication.logger.Warn("firewall recovery failed", "error", recoverErr)
-		})
+		recovered, recoverErr := recoverUntilReady(startupCtx, engine, recoveryReporter(startupCtx, publication.logger, notifier))
 		if recoverErr != nil {
+			startupRecoveryFailed = true
 			_ = publication.discard()
 			return errors.Join(applyErr, recoverErr, stopNotifier())
 		}
@@ -263,6 +281,7 @@ func Run(ctx context.Context, options Options) error {
 	if err := bridge.notifyReady(opts.Notify); err != nil {
 		return err
 	}
+	startupComplete = true
 
 	producerCtx, cancelProducers := context.WithCancel(runCtx)
 	defer cancelProducers()
@@ -270,6 +289,7 @@ func Run(ctx context.Context, options Options) error {
 	var producers sync.WaitGroup
 	recovering := false
 	recoveryBackoff := time.Second
+	recoveryAttempt := 0
 	var recoveryTimer *time.Timer
 	scheduleRecovery := func() {
 		if recovering {
@@ -277,6 +297,7 @@ func Run(ctx context.Context, options Options) error {
 		}
 		recovering = true
 		recoveryBackoff = time.Second
+		recoveryAttempt = 0
 		recoveryTimer = time.NewTimer(0)
 	}
 	var waiter *reloadRequest
@@ -568,7 +589,15 @@ func Run(ctx context.Context, options Options) error {
 			recoveryTimer = nil
 			recovered, recoverErr := engine.Recover(runCtx)
 			if recoverErr != nil {
-				publication.logger.Warn("firewall recovery failed", "error", recoverErr)
+				recoveryAttempt++
+				delay := recoveryBackoff
+				if !recoveryRetryable(recoverErr) || runCtx.Err() != nil {
+					delay = 0
+				}
+				recoveryReporter(runCtx, publication.logger, nil)(recoverErr, recoveryAttempt, delay)
+				if !recoveryRetryable(recoverErr) {
+					return errors.Join(recoverErr, stopService())
+				}
 				if runCtx.Err() == nil {
 					recoveryTimer = time.NewTimer(recoveryBackoff)
 					if recoveryBackoff < 30*time.Second {
@@ -669,34 +698,35 @@ func loadUpstreamSession(ctx context.Context, manager *upstream.Manager, cfg con
 	return manager.Load(ctx, profiles)
 }
 
-func recoverUntilReady(ctx context.Context, engine *Engine, failed func(error)) (*state.Revision, error) {
+func recoverUntilReady(ctx context.Context, engine *Engine, failed func(error, int, time.Duration)) (*state.Revision, error) {
 	backoff := time.Second
-	for {
+	for attempt := 1; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		recovered, err := engine.Recover(ctx)
 		if err == nil {
 			return recovered, nil
 		}
-		if failed != nil {
-			failed(err)
+		retry := recoveryRetryable(err) && ctx.Err() == nil
+		delay := time.Duration(0)
+		if retry {
+			delay = backoff
 		}
-		if ctx.Err() != nil {
-			return nil, errors.Join(err, ctx.Err())
+		if failed != nil {
+			failed(err, attempt, delay)
+		}
+		if !retry {
+			return nil, recoveryContextError(err, ctx.Err())
 		}
 		timer := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, errors.Join(err, ctx.Err())
+			timer.Stop()
+			return nil, recoveryContextError(err, ctx.Err())
 		case <-timer.C:
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-		}
+		backoff = min(2*backoff, 30*time.Second)
 	}
 }
 
