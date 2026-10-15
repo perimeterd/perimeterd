@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -48,12 +49,21 @@ func TestStatusAppliedRecoveryAndCleanup(t *testing.T) {
 	if !found {
 		t.Fatal("missing applied global blocklist count")
 	}
+	wantCompiled := details.CompiledSets
+	wantCompiled.Sets = slices.Clone(wantCompiled.Sets)
+	wantCompiled.Totals = slices.Clone(wantCompiled.Totals)
 	// Returned metadata cannot corrupt the daemon's shared applied snapshot.
 	details.Firewall.Families[0] = "corrupted"
 	details.PrefixCounts[0].Count = 99999
+	details.CompiledSets.Sets[0].ID = "corrupted"
+	details.CompiledSets.Sets[0].Count = 99999
+	details.CompiledSets.Totals[0].Count = 99999
 	again := engine.Status(context.Background())
 	if again.Applied.Details.Firewall.Families[0] != "ipv4" || again.Applied.Details.PrefixCounts[0].Count == 99999 {
 		t.Fatal("status output mutated published state")
+	}
+	if !reflect.DeepEqual(again.Applied.Details.CompiledSets, wantCompiled) {
+		t.Fatal("returned compiled set rows or totals mutated published state")
 	}
 	engine.Close()
 	recovered := NewEngine(store, backend, nil)
@@ -87,7 +97,7 @@ func TestStatusKeepsAcknowledgedRevisionAfterRejectedApply(t *testing.T) {
 	backend.applyFailures = 1
 	backend.applyErr = errors.New("apply failed")
 	backend.mu.Unlock()
-	result, err := engine.Apply(context.Background(), admitCandidate(t, engine, parseEngineConfig(t, "198.51.100.0/24")))
+	result, err := engine.Apply(context.Background(), admitCandidate(t, engine, parseEngineConfig(t, "198.51.100.0/24, 203.0.113.0/24")))
 	if err == nil || result.Committed || result.Degraded {
 		t.Fatalf("apply = %#v, %v", result, err)
 	}
@@ -231,6 +241,16 @@ func TestStatusConcurrentApplyDoesNotMixCountsAndEpochs(t *testing.T) {
 				if count.Family == "ipv4" && count.Source == "global" && count.Type == "blocklist" {
 					found = count.Count == want
 				}
+			}
+			compiled := false
+			for _, set := range got.Applied.Details.CompiledSets.Sets {
+				if set.Family == "ipv4" && set.ID == "global_blocklist" {
+					compiled = set.Count == want
+				}
+			}
+			if !compiled {
+				failures <- got
+				return
 			}
 			if !found {
 				failures <- got

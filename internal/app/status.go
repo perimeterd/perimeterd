@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"errors"
+	"math"
 	"slices"
 	"sort"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/control"
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/lookup"
+	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
 // Status reads the same acknowledgement-fenced view as Lookup. It performs no
@@ -20,7 +23,7 @@ func (e *Engine) Status(ctx context.Context) control.StatusResult {
 	}
 	now := time.Now()
 	result := control.StatusResult{
-		SchemaVersion: 1, ObservedAt: now.UTC(),
+		SchemaVersion: control.StatusSchemaVersion, ObservedAt: now.UTC(),
 		Daemon:  control.StatusDaemon{Version: e.version, Healthy: e.Healthy() && e.runtimeHealthy.Load()},
 		Applied: control.StatusApplied{State: "unavailable", Reason: "no coherent applied view is available"},
 	}
@@ -60,21 +63,53 @@ func (e *Engine) Status(ctx context.Context) control.StatusResult {
 	return result
 }
 
-func buildStatusDetails(candidate Candidate, target *firewall.Target) *control.StatusDetails {
+func buildStatusDetails(candidate Candidate, target *firewall.Target) (*control.StatusDetails, error) {
 	if target == nil {
-		return nil
+		return nil, nil
 	}
 	cfg := candidate.cfg
+	setCapacity := 0
+	for _, family := range target.Families {
+		setCapacity += len(family.Sets)
+	}
 	details := &control.StatusDetails{
 		Firewall:     control.StatusFirewall{Backend: target.Backend(), DenyAction: cfg.Firewall.DenyAction, Families: make([]string, 0, len(target.Families))},
 		Policies:     make([]control.StatusPolicy, 0, len(cfg.Policies)),
 		PrefixCounts: make([]control.StatusPrefixCount, 0, len(candidate.prefixes)),
-		CrowdSec:     control.StatusCrowdSec{Enabled: cfg.CrowdSec.Enabled, Validity: "disabled"},
+		CompiledSets: control.StatusCompiledSets{
+			Sets:   make([]control.StatusCompiledSet, 0, setCapacity),
+			Totals: make([]control.StatusCompiledTotal, 0, len(target.Families)),
+		},
+		CrowdSec: control.StatusCrowdSec{Enabled: cfg.CrowdSec.Enabled, Validity: "disabled"},
 	}
 	for _, family := range target.Families {
-		details.Firewall.Families = append(details.Firewall.Families, firewallFamily(family.Family))
+		name := firewallFamily(family.Family)
+		details.Firewall.Families = append(details.Firewall.Families, name)
+		var total uint64
+		for _, set := range family.Sets {
+			if set.Kind != policy.StaticSet {
+				continue
+			}
+			count := uint64(len(set.Prefixes))
+			if count > math.MaxUint64-total {
+				return nil, errors.New("compiled firewall set memberships overflow")
+			}
+			details.CompiledSets.Sets = append(details.CompiledSets.Sets, control.StatusCompiledSet{Family: name, ID: set.ID, Count: count})
+			total += count
+		}
+		details.CompiledSets.Totals = append(details.CompiledSets.Totals, control.StatusCompiledTotal{Family: name, Count: total})
 	}
 	sort.Strings(details.Firewall.Families)
+	sort.Slice(details.CompiledSets.Sets, func(i, j int) bool {
+		a, b := details.CompiledSets.Sets[i], details.CompiledSets.Sets[j]
+		if a.Family != b.Family {
+			return a.Family < b.Family
+		}
+		return a.ID < b.ID
+	})
+	sort.Slice(details.CompiledSets.Totals, func(i, j int) bool {
+		return details.CompiledSets.Totals[i].Family < details.CompiledSets.Totals[j].Family
+	})
 	if target.IPTables != nil {
 		for _, attachment := range target.IPTables.Attachments {
 			details.Firewall.Attachments = append(details.Firewall.Attachments, control.StatusAttachment{
@@ -103,7 +138,7 @@ func buildStatusDetails(candidate Candidate, target *firewall.Target) *control.S
 	for _, count := range candidate.prefixes {
 		details.PrefixCounts = append(details.PrefixCounts, control.StatusPrefixCount{Family: count.Family, Source: count.Source, Type: count.Type, Count: uint64(count.Count)})
 	}
-	return details
+	return details, nil
 }
 
 func statusPorts(ports []config.PortRange) []control.StatusPortRange {
@@ -133,6 +168,8 @@ func cloneStatusDetails(value *control.StatusDetails) *control.StatusDetails {
 		result.Policies[i].Traffic.UDP = slices.Clone(value.Policies[i].Traffic.UDP)
 	}
 	result.PrefixCounts = slices.Clone(value.PrefixCounts)
+	result.CompiledSets.Sets = slices.Clone(value.CompiledSets.Sets)
+	result.CompiledSets.Totals = slices.Clone(value.CompiledSets.Totals)
 	return &result
 }
 

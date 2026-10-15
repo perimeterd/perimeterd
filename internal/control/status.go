@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 )
 
@@ -105,7 +106,7 @@ func decodeStatus(data []byte) (StatusResult, error) {
 }
 
 func validateStatus(result StatusResult) error {
-	if result.SchemaVersion != 1 {
+	if result.SchemaVersion != StatusSchemaVersion {
 		return errors.New("unsupported status schema version")
 	}
 	if result.ObservedAt.IsZero() || result.Daemon.Version == "" {
@@ -134,6 +135,9 @@ func validateStatus(result StatusResult) error {
 		details.Policies == nil || details.PrefixCounts == nil {
 		return errors.New("incomplete applied policy summary")
 	}
+	if err := validateStatusCompiledSets(details.Firewall.Families, details.CompiledSets); err != nil {
+		return err
+	}
 	crowdsec := applied.Details.CrowdSec
 	switch crowdsec.Validity {
 	case "disabled":
@@ -155,6 +159,57 @@ func validateStatus(result StatusResult) error {
 		}
 	default:
 		return errors.New("invalid CrowdSec validity")
+	}
+	return nil
+}
+
+func validateStatusCompiledSets(families []string, compiled StatusCompiledSets) error {
+	if compiled.Sets == nil || compiled.Totals == nil {
+		return errors.New("missing compiled firewall set collections")
+	}
+	sums := make(map[string]uint64, len(families))
+	for _, family := range families {
+		if family != "ipv4" && family != "ipv6" {
+			return errors.New("invalid firewall family")
+		}
+		if _, exists := sums[family]; exists {
+			return errors.New("duplicate firewall family")
+		}
+		sums[family] = 0
+	}
+	type identity struct {
+		family string
+		id     string
+	}
+	seen := make(map[identity]struct{}, len(compiled.Sets))
+	for _, set := range compiled.Sets {
+		sum, enabled := sums[set.Family]
+		if !enabled || set.ID == "" {
+			return errors.New("invalid compiled firewall set identity")
+		}
+		key := identity{family: set.Family, id: set.ID}
+		if _, exists := seen[key]; exists {
+			return errors.New("duplicate compiled firewall set")
+		}
+		seen[key] = struct{}{}
+		if set.Count > math.MaxUint64-sum {
+			return errors.New("compiled firewall set total overflows")
+		}
+		sums[set.Family] = sum + set.Count
+	}
+	totals := make(map[string]struct{}, len(compiled.Totals))
+	for _, total := range compiled.Totals {
+		sum, enabled := sums[total.Family]
+		if !enabled || sum != total.Count {
+			return errors.New("inconsistent compiled firewall set total")
+		}
+		if _, exists := totals[total.Family]; exists {
+			return errors.New("duplicate compiled firewall family total")
+		}
+		totals[total.Family] = struct{}{}
+	}
+	if len(totals) != len(sums) {
+		return errors.New("missing compiled firewall family total")
 	}
 	return nil
 }

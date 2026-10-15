@@ -152,7 +152,11 @@ func (e *Engine) publishCandidateLookupLocked(candidate Candidate, revision *sta
 	}
 	status := e.stagedStatus
 	if status == nil {
-		status = buildStatusDetails(candidate, revision.Target)
+		var err error
+		status, err = buildStatusDetails(candidate, revision.Target)
+		if err != nil {
+			return fmt.Errorf("build candidate status state: %w", err)
+		}
 	}
 	e.publishLookupLocked(static, status, dynamic, revision.ID, revision.Manifest, revision.Epoch)
 	return nil
@@ -181,7 +185,11 @@ func (e *Engine) publishRecoveredLookupLocked(revision *state.Revision) error {
 	}
 	candidate := Candidate{cfg: revision.Config, snapshot: snapshot}
 	candidate.prefixes = prefixCounts(candidate)
-	e.publishLookupLocked(static, buildStatusDetails(candidate, revision.Target), dynamicFromCrowdState(e.crowd.active), revision.ID, revision.Manifest, revision.Epoch)
+	status, err := buildStatusDetails(candidate, revision.Target)
+	if err != nil {
+		return fmt.Errorf("build recovered status state: %w", err)
+	}
+	e.publishLookupLocked(static, status, dynamicFromCrowdState(e.crowd.active), revision.ID, revision.Manifest, revision.Epoch)
 	return nil
 }
 

@@ -42,7 +42,8 @@ RIPEstat-derived geographic/ASN policy, custom HTTP(S) plain-text or
 and an optional numeric filter, policy include/exclude selectors with per-list
 refresh intervals, direct provider IDs resolved dynamically through jsDelivr,
 and CrowdSec ingress bans. Docker
-coexistence, acknowledged configuration reload, applied-state status with loaded-data counts,
+coexistence, acknowledged configuration reload, applied-state status with source
+and compiled-set counts,
 IP/CIDR lookup with source explanations, and
 [optional OpenZiti transport](docs/architecture.md#optional-openziti-upstream-transport)
 for selected CrowdSec/custom-list upstreams are implemented. Direct HTTP(S)

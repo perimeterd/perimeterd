@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +19,7 @@ import (
 
 func statusFixture() control.StatusResult {
 	return control.StatusResult{
-		SchemaVersion: 1,
+		SchemaVersion: control.StatusSchemaVersion,
 		ObservedAt:    time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC),
 		Daemon:        control.StatusDaemon{Version: "v1.2.3", UptimeSeconds: 123, Healthy: true},
 		Applied: control.StatusApplied{
@@ -34,6 +36,18 @@ func statusFixture() control.StatusResult {
 				PrefixCounts: []control.StatusPrefixCount{
 					{Family: "ipv4", Source: "list:web", Type: "deny", Count: 10},
 					{Family: "ipv6", Source: "list:web", Type: "deny", Count: 4},
+				},
+				CompiledSets: control.StatusCompiledSets{
+					Sets: []control.StatusCompiledSet{
+						{Family: "ipv4", ID: "geo/egress", Count: 10},
+						{Family: "ipv4", ID: "geo/ingress", Count: 10},
+						{Family: "ipv4", ID: "geo/ssh", Count: 3},
+						{Family: "ipv4", ID: "global_allowlist", Count: 0},
+						{Family: "ipv6", ID: "geo/egress", Count: 4},
+						{Family: "ipv6", ID: "geo/ingress", Count: 4},
+						{Family: "ipv6", ID: "geo/ssh", Count: 1},
+					},
+					Totals: []control.StatusCompiledTotal{{Family: "ipv4", Count: 23}, {Family: "ipv6", Count: 9}},
 				},
 				CrowdSec: control.StatusCrowdSec{Enabled: true, Epoch: 3, Operation: 8, Validity: "valid", ValidUntil: time.Date(2026, 10, 13, 13, 0, 0, 0, time.UTC), Counts: &control.StatusDecisionCounts{IPv4: 11, IPv6: 2}},
 			},
@@ -118,6 +132,9 @@ func TestStatusReportsHealthAndStateFailuresOnStdout(t *testing.T) {
 			if tc.noCounts && strings.Contains(stdout.String(), "Unexpired acknowledged decisions") {
 				t.Fatalf("non-valid CrowdSec report exposed counts: %s", stdout.String())
 			}
+			if result.Applied.Details == nil && strings.Contains(stdout.String(), "Compiled firewall sets") {
+				t.Fatalf("unapplied status invented a compiled target: %s", stdout.String())
+			}
 		})
 	}
 }
@@ -142,7 +159,7 @@ func TestStatusJSONIncludesFullReportEvenOnFailure(t *testing.T) {
 		if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 			t.Fatal(err)
 		}
-		if got.SchemaVersion != 1 || got.ObservedAt != result.ObservedAt || got.Applied.Revision != result.Applied.Revision || got.Applied.Manifest != result.Applied.Manifest || got.Daemon.Healthy != healthy || got.Applied.Details.CrowdSec.Counts.IPv4 != 11 {
+		if got.SchemaVersion != control.StatusSchemaVersion || got.ObservedAt != result.ObservedAt || got.Applied.Revision != result.Applied.Revision || got.Applied.Manifest != result.Applied.Manifest || got.Daemon.Healthy != healthy || got.Applied.Details.CrowdSec.Counts.IPv4 != 11 || !reflect.DeepEqual(got.Applied.Details.CompiledSets, result.Applied.Details.CompiledSets) {
 			t.Fatalf("incomplete JSON report: %s", stdout.String())
 		}
 	}
@@ -217,5 +234,102 @@ func TestStatusRequiresRootBeforeContactingDaemon(t *testing.T) {
 	})
 	if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires root privileges") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestStatusCompiledTextMatchesJSON(t *testing.T) {
+	result := statusFixture()
+	before, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonReport control.StatusResult
+	if err := json.Unmarshal(before, &jsonReport); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := writeStatus(&out, result); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	sourcePos := strings.Index(text, "Loaded source prefix elements")
+	compiledPos := strings.Index(text, "Compiled firewall sets")
+	crowdsecPos := strings.Index(text, "CrowdSec: acknowledged_epoch")
+	if sourcePos < 0 || compiledPos <= sourcePos || crowdsecPos <= compiledPos {
+		t.Fatalf("source/compiled/CrowdSec sections out of order: %s", text)
+	}
+	last := compiledPos
+	for _, family := range []string{"ipv4", "ipv6"} {
+		for _, id := range []string{"geo/egress", "geo/ingress", "geo/ssh", "global_allowlist"} {
+			for _, set := range jsonReport.Applied.Details.CompiledSets.Sets {
+				if set.Family != family || set.ID != id {
+					continue
+				}
+				line := fmt.Sprintf("  family=%s set=%s count=%d\n", family, id, set.Count)
+				pos := strings.Index(text, line)
+				if pos <= last || strings.Count(text, line) != 1 {
+					t.Fatalf("missing, duplicated or unordered compiled row %q: %s", line, text)
+				}
+				last = pos
+			}
+		}
+		for _, total := range jsonReport.Applied.Details.CompiledSets.Totals {
+			if total.Family != family {
+				continue
+			}
+			line := fmt.Sprintf("  family=%s total_memberships=%d\n", family, total.Count)
+			pos := strings.Index(text, line)
+			if pos <= last || strings.Count(text, line) != 1 {
+				t.Fatalf("missing, duplicated or unordered total %q: %s", line, text)
+			}
+			last = pos
+		}
+	}
+	compiledText := text[compiledPos:crowdsecPos]
+	if !strings.Contains(compiledText, "static target memberships; duplicates across sets included; not a kernel audit") ||
+		!strings.Contains(compiledText, "Dynamic CrowdSec memberships excluded; decision counts reported separately.") ||
+		strings.Contains(compiledText, "set=crowdsec") {
+		t.Fatalf("static/dynamic membership semantics unclear: %s", compiledText)
+	}
+	for _, count := range jsonReport.Applied.Details.PrefixCounts {
+		line := fmt.Sprintf("family=%s source=%s type=%s count=%d", count.Family, count.Source, count.Type, count.Count)
+		if !strings.Contains(text[sourcePos:compiledPos], line) {
+			t.Fatalf("source count changed: missing %q", line)
+		}
+	}
+	if !strings.Contains(text[crowdsecPos:], "ipv4=11 ipv6=2") {
+		t.Fatalf("live decision counts changed: %s", text[crowdsecPos:])
+	}
+	after, err := json.Marshal(result)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("text rendering mutated status summary: %s, %v", after, err)
+	}
+}
+
+func TestStatusCompiledZeroTotalAndDisabledFamily(t *testing.T) {
+	result := statusFixture()
+	result.Applied.Details.Firewall.Families = []string{"ipv6"}
+	result.Applied.Details.CompiledSets = control.StatusCompiledSets{
+		Sets:   []control.StatusCompiledSet{},
+		Totals: []control.StatusCompiledTotal{{Family: "ipv6", Count: 0}},
+	}
+	var out bytes.Buffer
+	if err := writeStatus(&out, result); err != nil {
+		t.Fatal(err)
+	}
+	_, compiled, found := strings.Cut(out.String(), "Compiled firewall sets")
+	if !found {
+		t.Fatal("missing compiled section")
+	}
+	compiled, _, _ = strings.Cut(compiled, "CrowdSec: acknowledged_epoch")
+	if !strings.Contains(compiled, "family=ipv6 total_memberships=0\n") || strings.Contains(compiled, "family=ipv4") || strings.Contains(compiled, " set=") {
+		t.Fatalf("zero total or absent family rendered incorrectly: %s", compiled)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"compiled_sets":{"sets":[],"totals":[{"family":"ipv6","count":0}]}`)) {
+		t.Fatalf("zero total or empty collection missing from JSON: %s", encoded)
 	}
 }

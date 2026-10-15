@@ -8,6 +8,9 @@ import (
 // StatusEndpoint is the read-only applied-state endpoint.
 const StatusEndpoint = "/v1/status"
 
+// StatusSchemaVersion requires static compiled-set memberships in applied reports.
+const StatusSchemaVersion = 2
+
 // StatusResult reports daemon-owned, last-acknowledged state, not a kernel audit.
 type StatusResult struct {
 	SchemaVersion int           `json:"schema_version"`
@@ -34,11 +37,12 @@ type StatusApplied struct {
 	Details     *StatusDetails `json:"details,omitempty"`
 }
 
-// StatusDetails contains only public applied-policy metadata and loaded counts.
+// StatusDetails contains public applied-policy metadata and source/target counts.
 type StatusDetails struct {
 	Firewall     StatusFirewall      `json:"firewall"`
 	Policies     []StatusPolicy      `json:"policies"`
 	PrefixCounts []StatusPrefixCount `json:"prefix_counts"`
+	CompiledSets StatusCompiledSets  `json:"compiled_sets"`
 	CrowdSec     StatusCrowdSec      `json:"crowdsec"`
 }
 
@@ -88,6 +92,26 @@ type StatusPrefixCount struct {
 	Family string `json:"family"`
 	Source string `json:"source"`
 	Type   string `json:"type"`
+	Count  uint64 `json:"count"`
+}
+
+// StatusCompiledSets counts static target memberships, including duplicates
+// across logical sets. Dynamic CrowdSec memberships are excluded.
+type StatusCompiledSets struct {
+	Sets   []StatusCompiledSet   `json:"sets"`
+	Totals []StatusCompiledTotal `json:"totals"`
+}
+
+// StatusCompiledSet counts normalized prefix elements in one static logical set.
+type StatusCompiledSet struct {
+	Family string `json:"family"`
+	ID     string `json:"id"`
+	Count  uint64 `json:"count"`
+}
+
+// StatusCompiledTotal sums static memberships for an enabled address family.
+type StatusCompiledTotal struct {
+	Family string `json:"family"`
 	Count  uint64 `json:"count"`
 }
 

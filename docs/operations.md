@@ -323,14 +323,17 @@ root, uses the existing private socket permissions, and bounds a round trip
 to five seconds. It works with `metrics.listen: ""`; it does not parse the
 current YAML, read durable state as an offline fallback, contact sources, or
 inspect the kernel firewall. After upgrading from a binary without this
-endpoint, restart the daemon; configuration reload cannot add an endpoint.
+endpoint or with an older status schema, restart the upgraded daemon;
+configuration reload cannot upgrade a running process. Incompatible
+daemon/client schemas fail explicitly, never as misleading empty counts.
 
 The report includes the running daemon version, uptime and runtime health,
 revision/configuration epoch and source manifest when present, firewall
 backend/families/deny action, policy names/priorities/directions/modes/traffic
-scopes, iptables attachments, loaded prefix counts, and acknowledged CrowdSec
-metadata. Disabled policies are labeled `mode=disabled`. No source URLs,
-credentials, full configuration, or individual prefixes are included.
+scopes, iptables attachments, loaded source counts, static compiled set
+memberships, and acknowledged CrowdSec metadata. Disabled policies are labeled
+`mode=disabled`. No source URLs, credentials, full configuration, or individual
+prefixes are included.
 
 Text uptime uses compact elapsed days, hours, minutes, and seconds, omitting
 zero-valued units: `1260` seconds appears as `uptime=21m`, and `90061` seconds
@@ -350,11 +353,28 @@ A coherent revision can coexist with degraded runtime health. The report is
 an as-of daemon acknowledgement, not an independent audit of kernel rules or
 a guarantee of end-to-end reachability.
 
-Prefix counts reuse Prometheus's family/source/type semantics: unique prefix
+Loaded source counts reuse Prometheus's family/source/type semantics: unique prefix
 elements within each label combination and enabled family, including built-in
 local ranges. They are not counts of unique protected addresses, packets or
 bytes. There is no grand total across overlapping categories. Native packet
 and byte statistics remain on the [Prometheus surface](#prometheus-metrics).
+
+**Compiled firewall sets** is a separate static-only summary of the last
+acknowledged target. Each row reports the prefix count of one logical set,
+after compilation/normalization, and each enabled family has a membership
+total. The same prefix contributes again when it belongs to another set:
+identical ingress/egress selectors therefore have distinct rows. Logical sets
+referenced by multiple paths still contribute only once each. Internal sets
+such as `geo_eligible` are included; `global_allowlist` includes built-in local
+ranges. Present zero-count static sets and zero family totals remain visible;
+disabled families and absent sets are not invented.
+
+These totals reveal repeated memberships, not a count of duplicates or unique
+addresses. They are not native interval markers, ipset allocation sizes, memory
+usage, retained old/new generation totals, or a kernel audit. This logical
+counting is the same for nftables and both iptables frontends. Dynamic CrowdSec
+sets are excluded entirely: empty persisted prefixes do not mean there are no
+live decisions. Normalized live CrowdSec native-element counts are not reported.
 
 CrowdSec counts include unexpired decisions from the last acknowledged dynamic
 write for enabled families, not newer fetched decisions awaiting application
@@ -373,25 +393,50 @@ report and never falls back to disk.
 | `1` | Degraded/unavailable state, stale/unknown enabled CrowdSec state, transport/protocol failure, or output failure |
 | `2` | Invalid command usage |
 
-Example loaded-data portion with one global IPv4 blocklist prefix:
+Example source/compiled excerpt with identical ingress/egress country sets
+and a distinct SSH selection; totals also include global/internal sets:
 
 ```text
-Firewall: backend=nftables families=ipv4,ipv6 deny_action=drop
-Loaded prefix elements (per family/source/type; not unique IPs or packet counts):
+Loaded source prefix elements (per family/source/type; not unique IPs or packet counts):
+  family=ipv4 source=global type=allowlist count=1
   family=ipv4 source=global type=blocklist count=1
   family=ipv4 source=local type=local count=5
+  family=ipv4 source=ripestat type=country count=4
+  family=ipv6 source=global type=allowlist count=1
+  family=ipv6 source=global type=blocklist count=1
   family=ipv6 source=local type=local count=3
-CrowdSec: disabled
+  family=ipv6 source=ripestat type=country count=5
+Compiled firewall sets (static target memberships; duplicates across sets included; not a kernel audit):
+  family=ipv4 set=geo/egress count=3
+  family=ipv4 set=geo/ingress count=3
+  family=ipv4 set=geo/ssh count=1
+  family=ipv4 set=geo_eligible count=118
+  family=ipv4 set=global_allowlist count=6
+  family=ipv4 set=global_blocklist count=1
+  family=ipv4 total_memberships=132
+  family=ipv6 set=geo/egress count=3
+  family=ipv6 set=geo/ingress count=3
+  family=ipv6 set=geo/ssh count=2
+  family=ipv6 set=geo_eligible count=53
+  family=ipv6 set=global_allowlist count=4
+  family=ipv6 set=global_blocklist count=1
+  family=ipv6 total_memberships=66
+  Dynamic CrowdSec memberships excluded; decision counts reported separately.
 ```
 
-JSON retains full identifiers and uses `schema_version: 1`. For example, select
-the same applied summary without parsing human-readable labels:
+JSON retains full identifiers and uses `schema_version: 2`. Applied details
+require `compiled_sets.sets` rows (`family`, `id`, unsigned `count`) and
+`compiled_sets.totals` rows (`family`, unsigned `count`). Collections are
+non-null arrays; each present family has one total, even when zero. Empty or
+unavailable applied states retain their existing absence of details.
+For example, select all three count concepts without parsing text labels:
 
 ```sh
 sudo bin/perimeterd status --json |
   jq '{state: .applied.state, revision: .applied.revision,
        firewall: .applied.details.firewall,
        prefix_counts: .applied.details.prefix_counts,
+       compiled_sets: .applied.details.compiled_sets,
        crowdsec: .applied.details.crowdsec}'
 ```
 

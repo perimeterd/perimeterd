@@ -350,8 +350,13 @@ static feeds remain explainable when their committed policy remains enforced;
 report retrieval age rather than interpreting staleness as an empty set.
 
 `perimeterd status` uses this same publication token and invalidation boundary.
-`internal/app/status.go` prepares public static metadata and prefix counts once
-per candidate; recovery rebuilds them from the selected revision and manifest.
+`internal/app/status.go` prepares public static metadata, deduplicated source
+counts, and compiled static-set memberships once per candidate; recovery
+rebuilds them from the selected target, revision, and source manifest. Static
+summary construction walks logical `StaticSet` entries and reads prefix-slice
+lengths with checked unsigned totals. It includes internal/empty static sets
+but never captures dynamic CrowdSec contents, expands CIDRs, rescans prefix
+elements, or copies full prefix arrays for status.
 The immutable summary travels with the applied view, including through dynamic
 updates and safe compensation. Requests copy only the small public metadata,
 count unexpired acknowledged decisions at one captured time, and recheck the
@@ -402,6 +407,17 @@ runtime directory. The same control API accepts acknowledged reload requests
 via `POST /v1/reload` and read-only status requests via `GET /v1/status`.
 Access is root-only; remote access, delegated group access, and arbitrary
 CLI socket paths are outside these features.
+
+The status payload uses `schema_version: 2` on the existing `/v1/status`
+route; lookup/reload schemas and routes are unchanged. Applied details require
+non-null `compiled_sets.sets` and `compiled_sets.totals` arrays. Static rows use
+logical family/set identities, not generated native names, and are sorted at
+publication (IPv4, IPv6, then set ID). Each present family has exactly one
+total, including zero. Validation rejects missing collections, disabled/unknown
+families, duplicate identities/totals, inconsistent sums, and unsigned overflow.
+Empty/unavailable applied states still omit details. Mixed old/new status
+schemas fail explicitly in every state rather than synthesizing zero counts.
+The existing five-second round trip and 4 MiB response limit remain in force.
 
 At startup, `run` acquires the existing lifecycle lock before managing the
 socket. Only that owner may remove a verified stale socket at the fixed path; a

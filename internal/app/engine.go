@@ -290,8 +290,12 @@ func (e *Engine) applyLocked(ctx context.Context, candidate Candidate, selected 
 	if err != nil {
 		return Outcome{Active: previous, Degraded: e.degraded()}, fmt.Errorf("build lookup state: %w", err)
 	}
+	status, err := buildStatusDetails(candidate, candidateTarget)
+	if err != nil {
+		return Outcome{Active: previous, Degraded: e.degraded()}, fmt.Errorf("build status state: %w", err)
+	}
 	e.stagedQuery = static
-	e.stagedStatus = buildStatusDetails(candidate, candidateTarget)
+	e.stagedStatus = status
 	var admission, activation *firewall.DynamicState
 	if candidate.cfg.CrowdSec.Enabled {
 		if selected == nil || selected.store == nil {

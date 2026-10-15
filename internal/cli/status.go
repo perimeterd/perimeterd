@@ -121,10 +121,24 @@ func writeStatus(w io.Writer, result control.StatusResult) error {
 		for i, policy := range details.Policies {
 			fmt.Fprintf(&out, "Policy %d: name=%s priority=%d direction=%s mode=%s traffic=%s\n", i+1, policy.Name, policy.Priority, policy.Direction, policy.Mode, statusTraffic(policy.Traffic))
 		}
-		out.WriteString("Loaded prefix elements (per family/source/type; not unique IPs or packet counts):\n")
+		out.WriteString("Loaded source prefix elements (per family/source/type; not unique IPs or packet counts):\n")
 		for _, count := range details.PrefixCounts {
 			fmt.Fprintf(&out, "  family=%s source=%s type=%s count=%d\n", count.Family, count.Source, count.Type, count.Count)
 		}
+		out.WriteString("Compiled firewall sets (static target memberships; duplicates across sets included; not a kernel audit):\n")
+		for _, family := range [...]string{"ipv4", "ipv6"} {
+			for _, set := range details.CompiledSets.Sets {
+				if set.Family == family {
+					fmt.Fprintf(&out, "  family=%s set=%s count=%d\n", family, set.ID, set.Count)
+				}
+			}
+			for _, total := range details.CompiledSets.Totals {
+				if total.Family == family {
+					fmt.Fprintf(&out, "  family=%s total_memberships=%d\n", family, total.Count)
+				}
+			}
+		}
+		out.WriteString("  Dynamic CrowdSec memberships excluded; decision counts reported separately.\n")
 		crowdsec := details.CrowdSec
 		if !crowdsec.Enabled {
 			out.WriteString("CrowdSec: disabled\n")

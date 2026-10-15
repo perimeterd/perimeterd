@@ -94,8 +94,9 @@ The most useful file boundaries when changing an existing path are:
   deadlines, and maximum-expiry overlap projection.
 - `internal/app/lookup.go`: atomic applied-view publication, invalidation,
   acknowledged dynamic lease evidence, and query completion fencing.
-- `internal/app/status.go`: public applied-policy summary, loaded prefix counts,
-  acknowledged decision expiry/validity, and the same query completion fence.
+- `internal/app/status.go`: public applied-policy summary, loaded source counts,
+  static compiled set memberships/totals, acknowledged decision expiry/validity,
+  and the same query completion fence.
 - `internal/control/`: secure Unix socket/server/client lifecycle, strict reload
   request/results, and independent reload-handler capacity. Header/body reads
   retain five seconds; routed lookup/status writes/evaluation retain five seconds;
@@ -246,6 +247,27 @@ disabled. Control and CLI coverage distinguishes degraded reports from protocol
 failures and unavailable sockets, including stdout/exit behavior. Native smoke
 verification runs the actual status, lookup and reload CLI against a daemon in
 isolated network/mount namespaces, never against the development host firewall.
+
+Compiled membership regressions keep source de-duplication separate from
+per-set counts, including identical ingress/egress selectors, distinct SSH
+selection, internal/global sets, empty sets, disabled families, immutable
+returned slices, and count/revision consistency across publication and recovery.
+Control schema 2 requires coherent unsigned family totals and non-null
+collections; malformed/old reports fail rather than defaulting missing data to
+zero. Focused checks are `go test ./internal/app ./internal/control ./internal/cli`
+and `CGO_ENABLED=1 go test -race ./internal/app ./internal/control`.
+
+The native `make test-e2e` gate includes `TestE2EStatusCompiledSets` for
+nftables, iptables-legacy, and iptables-nft. It runs the production daemon
+entrypoint in a separate process with only a local country-source HTTP
+transport injected, and uses the actual status/text, status/JSON, reload, and
+lookup CLI over the private socket. Deterministic country and LAPI fixtures
+prove duplicate policy rows, correct logical totals, acknowledged selection
+changes, restart reconstruction, and live decision updates that preserve the
+static summary. The fixture retains adjacent logical CIDRs rather than
+assuming native interval coalescing. Distinct decision IDs sharing an address
+remain separate acknowledged decisions, not static memberships. No live sources
+or production rules are used.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent
