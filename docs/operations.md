@@ -332,6 +332,11 @@ scopes, iptables attachments, loaded prefix counts, and acknowledged CrowdSec
 metadata. Disabled policies are labeled `mode=disabled`. No source URLs,
 credentials, full configuration, or individual prefixes are included.
 
+Text uptime uses compact elapsed days, hours, minutes, and seconds, omitting
+zero-valued units: `1260` seconds appears as `uptime=21m`, and `90061` seconds
+as `uptime=1d1h1m1s`. Zero uptime is `0s`. JSON keeps
+`daemon.uptime_seconds` as an integer number of seconds for scripts.
+
 Applied state is explicit:
 
 - `applied`: one coherent acknowledged revision is available;

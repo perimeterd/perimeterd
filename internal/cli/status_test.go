@@ -41,6 +41,40 @@ func statusFixture() control.StatusResult {
 	}
 }
 
+func TestStatusHumanReadableUptime(t *testing.T) {
+	for _, tc := range []struct {
+		seconds uint64
+		want    string
+	}{
+		{0, "0s"},
+		{1, "1s"},
+		{59, "59s"},
+		{60, "1m"},
+		{61, "1m1s"},
+		{1260, "21m"},
+		{3599, "59m59s"},
+		{3600, "1h"},
+		{3661, "1h1m1s"},
+		{86399, "23h59m59s"},
+		{86400, "1d"},
+		{90061, "1d1h1m1s"},
+		{172801, "2d1s"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			result := statusFixture()
+			result.Daemon.UptimeSeconds = tc.seconds
+			var out bytes.Buffer
+			if err := writeStatus(&out, result); err != nil {
+				t.Fatal(err)
+			}
+			line, _, _ := strings.Cut(out.String(), "\n")
+			if !strings.Contains(line, " uptime="+tc.want+" ") {
+				t.Fatalf("uptime %d: got %q, want uptime=%s", tc.seconds, line, tc.want)
+			}
+		})
+	}
+}
+
 func TestStatusReportsHealthAndStateFailuresOnStdout(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("private command requires root")

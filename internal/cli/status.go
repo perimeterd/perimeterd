@@ -60,9 +60,29 @@ func statusCommand(args []string, stdout, stderr io.Writer, call func(context.Co
 	return 0
 }
 
+func writeStatusUptime(out *strings.Builder, seconds uint64) {
+	if seconds == 0 {
+		out.WriteString("0s")
+		return
+	}
+	var digits [20]byte
+	for _, unit := range [...]struct {
+		seconds uint64
+		suffix  byte
+	}{{86400, 'd'}, {3600, 'h'}, {60, 'm'}, {1, 's'}} {
+		if count := seconds / unit.seconds; count != 0 {
+			out.Write(strconv.AppendUint(digits[:0], count, 10))
+			out.WriteByte(unit.suffix)
+		}
+		seconds %= unit.seconds
+	}
+}
+
 func writeStatus(w io.Writer, result control.StatusResult) error {
 	var out strings.Builder
-	fmt.Fprintf(&out, "Daemon: version=%s uptime=%ds healthy=%t\n", result.Daemon.Version, result.Daemon.UptimeSeconds, result.Daemon.Healthy)
+	fmt.Fprintf(&out, "Daemon: version=%s uptime=", result.Daemon.Version)
+	writeStatusUptime(&out, result.Daemon.UptimeSeconds)
+	fmt.Fprintf(&out, " healthy=%t\n", result.Daemon.Healthy)
 	fmt.Fprintf(&out, "Observed: %s (last-acknowledged daemon state; not a kernel audit)\n", result.ObservedAt.Format(time.RFC3339Nano))
 	if !result.Daemon.Healthy {
 		out.WriteString("WARNING: daemon health is degraded\n")
