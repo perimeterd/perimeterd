@@ -657,22 +657,23 @@ func capacityNativeFailureCases(t *testing.T, configPath, sourceURL string, star
 	}
 	if !strings.Contains(output.String(), "recover") {
 		_ = cmd.Process.Kill()
-		<-done
-		t.Fatalf("first recovery failure was not visible: %s", output.String())
+		err := <-done
+		t.Fatalf("first recovery failure was not visible: %v: %s", err, output.String())
 	}
 	started = time.Now()
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-done:
+	case err := <-done:
+		t.Logf("recovery process stopped: %v", err)
 		if time.Since(started) > 3*time.Second {
 			t.Fatal("stop during retry was not prompt")
 		}
 	case <-time.After(5 * time.Second):
 		_ = cmd.Process.Kill()
-		<-done
-		t.Fatal("stop during recovery did not cancel retry")
+		err := <-done
+		t.Fatalf("stop during recovery did not cancel retry: %v", err)
 	}
 	if strings.Contains(output.String(), "SECRET-HOSTILE-NATIVE-DIAGNOSTIC") {
 		t.Fatal("stop recovery leaked native diagnostic")

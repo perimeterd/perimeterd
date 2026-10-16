@@ -808,7 +808,10 @@ func TestE2EIPTablesGeo(t *testing.T) {
 	defer func() {
 		cancel()
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Errorf("stop iptables geo daemon: %v", err)
+			}
 		case <-time.After(20 * time.Second):
 			t.Error("iptables geo daemon did not stop")
 		}

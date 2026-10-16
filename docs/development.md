@@ -607,6 +607,9 @@ golangci-lint policy enables `govet`, `staticcheck`, `errcheck`, `revive`,
 `gosec`, and US spelling checks. `make verify` also runs module verification
 and `govulncheck`.
 
+Error checking also covers values received from error channels, including
+test cleanup. Keep process exit errors in timeout diagnostics.
+
 The **release maintainer** owns atomic updates of downloaded binaries; Renovate
 updates Go modules (including `go tool` dependencies) and GitHub Actions only,
 not the downloaded binary pins below. The current manual-pin inventory and

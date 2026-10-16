@@ -632,8 +632,8 @@ func (f *dockerFixture) peerProbe(t *testing.T, network, address, expectation st
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		<-done
-		t.Fatalf("Docker peer probe timed out for %s %s (%s)\n%s", network, address, expectation, output.String())
+		err := <-done
+		t.Fatalf("Docker peer probe timed out for %s %s (%s): %v\n%s", network, address, expectation, err, output.String())
 	}
 }
 

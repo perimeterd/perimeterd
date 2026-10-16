@@ -222,7 +222,9 @@ func TestLookupTransportCloseCancelsActiveEvaluation(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("closing server did not cancel evaluation")
 	}
-	<-result
+	if err := <-result; err != nil {
+		t.Fatalf("request failed during graceful shutdown: %v", err)
+	}
 }
 
 func unixClient(path string) *http.Client {

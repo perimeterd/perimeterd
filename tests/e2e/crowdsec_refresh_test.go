@@ -193,7 +193,10 @@ policies:
 		if !stopped {
 			cancel()
 			select {
-			case <-done:
+			case err := <-done:
+				if err != nil {
+					t.Errorf("stop runtime: %v", err)
+				}
 			case <-time.After(40 * time.Second):
 				t.Error("runtime did not stop")
 			}

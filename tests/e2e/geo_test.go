@@ -222,7 +222,10 @@ func TestE2EGeo(t *testing.T) {
 	defer func() {
 		cancel()
 		select {
-		case <-done:
+		case err := <-done:
+			if err != nil {
+				t.Errorf("stop perimeterd: %v", err)
+			}
 		case <-time.After(20 * time.Second):
 			t.Error("perimeterd did not stop")
 		}
