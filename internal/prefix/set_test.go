@@ -3,6 +3,7 @@ package prefix
 import (
 	"net/netip"
 	"reflect"
+	"slices"
 	"strconv"
 	"testing"
 )
@@ -29,6 +30,33 @@ func TestNormalizeCanonicalizesWithoutMutatingInput(t *testing.T) {
 	}
 	if !reflect.DeepEqual(values, original) {
 		t.Fatalf("Normalize mutated input: got %v, want %v", values, original)
+	}
+}
+
+func TestAllCanonicalFamilyViewsAndEarlyStop(t *testing.T) {
+	v4 := netip.MustParsePrefix("192.0.2.0/24")
+	v6 := netip.MustParsePrefix("2001:db8::/32")
+	set, err := New([]netip.Prefix{v6, netip.MustParsePrefix("192.0.2.42/24"), v4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := slices.Collect(set.All()); !slices.Equal(got, []netip.Prefix{v4, v6}) {
+		t.Fatalf("canonical iteration: %v", got)
+	}
+	if got := slices.Collect(set.IPv4().All()); !slices.Equal(got, []netip.Prefix{v4}) {
+		t.Fatalf("IPv4 iteration: %v", got)
+	}
+	if got := slices.Collect(set.IPv6().All()); !slices.Equal(got, []netip.Prefix{v6}) {
+		t.Fatalf("IPv6 iteration: %v", got)
+	}
+	for value := range set.All() {
+		if value != v4 {
+			t.Fatalf("first canonical value: %v", value)
+		}
+		break
+	}
+	for value := range (Set{}).All() {
+		t.Fatalf("empty set yielded %v", value)
 	}
 }
 

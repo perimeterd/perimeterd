@@ -8,8 +8,8 @@ import (
 // StatusEndpoint is the read-only applied-state endpoint.
 const StatusEndpoint = "/v1/status"
 
-// StatusSchemaVersion requires static compiled-set memberships in applied reports.
-const StatusSchemaVersion = 2
+// StatusSchemaVersion requires explicit consumers for static compiled sets.
+const StatusSchemaVersion = 3
 
 // StatusResult reports daemon-owned, last-acknowledged state, not a kernel audit.
 type StatusResult struct {
@@ -95,8 +95,8 @@ type StatusPrefixCount struct {
 	Count  uint64 `json:"count"`
 }
 
-// StatusCompiledSets counts static target memberships, including duplicates
-// across logical sets. Dynamic CrowdSec memberships are excluded.
+// StatusCompiledSets counts materialized static target memberships once per set.
+// Dynamic CrowdSec memberships are excluded.
 type StatusCompiledSets struct {
 	Sets   []StatusCompiledSet   `json:"sets"`
 	Totals []StatusCompiledTotal `json:"totals"`
@@ -104,9 +104,10 @@ type StatusCompiledSets struct {
 
 // StatusCompiledSet counts normalized prefix elements in one static logical set.
 type StatusCompiledSet struct {
-	Family string `json:"family"`
-	ID     string `json:"id"`
-	Count  uint64 `json:"count"`
+	Family   string   `json:"family"`
+	ID       string   `json:"id"`
+	Policies []string `json:"policies"`
+	Count    uint64   `json:"count"`
 }
 
 // StatusCompiledTotal sums static memberships for an enabled address family.

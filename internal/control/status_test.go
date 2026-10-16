@@ -35,7 +35,7 @@ func statusReport(state string) StatusResult {
 			Policies:     []StatusPolicy{{Name: "web", Priority: -10, Direction: "ingress", Mode: "allowlist", Traffic: StatusTraffic{TCP: []StatusPortRange{{Start: 80, End: 443}}, ICMP: true}}},
 			PrefixCounts: []StatusPrefixCount{{Family: "ipv4", Source: "global", Type: "allowlist", Count: 12}},
 			CompiledSets: StatusCompiledSets{
-				Sets:   []StatusCompiledSet{{Family: "ipv4", ID: "global_allowlist", Count: 12}},
+				Sets:   []StatusCompiledSet{{Family: "ipv4", ID: "global_allowlist", Policies: []string{}, Count: 12}},
 				Totals: []StatusCompiledTotal{{Family: "ipv4", Count: 12}, {Family: "ipv6", Count: 0}},
 			},
 			CrowdSec: StatusCrowdSec{Validity: "disabled"},
@@ -153,7 +153,7 @@ func TestStatusRejectsProtocolFailures(t *testing.T) {
 		{"null", "null", 200},
 		{"empty", "{}", 200},
 		{"malformed", "{", 200},
-		{"schema", strings.Replace(valid, `"schema_version":2`, `"schema_version":1`, 1), 200},
+		{"schema", strings.Replace(valid, `"schema_version":3`, `"schema_version":2`, 1), 200},
 		{"unknown", strings.Replace(valid, `"state":"empty"`, `"state":"empty","extra":true`, 1), 200},
 		{"trailing", valid + " {}", 200},
 		{"state", strings.Replace(valid, `"state":"empty"`, `"state":"invented"`, 1), 200},
@@ -164,6 +164,10 @@ func TestStatusRejectsProtocolFailures(t *testing.T) {
 		{"missing_reason", strings.Replace(valid, `"state":"empty"`, `"state":"unavailable"`, 1), 200},
 		{"invalid_validity", strings.Replace(appliedJSON, `"validity":"disabled"`, `"validity":"invented"`, 1), 200},
 		{"missing_firewall", strings.Replace(appliedJSON, `"backend":"iptables"`, `"backend":""`, 1), 200},
+		{"missing_consumers", strings.Replace(appliedJSON, `"policies":[],`, "", 1), 200},
+		{"null_consumers", strings.Replace(appliedJSON, `"policies":[]`, `"policies":null`, 1), 200},
+		{"duplicate_consumers", strings.Replace(appliedJSON, `"policies":[]`, `"policies":["ingress","ingress"]`, 1), 200},
+		{"unsorted_consumers", strings.Replace(appliedJSON, `"policies":[]`, `"policies":["ingress","egress"]`, 1), 200},
 		{"counts_without_validity", strings.Replace(appliedJSON, `"validity":"disabled"`, `"validity":"disabled","counts":{"ipv4":0,"ipv6":0}`, 1), 200},
 		{"valid_without_counts", strings.Replace(appliedJSON, `"enabled":false,"validity":"disabled"`, `"enabled":true,"validity":"valid","epoch":1,"operation":1`, 1), 200},
 		{"missing_operation", strings.Replace(appliedJSON, `"enabled":false,"validity":"disabled"`, `"enabled":true,"validity":"valid","counts":{}`, 1), 200},
@@ -240,10 +244,10 @@ func TestStatusCompiledSetValidation(t *testing.T) {
 			d.CompiledSets = StatusCompiledSets{Sets: []StatusCompiledSet{}, Totals: []StatusCompiledTotal{{Family: "ipv4"}, {Family: "ipv6"}}}
 		}, true},
 		{"zero static row", func(d *StatusDetails) {
-			d.CompiledSets.Sets = append(d.CompiledSets.Sets, StatusCompiledSet{Family: "ipv6", ID: "geo/ssh"})
+			d.CompiledSets.Sets = append(d.CompiledSets.Sets, StatusCompiledSet{Family: "ipv6", ID: "geo/ssh", Policies: []string{"ssh"}})
 		}, true},
 		{"same ID different families", func(d *StatusDetails) {
-			d.CompiledSets.Sets = append(d.CompiledSets.Sets, StatusCompiledSet{Family: "ipv6", ID: "global_allowlist"})
+			d.CompiledSets.Sets = append(d.CompiledSets.Sets, StatusCompiledSet{Family: "ipv6", ID: "global_allowlist", Policies: []string{}})
 		}, true},
 		{"single family", func(d *StatusDetails) {
 			d.Firewall.Families = []string{"ipv4"}
@@ -253,6 +257,11 @@ func TestStatusCompiledSetValidation(t *testing.T) {
 			d.CompiledSets.Sets[0].Count = math.MaxUint64
 			d.CompiledSets.Totals[0].Count = math.MaxUint64
 		}, true},
+		{"shared consumers", func(d *StatusDetails) { d.CompiledSets.Sets[0].Policies = []string{"egress", "ingress"} }, true},
+		{"missing consumers", func(d *StatusDetails) { d.CompiledSets.Sets[0].Policies = nil }, false},
+		{"empty consumer", func(d *StatusDetails) { d.CompiledSets.Sets[0].Policies = []string{""} }, false},
+		{"duplicate consumers", func(d *StatusDetails) { d.CompiledSets.Sets[0].Policies = []string{"ingress", "ingress"} }, false},
+		{"unsorted consumers", func(d *StatusDetails) { d.CompiledSets.Sets[0].Policies = []string{"ingress", "egress"} }, false},
 		{"missing sets", func(d *StatusDetails) { d.CompiledSets.Sets = nil }, false},
 		{"missing totals", func(d *StatusDetails) { d.CompiledSets.Totals = nil }, false},
 		{"invalid enabled family", func(d *StatusDetails) { d.Firewall.Families[0] = "ipv5" }, false},
@@ -276,7 +285,7 @@ func TestStatusCompiledSetValidation(t *testing.T) {
 		{"mismatched total", func(d *StatusDetails) { d.CompiledSets.Totals[0].Count++ }, false},
 		{"overflow", func(d *StatusDetails) {
 			d.CompiledSets.Sets[0].Count = math.MaxUint64
-			d.CompiledSets.Sets = append(d.CompiledSets.Sets, StatusCompiledSet{Family: "ipv4", ID: "geo/ingress", Count: 1})
+			d.CompiledSets.Sets = append(d.CompiledSets.Sets, StatusCompiledSet{Family: "ipv4", ID: "geo/ingress", Policies: []string{"ingress"}, Count: 1})
 			d.CompiledSets.Totals[0].Count = 0
 		}, false},
 	}
@@ -337,7 +346,7 @@ func TestStatusRejectsOldSchemaForEveryState(t *testing.T) {
 	for _, state := range []string{"applied", "empty", "unavailable"} {
 		t.Run(state, func(t *testing.T) {
 			report := statusReport(state)
-			report.SchemaVersion = 1
+			report.SchemaVersion = 2
 			encoded, err := json.Marshal(report)
 			if err != nil {
 				t.Fatal(err)
@@ -357,7 +366,7 @@ func TestStatusRejectsMalformedCompiledCounts(t *testing.T) {
 	}
 	for _, count := range []string{"-1", "18446744073709551616", "1.5", `"12"`} {
 		t.Run(count, func(t *testing.T) {
-			for _, field := range []string{`"id":"global_allowlist","count":12`, `"totals":[{"family":"ipv4","count":12`} {
+			for _, field := range []string{`"id":"global_allowlist","policies":[],"count":12`, `"totals":[{"family":"ipv4","count":12`} {
 				replacement := strings.Replace(field, `"count":12`, `"count":`+count, 1)
 				body := strings.Replace(string(encoded), field, replacement, 1)
 				if body == string(encoded) {

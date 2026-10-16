@@ -39,15 +39,13 @@ func statusFixture() control.StatusResult {
 				},
 				CompiledSets: control.StatusCompiledSets{
 					Sets: []control.StatusCompiledSet{
-						{Family: "ipv4", ID: "geo/egress", Count: 10},
-						{Family: "ipv4", ID: "geo/ingress", Count: 10},
-						{Family: "ipv4", ID: "geo/ssh", Count: 3},
-						{Family: "ipv4", ID: "global_allowlist", Count: 0},
-						{Family: "ipv6", ID: "geo/egress", Count: 4},
-						{Family: "ipv6", ID: "geo/ingress", Count: 4},
-						{Family: "ipv6", ID: "geo/ssh", Count: 1},
+						{Family: "ipv4", ID: "geo/egress", Policies: []string{"egress", "ingress"}, Count: 10},
+						{Family: "ipv4", ID: "geo/ssh", Policies: []string{"ssh"}, Count: 3},
+						{Family: "ipv4", ID: "global_allowlist", Policies: []string{}, Count: 0},
+						{Family: "ipv6", ID: "geo/egress", Policies: []string{"egress", "ingress"}, Count: 4},
+						{Family: "ipv6", ID: "geo/ssh", Policies: []string{"ssh"}, Count: 1},
 					},
-					Totals: []control.StatusCompiledTotal{{Family: "ipv4", Count: 23}, {Family: "ipv6", Count: 9}},
+					Totals: []control.StatusCompiledTotal{{Family: "ipv4", Count: 13}, {Family: "ipv6", Count: 5}},
 				},
 				CrowdSec: control.StatusCrowdSec{Enabled: true, Epoch: 3, Operation: 8, Validity: "valid", ValidUntil: time.Date(2026, 10, 13, 13, 0, 0, 0, time.UTC), Counts: &control.StatusDecisionCounts{IPv4: 11, IPv6: 2}},
 			},
@@ -265,7 +263,11 @@ func TestStatusCompiledTextMatchesJSON(t *testing.T) {
 				if set.Family != family || set.ID != id {
 					continue
 				}
-				line := fmt.Sprintf("  family=%s set=%s count=%d\n", family, id, set.Count)
+				policies := strings.Join(set.Policies, ",")
+				if policies == "" {
+					policies = "-"
+				}
+				line := fmt.Sprintf("  family=%s set=%s policies=%s count=%d\n", family, id, policies, set.Count)
 				pos := strings.Index(text, line)
 				if pos <= last || strings.Count(text, line) != 1 {
 					t.Fatalf("missing, duplicated or unordered compiled row %q: %s", line, text)
@@ -286,7 +288,7 @@ func TestStatusCompiledTextMatchesJSON(t *testing.T) {
 		}
 	}
 	compiledText := text[compiledPos:crowdsecPos]
-	if !strings.Contains(compiledText, "static target memberships; duplicates across sets included; not a kernel audit") ||
+	if !strings.Contains(compiledText, "static target memberships; shared sets counted once; not a kernel audit") ||
 		!strings.Contains(compiledText, "Dynamic CrowdSec memberships excluded; decision counts reported separately.") ||
 		strings.Contains(compiledText, "set=crowdsec") {
 		t.Fatalf("static/dynamic membership semantics unclear: %s", compiledText)

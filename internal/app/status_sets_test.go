@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/netip"
 	"reflect"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,14 +113,13 @@ policies:
 				}
 				eligible := uint64(len(policy.GeoEligible(family).Prefixes()))
 				want.Sets = append(want.Sets,
-					control.StatusCompiledSet{Family: name, ID: "geo/egress", Count: geo},
-					control.StatusCompiledSet{Family: name, ID: "geo/ingress", Count: geo},
-					control.StatusCompiledSet{Family: name, ID: "geo/ssh", Count: ssh},
-					control.StatusCompiledSet{Family: name, ID: "geo_eligible", Count: eligible},
-					control.StatusCompiledSet{Family: name, ID: "global_allowlist", Count: local + 1},
-					control.StatusCompiledSet{Family: name, ID: "global_blocklist", Count: 1},
+					control.StatusCompiledSet{Family: name, ID: "geo/egress", Policies: []string{"egress", "ingress"}, Count: geo},
+					control.StatusCompiledSet{Family: name, ID: "geo/ssh", Policies: []string{"ssh"}, Count: ssh},
+					control.StatusCompiledSet{Family: name, ID: "geo_eligible", Policies: []string{}, Count: eligible},
+					control.StatusCompiledSet{Family: name, ID: "global_allowlist", Policies: []string{}, Count: local + 1},
+					control.StatusCompiledSet{Family: name, ID: "global_blocklist", Policies: []string{}, Count: 1},
 				)
-				want.Totals = append(want.Totals, control.StatusCompiledTotal{Family: name, Count: 2*geo + ssh + eligible + local + 2})
+				want.Totals = append(want.Totals, control.StatusCompiledTotal{Family: name, Count: geo + ssh + eligible + local + 2})
 				wantSources = append(wantSources,
 					control.StatusPrefixCount{Family: name, Source: "global", Type: "allowlist", Count: 1},
 					control.StatusPrefixCount{Family: name, Source: "global", Type: "blocklist", Count: 1},
@@ -130,6 +131,24 @@ policies:
 			if !report.Successful() || report.Applied.Revision != first.Active.ID || !reflect.DeepEqual(report.Applied.Details.CompiledSets, want) || !reflect.DeepEqual(report.Applied.Details.PrefixCounts, wantSources) {
 				t.Fatalf("compiled/source membership mismatch: %+v; want compiled=%+v sources=%+v", report, want, wantSources)
 			}
+			var readers sync.WaitGroup
+			for range 8 {
+				readers.Go(func() {
+					for range 16 {
+						got := engine.Status(context.Background())
+						if !got.Successful() || !reflect.DeepEqual(got.Applied.Details.CompiledSets, want) {
+							t.Error("concurrent status changed compiled consumers")
+							return
+						}
+						for i := range got.Applied.Details.CompiledSets.Sets {
+							if len(got.Applied.Details.CompiledSets.Sets[i].Policies) > 0 {
+								got.Applied.Details.CompiledSets.Sets[i].Policies[0] = "caller mutation"
+							}
+						}
+					}
+				})
+			}
+			readers.Wait()
 			var sshSelector config.Selector
 			for _, p := range cfg.Policies {
 				if p.Name == "ssh" {
@@ -143,18 +162,20 @@ policies:
 			}
 			second := apply()
 			for i := range want.Sets {
-				if want.Sets[i].ID == "geo/egress" {
+				switch want.Sets[i].ID {
+				case "geo/egress":
+					want.Sets[i].Policies = []string{"egress", "ssh"}
 					want.Sets[i].Count = 3
 					if want.Sets[i].Family == "ipv6" {
 						want.Sets[i].Count = 0
 					}
-				}
-			}
-			for i := range want.Totals {
-				if want.Totals[i].Family == "ipv4" {
-					want.Totals[i].Count++
-				} else {
-					want.Totals[i].Count--
+				case "geo/ssh":
+					want.Sets[i].ID = "geo/ingress"
+					want.Sets[i].Policies = []string{"ingress"}
+					want.Sets[i].Count = 2
+					if want.Sets[i].Family == "ipv6" {
+						want.Sets[i].Count = 1
+					}
 				}
 			}
 			report = engine.Status(context.Background())
@@ -172,7 +193,7 @@ func TestStatusCompiledSetsEmptyStaticMemberships(t *testing.T) {
 			wantSets := []control.StatusCompiledSet{}
 			if emptyStatic {
 				sets = append(sets, policy.PrefixSet{ID: "geo/crowdsec-exception", Kind: policy.StaticSet})
-				wantSets = append(wantSets, control.StatusCompiledSet{Family: "ipv6", ID: "geo/crowdsec-exception"})
+				wantSets = append(wantSets, control.StatusCompiledSet{Family: "ipv6", ID: "geo/crowdsec-exception", Policies: []string{}})
 			}
 			target := &firewall.Target{Families: []policy.FamilyPlan{{Family: policy.IPv6, Sets: sets}}}
 			details, err := buildStatusDetails(Candidate{}, target)
@@ -183,6 +204,60 @@ func TestStatusCompiledSetsEmptyStaticMemberships(t *testing.T) {
 			want := control.StatusCompiledSets{Sets: wantSets, Totals: []control.StatusCompiledTotal{{Family: "ipv6"}}}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("empty static/dynamic distinction: %+v, want %+v", got, want)
+			}
+		})
+	}
+}
+
+func TestStatusCompiledConsumersUseAcknowledgedRules(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		t.Run(map[bool]string{false: "historic-unshared", true: "shared-representative"}[shared], func(t *testing.T) {
+			sets := []policy.PrefixSet{
+				{ID: "geo/alias", Kind: policy.StaticSet},
+				{ID: "global_allowlist", Kind: policy.StaticSet},
+				{ID: "geo/unreferenced", Kind: policy.StaticSet},
+				{ID: "crowdsec", Kind: policy.DynamicCrowdSecSet},
+			}
+			ingressID := "geo/alias"
+			if !shared {
+				ingressID = "geo/ingress"
+				sets = append(sets, policy.PrefixSet{ID: ingressID, Kind: policy.StaticSet})
+			}
+			target := &firewall.Target{Families: []policy.FamilyPlan{{
+				Family: policy.IPv4, Sets: sets,
+				Paths: []policy.Path{
+					{Rules: []policy.Rule{
+						{Policy: "ingress", Match: policy.Match{SetID: ingressID}},
+						{Policy: "ingress", Match: policy.Match{SetID: ingressID}},
+						{Match: policy.Match{SetID: "global_allowlist"}},
+					}},
+					{Rules: []policy.Rule{{Policy: "egress", Match: policy.Match{SetID: "geo/alias"}}}},
+				},
+			}}}
+			details, err := buildStatusDetails(Candidate{}, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string][]string{
+				"geo/alias": {"egress"}, "global_allowlist": {}, "geo/unreferenced": {},
+			}
+			if shared {
+				want["geo/alias"] = []string{"egress", "ingress"}
+			} else {
+				want["geo/ingress"] = []string{"ingress"}
+			}
+			if len(details.CompiledSets.Sets) != len(want) {
+				t.Fatalf("static rows changed: %+v", details.CompiledSets)
+			}
+			for _, row := range details.CompiledSets.Sets {
+				if !slices.Equal(row.Policies, want[row.ID]) || row.Policies == nil {
+					t.Fatalf("actual rule consumers for %s = %v, want %v", row.ID, row.Policies, want[row.ID])
+				}
+			}
+			cloned := cloneStatusDetails(details)
+			cloned.CompiledSets.Sets[0].Policies[0] = "mutated"
+			if !reflect.DeepEqual(details.CompiledSets.Sets[0].Policies, want["geo/alias"]) {
+				t.Fatal("cloned consumers mutated acknowledged rows")
 			}
 		})
 	}

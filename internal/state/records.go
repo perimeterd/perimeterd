@@ -161,7 +161,7 @@ func (s *Store) validateRevision(revision *Revision) (resultErr error) {
 	} else if revision.Target.Table != revision.Config.Firewall.Nftables.Table || revision.Target.Priority != revision.Config.Firewall.Nftables.Priority {
 		return fmt.Errorf("state: revision %s target/config mismatch", revision.ID)
 	}
-	if !reflect.DeepEqual(revision.Target.Families, compiled.Families()) {
+	if !sameCompiledFamilies(revision.Target.Families, compiled.Families()) {
 		return fmt.Errorf("state: revision %s target/config model mismatch", revision.ID)
 	}
 	return nil

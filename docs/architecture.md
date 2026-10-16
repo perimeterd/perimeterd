@@ -119,6 +119,25 @@ validation remain trust boundaries.
 
 Native accounting objects and their meanings are specified by [firewall backends](firewall-backends.md#packet-and-byte-accounting); [operations](operations.md#prometheus-metrics) owns collection, export, failure handling, and process-lifetime counter semantics. Sampling is observational: it must not mutate policy or change readiness.
 
+### Static policy set sharing
+
+The backend-independent compiler resolves effective policy memberships once,
+then interns exact canonical sequences independently per family. SHA-256
+buckets frame the family, sequence length, canonical address bytes, and prefix
+lengths; full sequence equality is still required. Immutable prefix iteration
+avoids temporary family-slice copies, and only unique classes receive retained
+prefix arrays. No process-global interning cache or persisted reference index
+is involved.
+
+Each class uses `geo/<lexicographically-smallest-policy-name>` and a transient
+policy-to-set binding. Emitted geo objects are sorted independently of the
+original ordered rules. Different selectors, priorities, directions, traffic
+scopes, and modes can share data without changing rule behavior. Global lists,
+`geo_eligible`, and dynamic CrowdSec remain separate; partial overlaps are not
+factored. Applicable empty sets can share, while inapplicable families gain no
+rules or sets. [Firewall backends](firewall-backends.md#shared-static-policy-sets)
+owns native realization and transition invariants.
+
 ### Custom IP list integration
 
 Named `ip_lists` extend static source resolution, not the dynamic CrowdSec path.
@@ -357,6 +376,10 @@ summary construction walks logical `StaticSet` entries and reads prefix-slice
 lengths with checked unsigned totals. It includes internal/empty static sets
 but never captures dynamic CrowdSec contents, expands CIDRs, rescans prefix
 elements, or copies full prefix arrays for status.
+Consumers are derived from each acknowledged rule's original `Policy` and actual
+`Match.SetID`, sorted and deduplicated, and deep-cloned with the summary. A
+representative suffix never implies sole policy ownership. Historical unshared
+targets retain their actual separate rows until a shared revision commits.
 The immutable summary travels with the applied view, including through dynamic
 updates and safe compensation. Requests copy only the small public metadata,
 count unexpired acknowledged decisions at one captured time, and recheck the
@@ -408,11 +431,14 @@ via `POST /v1/reload` and read-only status requests via `GET /v1/status`.
 Access is root-only; remote access, delegated group access, and arbitrary
 CLI socket paths are outside these features.
 
-The status payload uses `schema_version: 2` on the existing `/v1/status`
+The status payload uses `schema_version: 3` on the existing `/v1/status`
 route; lookup/reload schemas and routes are unchanged. Applied details require
-non-null `compiled_sets.sets` and `compiled_sets.totals` arrays. Static rows use
-logical family/set identities, not generated native names, and are sorted at
-publication (IPv4, IPv6, then set ID). Each present family has exactly one
+non-null `compiled_sets.sets` and `compiled_sets.totals` arrays. Each row requires
+a non-null `policies` array with sorted unique consumer names; global/internal
+sets normally have an empty array. Static rows use logical family/set identities,
+not generated native names, and are sorted at publication (IPv4, IPv6, then set
+ID). Totals count each materialized set once, not once per consumer. Each present
+family has exactly one
 total, including zero. Validation rejects missing collections, disabled/unknown
 families, duplicate identities/totals, inconsistent sums, and unsigned overflow.
 Empty/unavailable applied states still omit details. Mixed old/new status
@@ -619,6 +645,15 @@ That is an idempotent recovery shape, not evidence of an unfinished distinct
 generation. nft capacity checks count its native objects once; true old/new
 static and dynamic identities remain independently accounted for. No state
 format migration or journal deletion is needed for this case.
+
+Recorded version-2 unshared targets remain valid. Durable validation compares
+non-geo data exactly and checks original path/rule metadata, ordering, policy
+identity, counters, and canonical memberships through actual set references.
+Only equivalent geo data-object aliases and multiplicity may differ from a
+current compilation; extra unreferenced geo objects are rejected. Validation
+never rewrites recorded targets or source manifests and does not run an obsolete
+compiler. Normal new compilation migrates through the existing generation and
+journal protocol; rollback/recovery still selects the recorded old target.
 
 Source-cache loading and pruning share one manifest decoder for raw bindings,
 canonical wire decoding, and semantic validation. Filesystem storage separately

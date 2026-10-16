@@ -249,25 +249,36 @@ verification runs the actual status, lookup and reload CLI against a daemon in
 isolated network/mount namespaces, never against the development host firewall.
 
 Compiled membership regressions keep source de-duplication separate from
-per-set counts, including identical ingress/egress selectors, distinct SSH
-selection, internal/global sets, empty sets, disabled families, immutable
-returned slices, and count/revision consistency across publication and recovery.
-Control schema 2 requires coherent unsigned family totals and non-null
-collections; malformed/old reports fail rather than defaulting missing data to
-zero. Focused checks are `go test ./internal/app ./internal/control ./internal/cli`
-and `CGO_ENABLED=1 go test -race ./internal/app ./internal/control`.
+materialized per-set counts and explicit policy consumers, including shared
+ingress/egress data, distinct SSH selection, internal/global sets, empty sets,
+disabled families, deeply immutable returned slices, and count/revision
+consistency across publication and recovery. Control schema 3 requires coherent
+unsigned family totals, non-null collections, and sorted unique consumer arrays;
+malformed/old reports fail rather than defaulting missing data to zero. Focused
+checks include `go test ./internal/policy ./internal/firewall ./internal/state ./internal/app ./internal/control ./internal/cli ./internal/lookup`
+and `CGO_ENABLED=1 go test -race ./internal/prefix ./internal/policy ./internal/state ./internal/app ./internal/control ./internal/lookup`.
 
 The native `make test-e2e` gate includes `TestE2EStatusCompiledSets` for
 nftables, iptables-legacy, and iptables-nft. It runs the production daemon
 entrypoint in a separate process with only a local country-source HTTP
 transport injected, and uses the actual status/text, status/JSON, reload, and
 lookup CLI over the private socket. Deterministic country and LAPI fixtures
-prove duplicate policy rows, correct logical totals, acknowledged selection
+prove shared consumer rows, correct logical totals, acknowledged split/merge
 changes, restart reconstruction, and live decision updates that preserve the
 static summary. The fixture retains adjacent logical CIDRs rather than
 assuming native interval coalescing. Distinct decision IDs sharing an address
 remain separate acknowledged decisions, not static memberships. No live sources
 or production rules are used.
+
+`TestE2ESharedPolicyLifecycle` uses actual recorded pre-sharing targets from
+`internal/testutil/historicalfixture`, not a legacy compiler. nftables and both
+iptables frontends recover them as recorded, migrate normally, split and merge
+memberships independently per family, remove/reselect the representative, and
+exercise rollback plus prepared/switched/retirement interruptions with real
+packets, lookup policy identity, counters, native references, and orphan checks.
+An unchanged direct-LAPI nft reload may retain its generation; iptables keeps
+its existing distinct-container authority replacement behavior. Query checks
+wait for the completion fence after retained-authority resynchronization.
 
 Ingress and egress probes distinguish silent DROP from protocol REJECT,
 including local UDP sends that return `EPERM` for both actions: a subsequent
@@ -323,35 +334,42 @@ TCP/UDP packet probes inside the disposable namespace. It is not a recording
 backend or a mock substitute for the daemon lifecycle.
 
 The deterministic country fixture expands the real `euro-atlantic` group.
-Nonadjacent prefixes prevent coalescing from shrinking the workload: the
-two-policy target contains 368,147 static memberships; adding the priority-10
-CZ/SK TCP+UDP port-22 allowlist ahead of priority-100 ingress/egress geo
-allowlists raises it to 368,151. Both families and both default DROP actions
-remain enabled. The independent LAPI fixture streams 107,938,931 bytes and
-admits 399,999 unexpired decision IDs, with `update_frequency: 10s`. Decision
-IDs, static memberships, projected native elements, and unique IP addresses
-are different quantities.
+Sparse prefixes preserve the exact post-normalization pair: 152,419 IPv4 and
+31,565 IPv6 memberships per policy. Shared geo storage is 183,984 memberships,
+versus the recorded unshared pair's 367,968. Unrelated global/eligibility sets
+contribute 179, giving 184,163 static memberships initially and 184,167 after
+adding the distinct CZ/SK SSH set. The priority-10 SSH scope explicitly includes
+both `22/tcp` and `22/udp`, ahead of priority-100 ingress/egress `any` policies.
+The captured historical shorthand is TCP-only and remains unchanged during
+historical recovery; normal application selects the current dual-protocol YAML.
+Both families and DROP actions remain enabled. The independent LAPI fixture
+streams 107,938,931 bytes and admits 399,999 unexpired decision IDs at a `10s`
+update frequency. IDs, logical memberships, native elements, and unique
+addresses are different quantities.
 
-The scenario verifies initial install, acknowledged SSH reload, unchanged
-static-generation reuse with a fresh authoritative synchronization, scheduled
-changed-country refresh, independent dynamic deletions, clean restart, and
-interrupted recovery for both identical previous/candidate/active revisions
-and distinct old/new generations. Packet probes distinguish DROP from REJECT
-and verify CZ/SK SSH exceptions plus retained CrowdSec enforcement. Transient
-native failure, cancellation, and a durable over-capacity target additionally
-exercise retry/exit behavior, safe status, no premature READY, and retained
-journal/native evidence.
+The scenario first recovers recorded unshared storage, interrupts genuinely
+distinct old/new preparation and native switching, and migrates through the
+normal journal protocol. It then verifies initial/shared counts, SSH reload,
+egress-only exclusion and split, restored equality and merge, post-switch
+rollback, unchanged reload, source refresh, dynamic deletions, clean restart,
+same-ID prepared recovery, and further old/new recovery. Native object/reference
+checks ensure successful retirement leaves no obsolete sets. TCP/UDP probes
+distinguish DROP from REJECT and preserve SSH restriction, CrowdSec precedence,
+and both traffic directions. Transient native failure, cancellation, and
+over-capacity startup retain their safe retry/exit and journal-evidence checks.
 
 The gate reports fixture generation separately, plus per-stage wall time,
 static memberships, full native inventory bytes, projected dynamic elements,
 daemon-only `/proc` peak RSS and cumulative CPU ticks, and native-child CPU/RSS.
 The scheduled-refresh measurement includes waiting for the fixture's one-minute
 refresh interval; restart measurements may include synchronization and packet
-probes. These are resource observations, not latency thresholds. On a local
-Linux x86-64 / Go 1.27.2 / nftables 1.1.6 run, the complete scenario passed in
-383s, daemon peak RSS reached 931,736 KiB, and the over-capacity startup failed
-in 5.02s with its prepared journal intact and without invoking nft or sending
-READY. This does not qualify untested native versions or hosted runners.
+probes. These are resource observations, not latency thresholds. The full
+transition peak includes simultaneous old/unshared and new/shared generations;
+it is not interchangeable with a fresh-daemon measurement. Reference
+before/after measurements below use the same fresh two-policy inputs, without
+claiming that membership savings imply proportional RSS savings. Native
+verification on nftables 1.1.6 does not qualify untested versions or hosted
+runners.
 
 Use the [verification matrix](#verification-matrix) for required behavior and
 the [service and packaging matrix](#service-and-packaging) for shared isolation
@@ -726,24 +744,47 @@ old/new generations, inspects the complete native table, and reports the old
 argument-sum estimate alongside the current unique-object estimate. The direct
 native generation path is measurement-only, not an alternate daemon admission
 path. The unchanged stage correctly issues no mutation. Local Linux x86-64 /
-Go 1.27.2 / nftables 1.1.6 reference measurements were:
+Go 1.27.2 / nftables 1.1.6 shared-probe reference measurements were:
 
 | Stage | Unique inventory estimate (bytes) | Complete native inventory (bytes) | Mutation input (bytes) |
 | --- | --- | --- | --- |
-| Initial | 31,843,266 | 5,511,021 | 15,881,184 |
-| SSH old/new pair | 63,631,868 | 11,013,646 | 15,879,793 |
-| Unchanged | 31,854,936 | 5,513,889 | 0 |
-| Country-refresh old/new pair | 64,661,038 | 11,525,269 | 16,388,543 |
+| Initial | 15,988,996 | 2,767,985 | 7,955,073 |
+| SSH old/new pair | 31,931,690 | 5,529,849 | 7,955,815 |
+| Unchanged | 16,009,028 | 2,773,128 | 0 |
+| Country-refresh old/new pair | 32,460,472 | 5,789,374 | 8,210,190 |
 
-The largest estimate leaves 36,002,258 bytes under the 96 MiB inventory budget;
-the largest conservative full-input estimate, 16,392,698 bytes, fits the
-unchanged 32 MiB input ceiling. Actual complete pair output fits the coordinated
-128 MiB capture ceiling. This native probe has empty dynamic sets; the daemon
-gate above independently exercises the large live authority and its projection.
-The probe's generator heap/RSS includes deliberately materialized comparison
-batches. Native-child `rusage` peak RSS can include inherited pre-exec generator
-memory and is an upper bound, not pure nft RSS. Neither measurement estimates
-kernel memory; the daemon gate's separate `VmHWM` excludes its HTTP generator.
+The probe maximum remains below the unchanged 96 MiB inventory budget,
+32 MiB per-command input, and 128 MiB capture ceilings. The independent
+460,000-static / 319,000-dynamic native gate still exceeds the combined budget
+with individually admissible payloads and requires an inventory-specific
+capacity error. Sharing policy sets does not shrink that unrelated global-set
+fixture or weaken rejection.
+
+Before/after observations used a saved unshared baseline binary and identical
+initial two-policy source/traffic inputs. The LAPI fixture in both fresh-daemon
+runs contained 107,938,931 bytes and 399,999 unexpired IDs:
+
+| Measurement | Unshared baseline | Shared |
+| --- | ---: | ---: |
+| Geo pair memberships | 367,968 | 183,984 |
+| All static memberships, including 179 unrelated | 368,147 | 184,163 |
+| Source/model/target and batch preparation wall | 480.14 ms | 318.01 ms |
+| Native mutation exec-to-exit wall | 1.397 s | 0.788 s |
+| Measurement-process peak RSS at initial stage | 415,396 KiB | 213,904 KiB |
+| Native child `rusage` peak RSS upper bound | 458,956 KiB | 231,524 KiB |
+| Fresh-daemon initial apply plus inspection wall | 7.785 s | 6.810 s |
+| Fresh-daemon-only `VmHWM` | 790,328 KiB | 365,912 KiB |
+
+Native exec timing was isolated with process-event tracing because the saved
+baseline's aggregate native wall also included inventory inspection. Prefix
+hashing, target construction, batch generation, source fixture memory, and
+compiler allocations belong to the measurement process, not the daemon.
+Native-child `rusage` may include inherited pre-exec generator memory; it is
+not pure nft RSS. Separate daemon `VmHWM` excludes the HTTP fixture generator.
+These observations include allocator/GC and scheduling effects, not a general
+memory percentage or kernel-memory estimate. Only the reported geo pair's
+membership reduction is exactly 50%; other sets and retained generations
+remain.
 
 ## Verification matrix
 
@@ -763,6 +804,8 @@ than one layer when the real boundary matters.
 | Selector algebra | Selector union/subtraction and `netip` prefix compaction produce the expected canonical prefixes. | Unit; PR and release CI |
 | Global and built-in ranges | Global IP/CIDR normalization and built-in local ranges are retained; allow-over-block precedence is explicit. | Unit; privileged netns E2E |
 | Policy priority | Priority ordering, first-matching-traffic-scope compilation, and family-empty allowlist/blocklist behavior remain deterministic. | Unit; privileged netns E2E |
+| Exact static sharing | Equal family-effective geo sequences share one lexicographic representative after collision-safe equality; partial overlaps, internal/dynamic sets and family-inapplicable policies remain separate. Rule ordering, modes, scopes, counters and lookup identities do not change. | Compiler/evaluator/lookup unit; forced-collision regression |
+| Shared native lifecycle | Historical unshared targets recover unchanged, migrate atomically, split/merge, replace representatives and retain old enforcement on failed transitions without orphaned/referenced-set deletion. | Durable-state/app unit; nftables and both iptables netns E2E |
 | Decision ordering | Established/new-flow and global-list/CrowdSec/geo ordering are preserved. | Unit; privileged netns E2E |
 | Geo classifier | Exact geo-classification boundaries and restored exceptions are enforced, including shared/documentation space that `IsGlobalUnicast` does not exclude. | Unit; privileged netns E2E |
 | Country policy | Country allowlist and blocklist behavior is correct by TCP/UDP port. | Privileged IPv4/IPv6 netns E2E where applicable |

@@ -40,7 +40,8 @@ func newPeerNamespace(t *testing.T) *peerNamespace {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proc := exec.Command("unshare", "--net", "--kill-child", "--fork", "sleep", "600")
+	// Keep the namespace alive for the isolated harness's full 15-minute budget.
+	proc := exec.Command("unshare", "--net", "--kill-child", "--fork", "sleep", "900")
 	if err := proc.Start(); err != nil {
 		t.Fatalf("start peer network namespace: %v", err)
 	}

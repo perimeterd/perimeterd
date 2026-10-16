@@ -16,7 +16,10 @@ import (
 const (
 	IPv4Memberships          = 152419
 	IPv6Memberships          = 31565
-	MinimumStaticMemberships = 368147
+	GeoMemberships           = IPv4Memberships + IPv6Memberships
+	UnrelatedMemberships     = 179
+	MinimumStaticMemberships = GeoMemberships + UnrelatedMemberships
+	SSHStaticMemberships     = MinimumStaticMemberships + 4
 	Owner                    = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	InitialID                = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	SSHID                    = "cccccccccccccccccccccccccccccccc"
@@ -56,7 +59,7 @@ policies:
     mode: allowlist
     include:
       countries: [CZ, SK]
-    traffic: ['22']
+    traffic: ['22/tcp', '22/udp']
 `
 	}
 	return text + `  - name: ingress
@@ -146,4 +149,49 @@ func Memberships(families []policy.FamilyPlan) (int, map[string]int) {
 		}
 	}
 	return total, counts
+}
+
+// ValidateShared checks actual materialized membership and every geo rule's
+// consumer binding, rather than treating representative IDs as policy owners.
+func ValidateShared(families []policy.FamilyPlan, ssh bool) error {
+	total, counts := Memberships(families)
+	wantTotal := MinimumStaticMemberships
+	if ssh {
+		wantTotal = SSHStaticMemberships
+	}
+	if total != wantTotal {
+		return fmt.Errorf("static memberships=%d, want %d: %v", total, wantTotal, counts)
+	}
+	for _, family := range families {
+		want := IPv4Memberships
+		if family.Family == policy.IPv6 {
+			want = IPv6Memberships
+		}
+		if counts[fmt.Sprintf("geo/egress/ipv%d", family.Family)] != want {
+			return fmt.Errorf("shared geo membership mismatch: %v", counts)
+		}
+		if _, exists := counts[fmt.Sprintf("geo/ingress/ipv%d", family.Family)]; exists {
+			return fmt.Errorf("duplicate ingress data object: %v", counts)
+		}
+		consumers := map[string]bool{}
+		for _, path := range family.Paths {
+			for _, rule := range path.Rules {
+				if rule.Policy == "ingress" || rule.Policy == "egress" {
+					if rule.Match.SetID == "geo/ingress" {
+						return fmt.Errorf("ingress still references duplicate geo set")
+					}
+					if rule.Match.SetID == "geo/egress" {
+						consumers[rule.Policy] = true
+					}
+				}
+			}
+		}
+		if !consumers["ingress"] || !consumers["egress"] {
+			return fmt.Errorf("shared geo set missing ingress/egress consumers: %v", consumers)
+		}
+		if ssh && counts[fmt.Sprintf("geo/ssh/ipv%d", family.Family)] != 2 {
+			return fmt.Errorf("SSH membership mismatch: %v", counts)
+		}
+	}
+	return nil
 }

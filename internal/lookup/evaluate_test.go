@@ -304,3 +304,59 @@ func TestEvaluateEvidenceLimitDoesNotReturnPartialSuccessOrCancellation(t *testi
 		t.Fatalf("over-budget response = %#v", response)
 	}
 }
+
+func TestSharedMembershipLookupRetainsOriginalPolicy(t *testing.T) {
+	static, _ := buildStatic(t, `version: 1
+firewall:
+  backend: nftables
+  ipv4: true
+  ipv6: true
+policies:
+  - name: ingress
+    priority: 100
+    direction: ingress
+    mode: allowlist
+    traffic: [any]
+    include:
+      countries: [CZ]
+  - name: egress
+    priority: 20
+    direction: egress
+    mode: blocklist
+    traffic: [any]
+    include:
+      countries: [CZ]
+`, policy.ResolvedSelector{
+		Selector: policy.Selector{Kind: policy.Country, Value: "CZ"},
+		IPv4:     []netip.Prefix{netip.MustParsePrefix("8.20.0.2/32")},
+		IPv6:     []netip.Prefix{netip.MustParsePrefix("2600:20::2/128")},
+	})
+	for _, address := range []string{"8.20.0.2", "2600:20::2"} {
+		for _, direction := range []policy.Direction{policy.Ingress, policy.Egress} {
+			response := lookup.Evaluate(context.Background(), static, lookup.Dynamic{}, lookup.Request{
+				Address: address, Direction: direction, Protocol: "tcp", Port: ptr(uint16(443)),
+			}, time.Now())
+			verdict, priority := "not_blocked", 100
+			if direction == policy.Egress {
+				verdict, priority = "blocked", 20
+			}
+			if response.Verdict != verdict || len(response.Outcomes) != 1 {
+				t.Fatalf("%s %s outcome = %#v", address, direction, response)
+			}
+			outcome := response.Outcomes[0]
+			if outcome.Policy != string(direction) || outcome.Priority != priority {
+				t.Fatalf("shared representative replaced original lookup policy: %#v", outcome)
+			}
+			found := false
+			for _, evidence := range outcome.Evidence {
+				if evidence.Contributing && evidence.Policy != "" && evidence.Policy != string(direction) {
+					t.Fatalf("shared set leaked representative policy into evidence: %#v", evidence)
+				}
+				found = found || evidence.Policy == string(direction) && evidence.Contributing
+			}
+			if !found {
+				t.Fatalf("missing original-policy source attribution: %#v", outcome)
+			}
+		}
+	}
+}

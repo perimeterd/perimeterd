@@ -165,13 +165,12 @@ func compileFamily(family Family, allow, block prefix.Set, policies []compiledPo
 	if len(familyPolicies) != 0 {
 		sets = append(sets, PrefixSet{ID: "geo_eligible", Kind: StaticSet, Prefixes: GeoEligible(family).Prefixes()})
 	}
-	for _, value := range familyPolicies {
-		sets = append(sets, PrefixSet{ID: "geo/" + value.policy.Name, Kind: StaticSet, Prefixes: value.includedFamily(family).Prefixes()})
-	}
+	geoSets, bindings := compileGeoSets(family, familyPolicies)
+	sets = append(sets, geoSets...)
 
 	paths := []Path{
-		compilePath(Ingress, SourceAddress, family, allow, block, familyPolicies, crowdsec, deny),
-		compilePath(Egress, DestinationAddress, family, allow, block, familyPolicies, false, deny),
+		compilePath(Ingress, SourceAddress, family, allow, block, familyPolicies, bindings, crowdsec, deny),
+		compilePath(Egress, DestinationAddress, family, allow, block, familyPolicies, bindings, false, deny),
 	}
 	return FamilyPlan{Family: family, Sets: sets, Paths: paths}
 }
@@ -190,7 +189,7 @@ func allowFamily(value prefix.Set, family Family) prefix.Set {
 	return value.IPv6()
 }
 
-func compilePath(direction Direction, remote RemoteField, family Family, allow, block prefix.Set, policies []compiledPolicy, crowdsec bool, deny Action) Path {
+func compilePath(direction Direction, remote RemoteField, family Family, allow, block prefix.Set, policies []compiledPolicy, bindings map[string]string, crowdsec bool, deny Action) Path {
 	processed := CounterRole{Kind: Processed}
 	path := Path{Direction: direction, Remote: remote, Processed: processed}
 	any := Scope{Any: true}
@@ -233,7 +232,7 @@ func compilePath(direction Direction, remote RemoteField, family Family, allow, 
 		if !ok {
 			continue
 		}
-		setID := "geo/" + value.policy.Name
+		setID := bindings[value.policy.Name]
 		if value.policy.Mode == "blocklist" {
 			path.Rules = append(path.Rules,
 				Rule{Match: Match{SetID: setID, Traffic: scope}, Action: deny, Policy: value.policy.Name, Counter: CounterRole{Kind: Denied, Reason: GeoPolicy, Action: deny}},

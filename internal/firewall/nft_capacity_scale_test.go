@@ -64,6 +64,10 @@ func TestNFTProductionCapacityMeasurement(t *testing.T) {
 		{"refresh", capacityfixture.RefreshID, true, true},
 	} {
 		started := time.Now()
+		var compileBefore syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &compileBefore); err != nil {
+			t.Fatal(err)
+		}
 		cfg, model, err := capacityfixture.Compile("capacity_measure", stage.ssh, stage.refresh)
 		if err != nil {
 			t.Fatal(err)
@@ -72,9 +76,14 @@ func TestNFTProductionCapacityMeasurement(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		var compileAfter syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &compileAfter); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("stage=%s compile-target-wall=%s compile-target-user=%s compile-target-system=%s", stage.name, time.Since(started), time.Duration(compileAfter.Utime.Nano()-compileBefore.Utime.Nano()), time.Duration(compileAfter.Stime.Nano()-compileBefore.Stime.Nano()))
 		total, counts := capacityfixture.Memberships(target.Families)
-		if total < capacityfixture.MinimumStaticMemberships {
-			t.Fatalf("coalesced fixture: %d %v", total, counts)
+		if err := capacityfixture.ValidateShared(target.Families, stage.ssh); err != nil {
+			t.Fatalf("coalesced or unshared fixture: %v", err)
 		}
 		batch, err := commandBatch(target, nil, nil)
 		if err != nil {
@@ -92,6 +101,7 @@ func TestNFTProductionCapacityMeasurement(t *testing.T) {
 		retained := capacity.tables[target.Table]
 		t.Logf("stage=%s estimated-input-bytes=%d unique-inventory-estimate=%d static-generations=%d dynamic-generations=%d", stage.name, capacity.inputs[target], retained.estimate(), len(retained.staticIDs), len(retained.dynamicIDs))
 		t.Logf("stage=%s static-memberships=%d per-set=%v generation=%s dynamic-generation=%s generated-bytes=%d old-single-estimate=%d old-pair-estimate=%d generator-wall=%s", stage.name, total, counts, target.Generation, target.DynamicGeneration, len(encoded), estimate, estimate+oldEstimate, time.Since(started))
+		t.Logf("stage=%s shared-geo-memberships=%d historical-unshared-geo-memberships=%d exact-geo-savings=%d unrelated-memberships=%d", stage.name, capacityfixture.GeoMemberships, 2*capacityfixture.GeoMemberships, capacityfixture.GeoMemberships, capacityfixture.UnrelatedMemberships)
 		if previous != nil {
 			// Measuring a full pair intentionally materializes both generations.
 			// Shared objects are omitted by the real observed-inventory generator.
@@ -107,6 +117,7 @@ func TestNFTProductionCapacityMeasurement(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Logf("stage=%s retained-old-static=%s retained-new-static=%s shared-static-identity=%t", stage.name, previous.Generation, target.Generation, previous.Generation == target.Generation)
 		}
 		started = time.Now()
 		var nativeUser, nativeSystem time.Duration
@@ -123,6 +134,7 @@ func TestNFTProductionCapacityMeasurement(t *testing.T) {
 			// Match the backend: unchanged inventory requires no native mutation.
 			encoded = nil
 		}
+		nativeWall := time.Since(started)
 		// #nosec G204 -- table is generated locally and mutation requires a verified private namespace.
 		listed := exec.CommandContext(ctx, "nft", "-j", "list", "table", "inet", target.Table)
 		inventory, err := listed.Output()
@@ -136,9 +148,22 @@ func TestNFTProductionCapacityMeasurement(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Logf("stage=%s generator-maxrss-kib=%d generator-user=%v generator-system=%v", stage.name, generator.Maxrss, generator.Utime, generator.Stime)
-		t.Logf("stage=%s mutation-bytes=%d native-inventory-bytes=%d native-wall=%s native-user=%s native-system=%s native-maxrss-kib=%d generator-heap-bytes=%d", stage.name, len(encoded), len(inventory), time.Since(started), nativeUser, nativeSystem, nativeMaxRSS, memory.HeapAlloc)
+		t.Logf("stage=%s mutation-bytes=%d native-inventory-bytes=%d native-wall=%s native-user=%s native-system=%s native-maxrss-kib=%d generator-heap-bytes=%d", stage.name, len(encoded), len(inventory), nativeWall, nativeUser, nativeSystem, nativeMaxRSS, memory.HeapAlloc)
 		t.Log("native child rusage maxrss is an upper bound: it may include inherited pre-exec generator RSS, not only nft resident memory")
 		if previous != nil {
+			observed, err := NewNFT().inspect(ctx, target.Table)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, retained := range []*Target{previous, target} {
+				for _, family := range retained.Families {
+					for _, set := range family.Sets {
+						if !observed.hasSet(setName(retained, family.Family, set.ID)) {
+							t.Fatalf("missing real retained native set: generation=%s family=%d id=%s", retained.Generation, family.Family, set.ID)
+						}
+					}
+				}
+			}
 			if err := NewNative(nil).Retire(ctx, previous, target); err != nil {
 				t.Fatal(fmt.Errorf("retire measured pair: %w", err))
 			}

@@ -125,11 +125,21 @@ func writeStatus(w io.Writer, result control.StatusResult) error {
 		for _, count := range details.PrefixCounts {
 			fmt.Fprintf(&out, "  family=%s source=%s type=%s count=%d\n", count.Family, count.Source, count.Type, count.Count)
 		}
-		out.WriteString("Compiled firewall sets (static target memberships; duplicates across sets included; not a kernel audit):\n")
+		out.WriteString("Compiled firewall sets (static target memberships; shared sets counted once; not a kernel audit):\n")
 		for _, family := range [...]string{"ipv4", "ipv6"} {
 			for _, set := range details.CompiledSets.Sets {
 				if set.Family == family {
-					fmt.Fprintf(&out, "  family=%s set=%s count=%d\n", family, set.ID, set.Count)
+					fmt.Fprintf(&out, "  family=%s set=%s policies=", family, set.ID)
+					if len(set.Policies) == 0 {
+						out.WriteByte('-')
+					}
+					for i, name := range set.Policies {
+						if i != 0 {
+							out.WriteByte(',')
+						}
+						out.WriteString(name)
+					}
+					fmt.Fprintf(&out, " count=%d\n", set.Count)
 				}
 			}
 			for _, total := range details.CompiledSets.Totals {

@@ -9,6 +9,7 @@ publication, recovery, and the cross-target migration algorithm;
 ## Contents
 
 - [Common invariants](#common-invariants)
+- [Shared static policy sets](#shared-static-policy-sets)
 - [Logical packet path](#logical-packet-path)
 - [Packet and byte accounting](#packet-and-byte-accounting)
 - [nftables](#nftables)
@@ -80,6 +81,42 @@ traffic scope, `/0` lowering, and new-flow-only behavior remain unchanged. See
 The [named-provider selectors](configuration.md#named-providers)
 use these same static sets and invariants. They add no provider-specific kernel
 objects, verdict stage, or source-fetching responsibility to either backend.
+
+## Shared static policy sets
+
+Within one address family and static generation, geo policies with exactly
+equal effective canonical prefix sequences use one data set. This applies even
+when their selectors, directions, priorities, modes, or traffic scopes differ.
+The representative is the lexicographically smallest policy name, with the
+existing `geo/<name>` ID. IPv4 and IPv6 classes are independent; equal empty
+applicable sets may share, but an inapplicable policy gains no set or rule.
+
+This is materialized storage sharing in the common compiler, not suppression of
+status rows. Both direction rules reference the shared nft set or corresponding
+ipset with their original source/destination orientation. Rule policy identity,
+traffic scope, action, counter roles, first-match ordering, and CrowdSec
+precedence remain unchanged. Lookup explanations identify the original matching
+policy, not the representative data object's suffix.
+
+Global allow/block lists, `geo_eligible`, and dynamic CrowdSec sets are never
+interned into policy classes. Unequal or partially overlapping membership stays
+separate; the compiler does not create common subsets or change prefix
+normalization. Native interval representation and `/0` lowering still differ
+from logical prefix membership counts.
+
+Every changed source snapshot recomputes equality. A policy can split from a
+class, converge again, or share in only one family. Removing/renaming the
+representative can change the set ID and static generation. The normal atomic
+generation switch, durable commit, and subsequent retirement handle those
+changes; old acknowledged sets are never modified or deleted before commit.
+Sharing never crosses retained generations, so genuinely distinct old/new
+objects remain separately budgeted.
+
+Version-2 historical unshared targets recover as recorded and migrate on normal
+application. No manifest rewriting, manual journal deletion, legacy compiler,
+or durable-format bump is required. Status reports actual static objects with
+explicit policy consumers; it does not claim unique address counts, hypothetical
+sharing, or a proportional daemon/native memory reduction.
 
 ## Logical packet path
 

@@ -85,6 +85,14 @@ func buildStatusDetails(candidate Candidate, target *firewall.Target) (*control.
 	for _, family := range target.Families {
 		name := firewallFamily(family.Family)
 		details.Firewall.Families = append(details.Firewall.Families, name)
+		consumers := make(map[string][]string)
+		for _, path := range family.Paths {
+			for _, rule := range path.Rules {
+				if rule.Policy != "" && rule.Match.SetID != "" {
+					consumers[rule.Match.SetID] = append(consumers[rule.Match.SetID], rule.Policy)
+				}
+			}
+		}
 		var total uint64
 		for _, set := range family.Sets {
 			if set.Kind != policy.StaticSet {
@@ -94,7 +102,13 @@ func buildStatusDetails(candidate Candidate, target *firewall.Target) (*control.
 			if count > math.MaxUint64-total {
 				return nil, errors.New("compiled firewall set memberships overflow")
 			}
-			details.CompiledSets.Sets = append(details.CompiledSets.Sets, control.StatusCompiledSet{Family: name, ID: set.ID, Count: count})
+			policies := consumers[set.ID]
+			sort.Strings(policies)
+			policies = slices.Compact(policies)
+			if policies == nil {
+				policies = []string{}
+			}
+			details.CompiledSets.Sets = append(details.CompiledSets.Sets, control.StatusCompiledSet{Family: name, ID: set.ID, Policies: policies, Count: count})
 			total += count
 		}
 		details.CompiledSets.Totals = append(details.CompiledSets.Totals, control.StatusCompiledTotal{Family: name, Count: total})
@@ -169,6 +183,9 @@ func cloneStatusDetails(value *control.StatusDetails) *control.StatusDetails {
 	}
 	result.PrefixCounts = slices.Clone(value.PrefixCounts)
 	result.CompiledSets.Sets = slices.Clone(value.CompiledSets.Sets)
+	for i := range result.CompiledSets.Sets {
+		result.CompiledSets.Sets[i].Policies = slices.Clone(value.CompiledSets.Sets[i].Policies)
+	}
 	result.CompiledSets.Totals = slices.Clone(value.CompiledSets.Totals)
 	return &result
 }

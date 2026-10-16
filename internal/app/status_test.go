@@ -52,12 +52,20 @@ func TestStatusAppliedRecoveryAndCleanup(t *testing.T) {
 	wantCompiled := details.CompiledSets
 	wantCompiled.Sets = slices.Clone(wantCompiled.Sets)
 	wantCompiled.Totals = slices.Clone(wantCompiled.Totals)
+	for i := range wantCompiled.Sets {
+		wantCompiled.Sets[i].Policies = slices.Clone(wantCompiled.Sets[i].Policies)
+	}
 	// Returned metadata cannot corrupt the daemon's shared applied snapshot.
 	details.Firewall.Families[0] = "corrupted"
 	details.PrefixCounts[0].Count = 99999
 	details.CompiledSets.Sets[0].ID = "corrupted"
 	details.CompiledSets.Sets[0].Count = 99999
 	details.CompiledSets.Totals[0].Count = 99999
+	for i := range details.CompiledSets.Sets {
+		if len(details.CompiledSets.Sets[i].Policies) > 0 {
+			details.CompiledSets.Sets[i].Policies[0] = "corrupted"
+		}
+	}
 	again := engine.Status(context.Background())
 	if again.Applied.Details.Firewall.Families[0] != "ipv4" || again.Applied.Details.PrefixCounts[0].Count == 99999 {
 		t.Fatal("status output mutated published state")

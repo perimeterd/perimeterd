@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -84,6 +85,16 @@ func TestE2ECapacityDaemonHelper(t *testing.T) {
 		Checkpoint: func(label string) error {
 			if checkpoint != "" && checkpoint == label {
 				os.Exit(97)
+			}
+			if label == "after-switch" {
+				if marker := os.Getenv("PERIMETERD_CAPACITY_FAIL_FILE"); marker != "" {
+					if _, err := os.Stat(marker); err == nil { // #nosec G703 -- marker is created by this private namespace fixture.
+						if err := os.Remove(marker); err != nil { // #nosec G703 -- removes only that fixture-owned marker.
+							return err
+						}
+						return errors.New("injected capacity reload failure after native switch")
+					}
+				}
 			}
 			return nil
 		},
@@ -238,23 +249,10 @@ func capacityAssertState(t *testing.T, ssh bool) *state.Revision {
 		t.Fatalf("persisted policies=%d, want %d", len(revision.Config.Policies), wantPolicies)
 	}
 	total, counts := capacityfixture.Memberships(revision.Target.Families)
-	if total < capacityfixture.MinimumStaticMemberships {
-		t.Fatalf("production fixture coalesced: total=%d counts=%v", total, counts)
+	if err := capacityfixture.ValidateShared(revision.Target.Families, ssh); err != nil {
+		t.Fatal(err)
 	}
-	for _, family := range []int{4, 6} {
-		want := capacityfixture.IPv4Memberships
-		if family == 6 {
-			want = capacityfixture.IPv6Memberships
-		}
-		for _, direction := range []string{"ingress", "egress"} {
-			if counts[fmt.Sprintf("geo/%s/ipv%d", direction, family)] != want {
-				t.Fatalf("wrong postcompile membership: %v", counts)
-			}
-		}
-		if ssh && counts[fmt.Sprintf("geo/ssh/ipv%d", family)] != 2 {
-			t.Fatalf("SSH country membership lost: %v", counts)
-		}
-	}
+	capacityAssertStatusAndNative(t, revision, false)
 	t.Logf("applied=%s static-generation=%s dynamic-generation=%s memberships=%d per-set=%v", revision.ID, revision.Target.Generation, revision.Target.DynamicGeneration, total, counts)
 	return revision
 }
@@ -314,7 +312,7 @@ func capacityMeasure(t *testing.T, daemon *daemonProcess, table, phase string, s
 	}
 }
 
-func capacityPackets(t *testing.T, peer *peerNamespace, ssh, banned bool) {
+func capacityPackets(t *testing.T, peer *peerNamespace, ssh, banned, udpSSH bool) {
 	t.Helper()
 	for _, network := range []string{"tcp4", "tcp6"} {
 		for _, subnet := range []string{"20", "21", "22", "23"} {
@@ -333,6 +331,11 @@ func capacityPackets(t *testing.T, peer *peerNamespace, ssh, banned bool) {
 				sshAllow = "drop"
 			}
 			probeIngress(t, peer, network, host+":22", sshAllow, "tcp")
+			udpAllow := allow
+			if udpSSH && subnet == "22" {
+				udpAllow = "drop"
+			}
+			probeIngress(t, peer, strings.Replace(network, "tcp", "udp", 1), host+":22", udpAllow, "udp")
 			probeIngress(t, peer, network, host+":18880", allow, "tcp")
 			// CrowdSec only guards ingress; egress still follows the broader group.
 			egress := "success"
@@ -384,7 +387,9 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	failFile := filepath.Join(t.TempDir(), "fail-after-switch")
 	start := func(extra ...string) *daemonProcess {
+		extra = append(extra, "PERIMETERD_CAPACITY_FAIL_FILE="+failFile)
 		daemon := startDaemonCommand(t, capacityCommand(configPath, server.URL, extra...), "production capacity daemon", func() bool { return activeRevision() != "" }, 3*time.Minute)
 		fixture.mu.Lock()
 		deleted := fixture.deletePeers
@@ -396,26 +401,36 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 		return daemon
 	}
 	started := time.Now()
-	write(false)
+	write(true)
+	historical := capacityStageHistorical(t, configPath, server.URL, peer)
+	capacityMeasure(t, nil, table, "recorded-unshared-recovery", started)
 	daemon := start()
+	migrated := capacityAssertState(t, true)
+	if migrated.Target.Generation == historical.Target.Generation {
+		t.Fatal("normal startup did not migrate the recorded unshared generation")
+	}
+	capacityMeasure(t, daemon, table, "recorded-unshared-to-shared", started)
+	capacityPackets(t, peer, true, true, true)
+	write(false)
+	previousInitial := activeRevision()
+	initialOutput := command(t, 180*time.Second, e2eBinary(t), "reload")
+	assertReloadAcknowledgement(t, previousInitial, reloadConfigDigest(t, configPath), initialOutput)
 	initial := capacityAssertState(t, false)
 	fixture.mu.Lock()
 	size := fixture.bytes
 	fixture.mu.Unlock()
-	if size < 98_499_095 {
-		t.Fatalf("large full LAPI stream too small: %d", size)
+	if size != 107_938_931 {
+		t.Fatalf("large full LAPI stream changed: %d bytes, want 107938931", size)
 	}
-	status := largeCrowdStatus(t)
-	if status.Applied.Details == nil || status.Applied.Details.CrowdSec.Counts == nil {
-		t.Fatal("missing live decision counts")
-	}
+	status := capacityReadyStatus(t)
 	counts := *status.Applied.Details.CrowdSec.Counts
 	if counts.IPv4 != crowdsecfixture.LargeCount-2 || counts.IPv6 != 1 {
 		t.Fatalf("unique live decision counts=%+v", counts)
 	}
 	t.Logf("full-LAPI-bytes=%d unique-live-IDs=%d IPv4-IDs=%d IPv6-IDs=%d (not a native prefix count)", size, counts.IPv4+counts.IPv6, counts.IPv4, counts.IPv6)
 	capacityMeasure(t, daemon, table, "initial", started)
-	capacityPackets(t, peer, false, true)
+	t.Logf("exact shared geo savings=%d memberships (historical pair=%d shared=%d; unrelated=%d)", capacityfixture.GeoMemberships, 2*capacityfixture.GeoMemberships, capacityfixture.GeoMemberships, capacityfixture.UnrelatedMemberships)
+	capacityPackets(t, peer, false, true, false)
 
 	started = time.Now()
 	before := activeRevision()
@@ -427,7 +442,77 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 		t.Fatal("SSH reload did not create distinct static generation")
 	}
 	capacityMeasure(t, daemon, table, "add-ssh", started)
-	capacityPackets(t, peer, true, true)
+	capacityPackets(t, peer, true, true, true)
+
+	// Change only egress's effective membership, leaving ingress and SSH intact.
+	started = time.Now()
+	beforeSplitStatus := capacityReadyStatus(t)
+	baseText, err := os.ReadFile(configPath) // #nosec G304 -- private namespace policy fixture.
+	if err != nil {
+		t.Fatal(err)
+	}
+	splitText := string(baseText)
+	marker := "  - name: egress\n"
+	position := strings.Index(splitText, marker)
+	if position < 0 {
+		t.Fatal("missing egress policy")
+	}
+	splitText = splitText[:position] + strings.Replace(splitText[position:], "    traffic: [any]", "    exclude:\n      countries: [CZ]\n    traffic: [any]", 1)
+	if err := os.WriteFile(configPath, []byte(splitText), 0o600); err != nil { // #nosec G703 -- private namespace policy fixture.
+		t.Fatal(err)
+	}
+	before = activeRevision()
+	output = command(t, 180*time.Second, e2eBinary(t), "reload")
+	assertReloadAcknowledgement(t, before, reloadConfigDigest(t, configPath), output)
+	split := capacityReadRevision(t)
+	capacityAssertSplit(t, split)
+	splitStatus := capacityReadyStatus(t)
+	if !reflect.DeepEqual(splitStatus.Applied.Details.PrefixCounts, beforeSplitStatus.Applied.Details.PrefixCounts) ||
+		!reflect.DeepEqual(splitStatus.Applied.Details.CrowdSec.Counts, beforeSplitStatus.Applied.Details.CrowdSec.Counts) {
+		t.Fatal("geo sharing split changed source or live decision accounting")
+	}
+	capacityMeasure(t, daemon, table, "split-egress-only", started)
+	for _, network := range []string{"tcp4", "tcp6"} {
+		host, remote := "8.20.0.1:18885", "8.20.0.2:18886"
+		if network == "tcp6" {
+			host, remote = "[2600:20::1]:18885", "[2600:20::2]:18886"
+		}
+		probeIngress(t, peer, network, host, "success", "tcp")
+		probeEgress(t, peer, network, remote, "drop", "tcp")
+	}
+	started = time.Now()
+	if err := os.WriteFile(configPath, baseText, 0o600); err != nil { // #nosec G703 -- restores the private namespace policy fixture.
+		t.Fatal(err)
+	}
+	before = activeRevision()
+	output = command(t, 180*time.Second, e2eBinary(t), "reload")
+	assertReloadAcknowledgement(t, before, reloadConfigDigest(t, configPath), output)
+	withSSH = capacityAssertState(t, true)
+	capacityMeasure(t, daemon, table, "merge-egress", started)
+	capacityPackets(t, peer, true, true, true)
+
+	// A failure after the actual native switch must roll back the previous
+	// acknowledged shared representation, including its live CrowdSec leases.
+	beforeRollback := capacityReadRevision(t)
+	if err := os.WriteFile(configPath, []byte(splitText), 0o600); err != nil { // #nosec G703 -- private namespace rollback fixture.
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(failFile, []byte("fail"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rollbackCmd := exec.Command(e2eBinary(t), "reload") // #nosec G204 -- trusted fixture CLI with fixed arguments.
+	if output, err := rollbackCmd.CombinedOutput(); err == nil {
+		t.Fatalf("post-switch failed reload was acknowledged: %s", output)
+	}
+	afterRollback := capacityAssertState(t, true)
+	if afterRollback.ID != beforeRollback.ID || !reflect.DeepEqual(afterRollback.Target, beforeRollback.Target) {
+		t.Fatal("failed reload changed acknowledged shared target")
+	}
+	capacityPackets(t, peer, true, true, true)
+	capacityMeasure(t, daemon, table, "post-switch-rollback", time.Now())
+	if err := os.WriteFile(configPath, baseText, 0o600); err != nil { // #nosec G703 -- restores the private namespace policy fixture.
+		t.Fatal(err)
+	}
 
 	started = time.Now()
 	before = activeRevision()
@@ -467,7 +552,7 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	if afterDynamic.Target.Generation != refreshed.Target.Generation {
 		t.Fatal("independent dynamic change replaced static generation")
 	}
-	capacityPackets(t, peer, true, false)
+	capacityPackets(t, peer, true, false, true)
 	capacityMeasure(t, daemon, table, "dynamic-delete", time.Now())
 	daemon.stop(t)
 
@@ -491,7 +576,7 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	started = time.Now()
 	daemon = start()
 	capacityAssertState(t, true)
-	capacityPackets(t, peer, true, false)
+	capacityPackets(t, peer, true, false, true)
 	capacityMeasure(t, daemon, table, "same-ID-recovery", started)
 	daemon.stop(t)
 
@@ -523,7 +608,7 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	}
 	daemon = start()
 	capacityAssertState(t, true)
-	capacityPackets(t, peer, true, false)
+	capacityPackets(t, peer, true, false, true)
 	daemon.stop(t)
 
 	capacityNativeFailureCases(t, configPath, server.URL, start)

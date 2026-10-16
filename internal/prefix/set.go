@@ -4,14 +4,16 @@ package prefix
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"net/netip"
+	"slices"
 	"sort"
 )
 
 // Set is an immutable, canonical collection of non-overlapping IP prefixes.
 //
 // The zero Set is an empty set. Prefixes are sorted by family, network address,
-// and prefix length. All methods that expose prefixes return independent copies.
+// and prefix length. Methods expose independent copies or immutable value iterators.
 type Set struct {
 	prefixes []netip.Prefix
 	v6Start  int
@@ -119,6 +121,11 @@ func (set Set) Prefixes() []netip.Prefix {
 		return []netip.Prefix{}
 	}
 	return append([]netip.Prefix(nil), set.prefixes...)
+}
+
+// All iterates canonical prefix values without copying the backing collection.
+func (set Set) All() iter.Seq[netip.Prefix] {
+	return slices.Values(set.prefixes)
 }
 
 // IPv4 returns an immutable view containing only the set's IPv4 prefixes.

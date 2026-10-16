@@ -187,6 +187,14 @@ func validateStatusCompiledSets(families []string, compiled StatusCompiledSets) 
 		if !enabled || set.ID == "" {
 			return errors.New("invalid compiled firewall set identity")
 		}
+		if set.Policies == nil {
+			return errors.New("missing compiled firewall set policies")
+		}
+		for i, name := range set.Policies {
+			if name == "" || (i > 0 && set.Policies[i-1] >= name) {
+				return errors.New("invalid compiled firewall set policies")
+			}
+		}
 		key := identity{family: set.Family, id: set.ID}
 		if _, exists := seen[key]; exists {
 			return errors.New("duplicate compiled firewall set")

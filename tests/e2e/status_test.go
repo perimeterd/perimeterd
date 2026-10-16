@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -141,12 +142,15 @@ func expectedStatusCompiled(reloaded bool) control.StatusCompiledSets {
 		// Built-in local allow ranges plus one explicit allow prefix per family;
 		// the classifier's normative internal set also contributes exactly once.
 		rows := []control.StatusCompiledSet{
-			{Family: name, ID: "geo/egress", Count: egress},
-			{Family: name, ID: "geo/ingress", Count: 3},
-			{Family: name, ID: "geo/ssh", Count: ssh},
-			{Family: name, ID: "geo_eligible", Count: uint64(len(policy.GeoEligible(family).Prefixes()))},
-			{Family: name, ID: "global_allowlist", Count: allow},
-			{Family: name, ID: "global_blocklist", Count: 1},
+			{Family: name, ID: "geo/egress", Policies: []string{"egress", "ingress"}, Count: egress},
+			{Family: name, ID: "geo/ssh", Policies: []string{"ssh"}, Count: ssh},
+			{Family: name, ID: "geo_eligible", Policies: []string{}, Count: uint64(len(policy.GeoEligible(family).Prefixes()))},
+			{Family: name, ID: "global_allowlist", Policies: []string{}, Count: allow},
+			{Family: name, ID: "global_blocklist", Policies: []string{}, Count: 1},
+		}
+		if reloaded {
+			rows[0].Policies = []string{"egress"}
+			rows = slices.Insert(rows, 1, control.StatusCompiledSet{Family: name, ID: "geo/ingress", Policies: []string{"ingress"}, Count: 3})
 		}
 		var total uint64
 		for _, row := range rows {
@@ -206,9 +210,13 @@ func assertStatusCLI(t *testing.T, phase string, reloaded bool) control.StatusRe
 		}
 		t.Fatalf("status text missing targeted line %q:\n%s", want, text)
 	}
-	hasLine("Compiled firewall sets (static target memberships; duplicates across sets included; not a kernel audit):")
+	hasLine("Compiled firewall sets (static target memberships; shared sets counted once; not a kernel audit):")
 	for _, row := range want.Sets {
-		hasLine(fmt.Sprintf("  family=%s set=%s count=%d", row.Family, row.ID, row.Count))
+		policies := "-"
+		if len(row.Policies) != 0 {
+			policies = strings.Join(row.Policies, ",")
+		}
+		hasLine(fmt.Sprintf("  family=%s set=%s policies=%s count=%d", row.Family, row.ID, policies, row.Count))
 	}
 	for _, total := range want.Totals {
 		hasLine(fmt.Sprintf("  family=%s total_memberships=%d", total.Family, total.Count))

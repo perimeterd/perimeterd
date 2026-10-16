@@ -327,8 +327,8 @@ func TestGeoPolicyEligibleSetNameDoesNotAliasReservedSet(t *testing.T) {
 	target := testTarget(t, testGenA)
 	target.Families = policy.CloneFamilies(target.Families)
 	target.Families[0].Sets = append(target.Families[0].Sets,
-		policy.PrefixSet{ID: "geo_eligible", Kind: policy.StaticSet},
-		policy.PrefixSet{ID: "geo/eligible", Kind: policy.StaticSet},
+		policy.PrefixSet{ID: "geo_eligible", Kind: policy.StaticSet, Prefixes: []netip.Prefix{netip.MustParsePrefix("8.0.0.0/8")}},
+		policy.PrefixSet{ID: "geo/eligible", Kind: policy.StaticSet, Prefixes: []netip.Prefix{netip.MustParsePrefix("9.0.0.0/8")}},
 	)
 	if err := ValidateTarget(target); err != nil {
 		t.Fatal(err)

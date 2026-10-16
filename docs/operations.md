@@ -362,12 +362,15 @@ and byte statistics remain on the [Prometheus surface](#prometheus-metrics).
 **Compiled firewall sets** is a separate static-only summary of the last
 acknowledged target. Each row reports the prefix count of one logical set,
 after compilation/normalization, and each enabled family has a membership
-total. The same prefix contributes again when it belongs to another set:
-identical ingress/egress selectors therefore have distinct rows. Logical sets
-referenced by multiple paths still contribute only once each. Internal sets
-such as `geo_eligible` are included; `global_allowlist` includes built-in local
-ranges. Present zero-count static sets and zero family totals remain visible;
-disabled families and absent sets are not invented.
+total. Equal policy memberships share one row per family, with sorted
+`policies` consumers derived from actual rule references. The representative
+`geo/<name>` identifies the data object, not its sole policy. Empty consumers
+print as `policies=-`. Different family memberships may share differently.
+Distinct, overlapping sets still contribute separately; global/internal sets
+are not merged into policy sets. `geo_eligible` remains included, and
+`global_allowlist` includes built-in local ranges. Present zero-count static sets
+and zero family totals remain visible; disabled families and absent sets are
+not invented.
 
 These totals reveal repeated memberships, not a count of duplicates or unique
 addresses. They are not native interval markers, ipset allocation sizes, memory
@@ -406,29 +409,31 @@ Loaded source prefix elements (per family/source/type; not unique IPs or packet 
   family=ipv6 source=global type=blocklist count=1
   family=ipv6 source=local type=local count=3
   family=ipv6 source=ripestat type=country count=5
-Compiled firewall sets (static target memberships; duplicates across sets included; not a kernel audit):
-  family=ipv4 set=geo/egress count=3
-  family=ipv4 set=geo/ingress count=3
-  family=ipv4 set=geo/ssh count=1
-  family=ipv4 set=geo_eligible count=118
-  family=ipv4 set=global_allowlist count=6
-  family=ipv4 set=global_blocklist count=1
-  family=ipv4 total_memberships=132
-  family=ipv6 set=geo/egress count=3
-  family=ipv6 set=geo/ingress count=3
-  family=ipv6 set=geo/ssh count=2
-  family=ipv6 set=geo_eligible count=53
-  family=ipv6 set=global_allowlist count=4
-  family=ipv6 set=global_blocklist count=1
-  family=ipv6 total_memberships=66
+Compiled firewall sets (static target memberships; shared sets counted once; not a kernel audit):
+  family=ipv4 set=geo/egress policies=egress,ingress count=3
+  family=ipv4 set=geo/ssh policies=ssh count=1
+  family=ipv4 set=geo_eligible policies=- count=118
+  family=ipv4 set=global_allowlist policies=- count=6
+  family=ipv4 set=global_blocklist policies=- count=1
+  family=ipv4 total_memberships=129
+  family=ipv6 set=geo/egress policies=egress,ingress count=3
+  family=ipv6 set=geo/ssh policies=ssh count=2
+  family=ipv6 set=geo_eligible policies=- count=53
+  family=ipv6 set=global_allowlist policies=- count=4
+  family=ipv6 set=global_blocklist policies=- count=1
+  family=ipv6 total_memberships=63
   Dynamic CrowdSec memberships excluded; decision counts reported separately.
 ```
 
-JSON retains full identifiers and uses `schema_version: 2`. Applied details
-require `compiled_sets.sets` rows (`family`, `id`, unsigned `count`) and
-`compiled_sets.totals` rows (`family`, unsigned `count`). Collections are
-non-null arrays; each present family has one total, even when zero. Empty or
+JSON retains full identifiers and uses `schema_version: 3`. Applied details
+require `compiled_sets.sets` rows (`family`, `id`, unsigned `count`, sorted unique
+`policies`) and `compiled_sets.totals` rows (`family`, unsigned `count`).
+Consumer arrays must be present even when empty. Collections are non-null
+arrays; each present family has one total, even when zero. Empty or
 unavailable applied states retain their existing absence of details.
+Historical unshared revisions show their actual separate rows until a new
+shared representation commits. Migration and failed-reload recovery use the
+ordinary journal protocol; do not delete state to force sharing.
 For example, select all three count concepts without parsing text labels:
 
 ```sh
