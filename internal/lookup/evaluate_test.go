@@ -22,6 +22,7 @@ func buildStatic(t *testing.T, text string, records ...policy.ResolvedSelector) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Geo.CountryProvider = config.CountryProviderRIPEstat
 	cache, err := source.NewCache(filepath.Join(t.TempDir(), "state"), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -59,6 +60,8 @@ func buildStatic(t *testing.T, text string, records ...policy.ResolvedSelector) 
 
 func TestNewStaticOwnsTargetFamilies(t *testing.T) {
 	cfg, err := config.Parse([]byte(`version: 1
+geo:
+  country_provider: ripestat
 firewall:
   backend: nftables
   ipv4: true

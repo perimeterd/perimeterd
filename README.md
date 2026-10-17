@@ -37,7 +37,8 @@ Try enforcement only in a disposable VM or isolated network namespace. See
 ## Capabilities
 
 The runtime targets Linux on `amd64` and `arm64`, with nftables or iptables/ipset,
-RIPEstat-derived geographic/ASN policy, custom HTTP(S) plain-text or
+DB-IP Lite country policy (with RIPEstat as an explicit alternative), RIPEstat
+ASN policy, custom HTTP(S) plain-text or
 [CSV IP lists](docs/configuration.md#csv-column-selection) with one-based columns
 and an optional numeric filter, policy include/exclude selectors with per-list
 refresh intervals, direct provider IDs resolved dynamically through jsDelivr,
@@ -56,6 +57,13 @@ install services or packages; see the [installed layout](docs/operations.md#inst
 for package contents and [release workflow](docs/development.md#release-workflow)
 for publication requirements.
 
+Newly parsed YAML uses DB-IP Lite for every country, group, and RIR expansion.
+To retain RIPEstat allocation-country behavior when upgrading, set
+`geo.country_provider: ripestat` before reloading. Historical committed revisions
+keep their recorded RIPEstat meaning; changing provider requires complete matching
+source evidence. An older binary cannot read a newly committed DB-IP snapshot.
+See [country-provider upgrades](docs/configuration.md#country-provider-upgrades).
+
 ## Documentation
 
 Start with [operations](docs/operations.md#runtime-capabilities) to try
@@ -66,7 +74,7 @@ verify changes.
 | --- | --- |
 | [Architecture](docs/architecture.md) | Component boundaries, writer ownership, revision admission, commit, recovery, and applied-state lookup |
 | [Configuration](docs/configuration.md) | YAML schema, defaults, validation, policy semantics, and examples |
-| [Data sources](docs/data-sources.md) | RIPEstat/cache contracts, HTTP(S) text/CSV lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
+| [Data sources](docs/data-sources.md) | DB-IP Lite/RIPEstat and cache contracts, HTTP(S) text/CSV lists, dynamic provider feeds, and CrowdSec wire compatibility, authority, projection, and leases |
 | [Firewall backends](docs/firewall-backends.md) | Packet paths, native ownership, commit/rollback guarantees, and attachments |
 | [Operations](docs/operations.md) | Source-build procedures, health/metrics, status and lookup CLI contracts, and service/package lifecycle |
 | [Development](docs/development.md) | Repository map, commands, verification matrix, measurements, CI, and release requirements |
@@ -81,3 +89,8 @@ The project is [MIT-licensed](LICENSE). It takes behavior-level inspiration from
 must not be copied into this repository. See
 [license discipline](docs/development.md#license-discipline) for dependency reuse
 and notice requirements.
+
+This product uses IP to Country Lite data by DB-IP, available at https://db-ip.com/, licensed under Creative Commons Attribution 4.0 International (https://creativecommons.org/licenses/by/4.0/). Perimeterd filters country records and converts address ranges into normalized CIDRs.
+
+The software remains MIT-licensed; the downloaded DB-IP database is CC BY 4.0
+and is not bundled into binaries or packages.

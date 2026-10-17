@@ -383,6 +383,7 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	table := fmt.Sprintf("production_capacity_%d", os.Getpid())
 	write := func(ssh bool) {
 		text := strings.Replace(capacityfixture.YAML(table, server.URL, key, ssh), "refresh_interval: 1h", "refresh_interval: 1m\n  refresh_jitter: 1ns", 1)
+		text = strings.Replace(text, "geo:\n", "geo:\n  country_provider: ripestat\n", 1)
 		if err := os.WriteFile(configPath, []byte(text), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -696,6 +697,8 @@ func capacityOverBudgetStartup(t *testing.T, sourceURL string) {
 	// expressions exceed native input capacity after compilation.
 	const count = 900_000
 	cfg, err := config.Parse([]byte(`version: 1
+geo:
+  country_provider: ripestat
 firewall:
   backend: nftables
   ipv4: false

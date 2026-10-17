@@ -25,6 +25,7 @@ func statusFixture() control.StatusResult {
 		Applied: control.StatusApplied{
 			State: "applied", Revision: strings.Repeat("a", 64), ConfigEpoch: 7, Manifest: strings.Repeat("b", 64),
 			Details: &control.StatusDetails{
+				Sources: []control.StatusSource{{Provider: "dbip-lite", Release: "2026-10", RetrievedAt: time.Date(2026, 10, 13, 11, 0, 0, 0, time.UTC)}},
 				Firewall: control.StatusFirewall{
 					Backend: "iptables", Families: []string{"ipv4", "ipv6"}, DenyAction: "drop",
 					Attachments: []control.StatusAttachment{{Chain: "DOCKER-USER", Direction: "ingress", InputInterfaces: []string{"eth0"}, OutputInterfaces: []string{"br0"}, OriginalDestination: true}},

@@ -43,7 +43,7 @@ func normalize(raw rawConfig) (Config, error) {
 			Nftables: NftablesConfig{Table: "perimeterd", Priority: -10},
 			IPTables: IPTablesConfig{Attachments: defaultAttachments()},
 		},
-		Geo:       GeoConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second, RefreshJitter: 10 * time.Minute},
+		Geo:       GeoConfig{CountryProvider: CountryProviderDBIPLite, RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second, RefreshJitter: 10 * time.Minute},
 		Providers: ProvidersConfig{RefreshInterval: 24 * time.Hour, RequestTimeout: 30 * time.Second},
 		IPLists:   make(map[string]IPListConfig),
 		Groups:    make(map[string][]string),
@@ -139,6 +139,12 @@ func normalize(raw rawConfig) (Config, error) {
 	}
 
 	if raw.Geo != nil {
+		if raw.Geo.CountryProvider != nil {
+			cfg.Geo.CountryProvider = *raw.Geo.CountryProvider
+			if cfg.Geo.CountryProvider != CountryProviderDBIPLite && cfg.Geo.CountryProvider != CountryProviderRIPEstat {
+				return Config{}, fmt.Errorf("geo.country_provider: unsupported value %q (must be dbip-lite or ripestat)", cfg.Geo.CountryProvider)
+			}
+		}
 		if raw.Geo.RefreshInterval != nil {
 			cfg.Geo.RefreshInterval, err = positiveDuration(*raw.Geo.RefreshInterval, "geo.refresh_interval")
 			if err != nil {

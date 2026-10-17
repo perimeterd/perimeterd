@@ -2,9 +2,9 @@
 
 This document owns source validation, transport, cache identity, refresh, and
 fallback, plus CrowdSec synchronization, decision authority, and finite leases.
-RIPEstat, custom HTTP(S) IP lists, and dynamic named-provider feeds contribute
-static snapshots; CrowdSec supplies independent dynamic ingress bans. Both
-native backends consume these contracts.
+DB-IP Lite, RIPEstat, custom HTTP(S) IP lists, and dynamic named-provider feeds
+contribute static snapshots; CrowdSec supplies independent dynamic ingress bans.
+Both native backends consume these contracts.
 
 [Lookup attribution](#lookup-source-attribution) explains committed source
 evidence without fetching or treating desired-but-unapplied decisions as active.
@@ -20,10 +20,10 @@ deployment contract.
 
 ## Contents
 
-- [RIPEstat scope and accuracy](#ripestat-scope-and-accuracy)
-  - [Normative provider contract](#normative-provider-contract)
-  - [Accuracy and interpretation](#accuracy-and-interpretation)
-  - [Evaluated alternative: sapics/ip-location-db](#evaluated-alternative-sapicsip-location-db)
+- [Country providers and ASN scope](#country-providers-and-asn-scope)
+  - [DB-IP Lite country default](#db-ip-lite-country-default)
+  - [RIPEstat opt-in country and ASN](#ripestat-opt-in-country-and-asn)
+  - [Accuracy and licensing](#accuracy-and-licensing)
 - [Resolution transaction](#resolution-transaction)
   - [Normative resolution steps](#normative-resolution-steps)
   - [Actual-response fixtures](#actual-response-fixtures)
@@ -58,80 +58,109 @@ deployment contract.
 - [Source failure matrix](#source-failure-matrix)
 - [Lookup source attribution](#lookup-source-attribution)
 
-Version 1 uses RIPEstat for static country/ASN prefixes, custom HTTP(S)
-text or explicitly configured CSV lists as another static selector type, and CrowdSec LAPI for dynamic
-ingress bans. Named feeds from `rezmoss/cloud-provider-ip-addresses` also use
-the static-source pipeline. [Configuration](configuration.md) defines selectors and defaults;
+Version 1 defaults to DB-IP Lite for country prefixes, retains explicit RIPEstat
+country mode, and always uses RIPEstat for ASNs. Custom HTTP(S) text or explicitly
+configured CSV lists are another static selector type; CrowdSec LAPI supplies
+dynamic ingress bans. Named feeds from `rezmoss/cloud-provider-ip-addresses` also
+use the static-source pipeline. [Configuration](configuration.md) defines selectors and defaults;
 [architecture](architecture.md) defines revision admission, commit behavior,
 and process lifecycle. Sources produce typed data and never emit firewall
 syntax. This document owns source wire compatibility, source-side validation,
 cache coupling, authoritative dynamic state, timed projection, and lease
 behavior.
 
-## RIPEstat scope and accuracy
+## Country providers and ASN scope
 
-### Normative provider contract
+### DB-IP Lite country default
 
-RIPEstat is the sole version 1 geo/ASN provider. It is usable without an
-account, API key, downloaded commercial database, or central perimeterd
-service. Requests use only the official HTTPS JSON API and always include
-`sourceapp=perimeterd`:
+New YAML defaults `geo.country_provider` to `dbip-lite`; `ripestat` is the only
+alternative. No key, commercial database, configurable download URL, per-IP
+lookup API, mirror, geofeed, or OpenZiti transport is involved. Countries, all
+group leaves, and RIR service-region country unions use the selected provider.
+ASN announced-prefixes remain RIPEstat-only. No required country means no DB-IP
+download, including ASN-only configurations.
 
-- Countries use RIPEstat
-  [`country-resource-list`](https://stat.ripe.net/docs/data-api/api-endpoints/country-resource-list)
-  with the normalized ISO-3166-1 alpha-2 code as `resource` and
-  `v4_format=prefix`.
-- ASNs use RIPEstat
-  [`announced-prefixes`](https://stat.ripe.net/docs/data-api/api-endpoints/announced-prefixes)
-  with the numeric ASN as `resource`.
+The origin is the vendor's direct HTTPS monthly artifact:
 
-### Accuracy and interpretation
+```text
+https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.csv.gz
+```
 
-Country results derive from the RIR statistics files and describe address
-allocation or registration country. ASN results describe observed routing
-announcements. Neither identifies a device's physical location and neither
-promises MaxMind-style geolocation accuracy. VPNs, hosting networks, mobile
-carriers, transfers, and routing changes can make country policy differ from a
-user's actual location.
+Capture UTC time once per country batch. Request that month; only an exact HTTP
+404 permits one attempt at the immediately previous calendar month. Each selected
+artifact uses the existing three-attempt transient retry policy, not a stacked
+retry loop. Other failures, invalid content, and size/checksum errors never
+trigger month fallback. Accept HTTP 200 only. Record the month actually read;
+never replace committed DB-IP evidence with an older release, even after clock
+rollback. The same month's filename may change bytes: a new decoded digest is
+new provenance, even when selected prefixes are unchanged.
 
-For an ASN response, each prefix has a visibility timeline. Perimeterd retains
-the prefix only when that timeline includes the response's `query_endtime`. A
-prefix seen earlier in the query window but no longer announced at its end is
-excluded.
+Requests send `Accept-Encoding: identity`. An absent/identity/gzip content coding
+is accepted for one application gzip artifact. If the HTTP transport explicitly
+marks `resp.Uncompressed`, the body may be already-decoded CSV or one remaining
+gzip artifact; never decompress the same layer twice. Unsupported coding,
+concatenated or nested gzip, trailing garbage, truncated streams, checksum
+failure, and invalid extra gzip content reject the whole candidate. Read through
+EOF to validate the gzip trailer. HTTPS redirects retain origin and downgrade
+protections; normal TLS certificate validation remains mandatory.
+For an injected transport that has already decoded CSV, the original encoded
+byte count is unavailable; enforce the decoded budget on that body. The normal
+identity-encoded HTTPS path observes and enforces both wire and decoded limits.
 
-### Evaluated alternative: sapics/ip-location-db
+Streaming DB-IP limits are 32 MiB encoded, 64 MiB decoded, 2,000,000 rows,
+4,000,000 emitted CIDRs, and 1 KiB per CSV record. Other source limits do not
+change. UTF-8 RFC4180 CSV has no header and exactly `ip_start,ip_end,country`.
+Addresses must be unscoped, same-family, unmapped, ordered inclusive ranges.
+Rows must be sorted by family/address without overlap or duplicate assignments;
+gaps are allowed. Whitespace, extra columns, invalid UTF-8, unknown country
+tokens, or malformed unselected rows/tails invalidate the entire artifact.
+Countries are canonical uppercase ISO catalog codes; vendor extensions `XK`
+and `ZZ` are validated but excluded, never aliased or added to the public catalog.
 
-The [`sapics/ip-location-db`](https://github.com/sapics/ip-location-db)
-project is not the version 1 source. Its daily `server-country` database is a
-credible candidate for a future physical-endpoint-location provider:
+Convert ranges to exact minimal CIDRs with integer operations, then use normal
+canonical normalization. Retain only requested ISO countries, but validate both
+families and every row even if a firewall family is disabled. A valid full
+dataset can emit explicit empty country/family records; an entirely empty
+artifact is invalid. Existing compiler empty-effective-policy safeguards remain.
+Never truncate countries, widen boundaries, or raise unrelated native/durable
+limits to make a policy fit.
 
-- routing and geofeed inputs can locate deployed infrastructure more accurately
-  than RIR allocation country;
-- `server-country` matches the address visible to a firewall, whereas
-  `user-country` attempts to infer a user behind VPN or proxy infrastructure;
-- the combined `server-country-cidr.csv` asset is a directly streamable
-  `prefix,country_code` representation for both address families.
+If any required DB-IP country is due, missing, or provider-mismatched, refresh
+all currently required countries from one download. They share release, complete
+decoded SHA-256, and successful validation-completion timestamp. Adding a country
+requires a new batch; removing countries may reuse a coherent committed subset.
+Other due sources retain bounded concurrency in the same all-or-nothing
+transaction. Failed sources, compilation, native apply, or durable publication
+cannot partially publish countries or advance active provenance/freshness.
+The daily geo schedule checks monthly releases; it is not a per-packet download.
 
-RIPEstat remains the version 1 choice because it is an official primary API,
-fetches only referenced selectors, supplies explicit query metadata, and
-generally produces coarser sets better suited to both nftables and
-iptables/ipset. The SAPICS database is a complete global snapshot with much
-finer country boundaries, so a selected country or region can require
-materially more firewall prefixes. Its data-generation pipeline, mutable
-`latest` release, provider-hosted checksums, geofeeds without explicit
-licenses, and emitted legacy or non-ISO codes such as `AN`, `FX`, and `XK`
-also require an explicit trust and normalization contract.
+### RIPEstat opt-in country and ASN
 
-If a SAPICS provider is added later, it must consume
-`server-country-cidr.csv`, not MMDB or the start/end range CSV. CIDR CSV maps
-directly to `netip.Prefix` and supports strict streaming validation; MMDB is
-optimized for individual IP lookups rather than enumerating every prefix for
-selected countries. The adapter must resolve one release metadata document,
-capture the release and asset identities, verify the asset SHA-256 digest,
-enforce file-size, record-count, and derived-prefix limits, define handling for
-non-current country codes and contradictory overlaps, and stage the complete
-validated snapshot before publication. No provider configuration field is
-added until such an implementation exists.
+`geo.country_provider: ripestat` selects allocation/registration country via
+[`country-resource-list`](https://stat.ripe.net/docs/data-api/api-endpoints/country-resource-list),
+with the normalized ISO code as `resource` and `v4_format=prefix`.
+ASNs always use
+[`announced-prefixes`](https://stat.ripe.net/docs/data-api/api-endpoints/announced-prefixes)
+with the numeric ASN as `resource`, independently of country selection.
+Both official HTTPS JSON endpoints include `sourceapp=perimeterd` and need no
+account or API key. An ASN prefix is retained only when its visibility timeline
+includes the response's `query_endtime`.
+
+### Accuracy and licensing
+
+DB-IP country means that database's geographic classification of the visible IP;
+it is not proof of hardware location or the person behind a VPN. RIPEstat country
+means allocation/registration country. Neither provider is silently substituted
+for the other. ASN results describe observed routing announcements.
+
+This product uses IP to Country Lite data by DB-IP, available at https://db-ip.com/, licensed under Creative Commons Attribution 4.0 International (https://creativecommons.org/licenses/by/4.0/). Perimeterd filters country records and converts address ranges into normalized CIDRs.
+
+The software is MIT; the downloaded database is CC BY 4.0 and is not bundled in
+binaries/packages. Redistributed fixtures or derived data retain attribution and
+identify transformations. The vendor owns its
+[CSV format](https://db-ip.com/db/format/ip-to-country-lite/csv.html),
+[download](https://db-ip.com/db/download/ip-to-country-lite), and
+[license terms](https://db-ip.com/tos.php).
 
 ## Resolution transaction
 
@@ -139,9 +168,9 @@ added until such an implementation exists.
 enabled policies and stages one complete immutable cache snapshot. Every
 resolution is a complete candidate, not a stream of independently publishable
 selector updates.
-The steps below describe RIPEstat resolution; the
-[custom-list extension](#custom-https-ip-lists) specifies how additional
-selectors join the same transaction.
+DB-IP countries follow the single-artifact batch above; RIPEstat endpoint
+validation is specified below. The [custom-list extension](#custom-https-ip-lists)
+specifies how additional selectors join the same transaction.
 
 RIR service regions use a release-pinned, explicit country assignment from the
 [RIPE NCC country/RIR table](https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/),
@@ -156,12 +185,13 @@ assignments cover all 249 supported ISO country codes exactly once.
 1. Expand configured countries, RIR service regions, and groups to unique
    country/ASN selectors. Reject a configuration exceeding 512 unique expanded
    selectors before issuing requests.
-2. Fetch missing or stale selectors with at most four requests in flight and
-   the configured timeout per attempt (`30s` by default), including bounded
-   transient retries as described below.
-3. Cap each decoded HTTP response at 32 MiB. Crossing the limit fails that
-   selector; the body is never partially accepted.
-4. Require a successful HTTP response, RIPEstat API status `ok`, and the
+2. Fetch missing or stale sources with at most four requests in flight and the
+   configured timeout per attempt (`30s` by default), including slot admission,
+   body reading, parsing, and bounded transient retries. A due DB-IP country
+   expands the work item to all required countries.
+3. Cap non-DB-IP decoded HTTP responses at 32 MiB; DB-IP uses the separate fixed
+   streaming limits above. Never accept a partial body.
+4. For RIPEstat, require a successful HTTP response, API status `ok`, and the
    endpoint-specific schema and identity checks below:
    - **Country resource list:** the request identity is the normalized
      uppercase ISO-3166-1 alpha-2 country code sent as `resource`, with
@@ -186,13 +216,14 @@ assignments cover all 249 supported ISO country codes exactly once.
    version, and all decoded prefix arrays. Assemble one immutable
    `PrefixSnapshot` referring to one complete manifest.
 
-RIPEstat, custom IP lists, and named-provider feeds make at most **three GET
+DB-IP, RIPEstat, custom IP lists, and named-provider feeds make at most **three GET
 attempts** for temporary network failures, per-attempt timeouts, interrupted
 reads, and HTTP **408, 500, 502, 503, or 504**. Wait **1s**, then **2s**, before
 retrying. Each attempt gets the configured `request_timeout`; all attempts and
 waits remain subject to caller cancellation and the startup deadline. With the
-default timeout, a selector's HTTP budgets and retry waits can total 93 seconds,
-rather than a single 30-second attempt.
+default timeout, one selected artifact or independent selector can consume
+93 seconds rather than a single 30-second attempt. DB-IP's bounded 404
+publication-lag selection can add the previous artifact's separate retry budget.
 
 Do not retry invalid data, oversized responses, certificate verification errors,
 or other HTTP statuses (including rate-limiting 429). Close the failed response
@@ -201,6 +232,10 @@ is reused. Exhausting retries fails the selector and leaves the existing
 complete-snapshot/fallback rules unchanged. Retry counts/delays are internal
 constants, not new configuration fields; CrowdSec keeps its separate existing
 reconnect policy.
+
+DB-IP frame-local CSV failures, including blank LF/CRLF records, are validation
+errors and never trigger another download. Failures reading the underlying
+artifact stream retain their normal transient retry classification.
 
 The snapshot is all-or-nothing. A failed, truncated, malformed, mismatched, or
 partial response never becomes an empty valid selector. A candidate revision is
@@ -239,9 +274,12 @@ immutable; publication selects one complete manifest.
 New objects and manifests use schema version 3 with explicit
 [transport identity](#transport-identity-and-saved-evidence). Committed
 version-1/2 objects and manifests remain readable, stabilizable, and protected
-from collection by their original exact references. The fields below describe
-RIPEstat records; [list identity](#list-identity-and-immutable-cache) adds
-source-specific metadata within the same cache.
+from collection by their original exact references. DB-IP is admitted only in
+schema 3; schemas 1/2 explicitly reject it. Optional `release` is omitted from
+historical RIPEstat/list/provider bytes and forbidden on those records. Existing
+durable state stays version 2; old immutable objects/revisions are not rewritten.
+The fields below describe common records; provider-specific metadata is bound
+to the same cache identity.
 
 ### Selector objects
 
@@ -265,6 +303,22 @@ metadata in place. A re-fetch with changed metadata creates a new object;
 unchanged content may be referenced again without rewriting it. Canonical bytes
 use RFC 8785 JSON canonicalization; schema versions define array ordering and
 UTC timestamp representation.
+
+DB-IP country records retain semantic `country/CC` selectors with source kind
+`dbip-lite`, empty source name, parser version `dbip-country-csv-1`, and release
+`YYYY-MM`. The endpoint is exactly that vendor monthly URL. Parameters contain
+exactly `resource` (the ISO selector) and `sha256` (lowercase SHA-256 of the complete
+decoded CSV); query start/end are zero. Retrieval time is successful complete
+validation time, not month start. Transport is direct. The local digest identifies
+content; it is not a vendor signature or an independent authenticity guarantee.
+HTTPS authenticates the origin.
+
+Objects and manifests both bind and compare every metadata field, including
+release and artifact digest. All DB-IP countries in a manifest must have the same
+release/digest/retrieval time, checked at candidate assembly and durable load.
+DB-IP manifests use source `static`; historical/RIPE-only forms remain unchanged.
+Prefix membership hashes remain separate from artifact provenance; altered
+artifact bytes change object/manifest identity even if selected CIDRs do not.
 
 ### Snapshot manifests
 
@@ -304,7 +358,7 @@ recovery evidence.
 
 ### Fresh reuse and stale fallback
 
-Only currently referenced RIPEstat selectors refresh. The default schedule is once per
+Only currently referenced sources refresh. Country/ASN defaults are once per
 `24h` interval plus an independently sampled delay from zero through `10m`;
 the request timeout defaults to `30s` and concurrency remains at most four.
 Freshness uses the configured refresh interval and recorded retrieval time;
@@ -337,6 +391,13 @@ policy mutation or readiness. Snapshot age uses the oldest retrieval time among
 required selectors, never the manifest creation time, so reusing stale data
 cannot make it appear fresh. After bounded request retries are exhausted,
 report refresh failure and retry at the next normal schedule.
+
+Provider compatibility is the validated source contract, not equality to the
+current wall-clock month's URL. Complete same-provider committed evidence may
+remain eligible for stale fallback across month boundaries. A provider change,
+missing country, or incompatible format cannot use it. Empty historical source
+kind means RIPEstat only, never DB-IP. [Country-provider upgrades](configuration.md#country-provider-upgrades)
+distinguishes recovery of old bytes from reparsing YAML and binary downgrade.
 
 ## Custom HTTP(S) IP lists
 
@@ -1326,13 +1387,15 @@ For globals, identify the effective global allow/block entry and known built-in
 membership; do not claim an entry was operator-supplied when normalization has
 erased that distinction.
 
-Attribution identifies retained normalized ranges, not original TXT line numbers
-or a byte-for-byte upstream record. Country evidence still means allocation or
-registration country, not physical location. Provider evidence still means
-membership in that feed, not proof of endpoint ownership. Display source
-kind/name and retrieval time without exposing potentially secret-bearing URLs.
-Lookup requires no additional cache schema change or raw-response retention;
-version-1/2/3 recovery compatibility remains intact.
+Attribution identifies retained normalized ranges, not original upstream rows.
+Country/ASN evidence keeps semantic `kind=country`/`kind=asn` and selector name,
+with provider `dbip-lite` or `ripestat`; only DB-IP supplies monthly `release`.
+Country interpretation follows the selected provider above. Infrastructure-provider
+evidence still means feed membership, not proof of endpoint ownership. Evidence
+ordering, equality, and outcome coalescing include provider/release. Display
+retrieval time without endpoints or artifact parameters. Lookup never fetches
+upstream data; historical cache schemas remain readable under their original
+RIPEstat contracts, not as DB-IP.
 
 ### CrowdSec provenance
 

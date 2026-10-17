@@ -41,10 +41,18 @@ func (r *Resolver) fetchOne(ctx context.Context, cfg config.Config, selector pol
 	if r.observeRequest != nil {
 		defer func() { r.observeRequest(selectorMetricSource(selector.Kind), success) }()
 	}
+	record, err := retryFetch(ctx, func() (Record, error) { return r.fetchAttempt(ctx, cfg, selector) })
+	success = err == nil
+	return record, err
+}
+
+// retryFetch is the single retry budget for both selector and artifact work.
+func retryFetch[T any](ctx context.Context, fetch func() (T, error)) (T, error) {
+	var zero T
 	var lastErr error
 	for attempt := range maxFetchAttempts {
 		if err := ctx.Err(); err != nil {
-			return Record{}, err
+			return zero, err
 		}
 		if attempt > 0 {
 			// Two short, interruptible waits: one second, then two seconds.
@@ -52,23 +60,22 @@ func (r *Resolver) fetchOne(ctx context.Context, cfg config.Config, selector pol
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return Record{}, ctx.Err()
+				return zero, ctx.Err()
 			case <-timer.C:
 			}
 		}
-		record, err := r.fetchAttempt(ctx, cfg, selector)
+		record, err := fetch()
 		if err == nil {
-			success = true
 			return record, nil
 		}
 		if contextErr := ctx.Err(); contextErr != nil {
-			return Record{}, contextErr
+			return zero, contextErr
 		}
 		var retryable *retryableFetchError
 		if !errors.As(err, &retryable) {
-			return Record{}, err
+			return zero, err
 		}
 		lastErr = err
 	}
-	return Record{}, fmt.Errorf("after %d attempts: %w", maxFetchAttempts, lastErr)
+	return zero, fmt.Errorf("after %d attempts: %w", maxFetchAttempts, lastErr)
 }

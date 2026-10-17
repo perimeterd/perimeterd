@@ -154,6 +154,7 @@ firewall:
   nftables:
     table: crowd_refresh_capacity
 geo:
+  country_provider: ripestat
   refresh_interval: 1s
   request_timeout: 1m
   refresh_jitter: 1ns

@@ -232,6 +232,16 @@ func writeLookupHuman(w io.Writer, response lookup.Response) error {
 					return err
 				}
 			}
+			if evidence.Provider != "" {
+				if _, err := fmt.Fprintf(w, " provider=%s", evidence.Provider); err != nil {
+					return err
+				}
+			}
+			if evidence.Release != "" {
+				if _, err := fmt.Fprintf(w, " release=%s", evidence.Release); err != nil {
+					return err
+				}
+			}
 			if !evidence.RetrievedAt.IsZero() {
 				if _, err := fmt.Fprintf(w, " retrieved_at=%s", evidence.RetrievedAt.UTC().Format(time.RFC3339Nano)); err != nil {
 					return err

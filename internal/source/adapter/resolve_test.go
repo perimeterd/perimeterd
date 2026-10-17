@@ -42,7 +42,7 @@ func sourceConfig(countries, asns []string) config.Config {
 	return config.Config{
 		Version:  1,
 		Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", IPv4: true, IPv6: true},
-		Geo:      config.GeoConfig{RequestTimeout: time.Second, RefreshInterval: time.Hour},
+		Geo:      config.GeoConfig{CountryProvider: config.CountryProviderRIPEstat, RequestTimeout: time.Second, RefreshInterval: time.Hour},
 		Policies: []config.Policy{{Name: "fixture", Priority: 1, Direction: "ingress", Mode: "blocklist", Traffic: config.TrafficScope{Any: true}, Include: config.Selector{Countries: countries, ASNs: asns}}},
 	}
 }
@@ -464,5 +464,31 @@ func TestResolverBoundsConcurrentRequests(t *testing.T) {
 	}
 	if maximum.Load() > 4 {
 		t.Fatalf("exceeded four simultaneous requests: %d", maximum.Load())
+	}
+}
+
+func TestRIPECommittedCountryCannotCoverDBIPSwitch(t *testing.T) {
+	var fail atomic.Bool
+	country := fixture(t, "country_li.json")
+	_, resolver := resolverFor(t, func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "unavailable", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write(country)
+	})
+	cfg := sourceConfig([]string{"LI"}, nil)
+	committed, err := resolver.Resolve(context.Background(), cfg, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail.Store(true)
+	cfg.Geo.CountryProvider = config.CountryProviderDBIPLite
+	result, err := resolver.Resolve(context.Background(), cfg, committed.Snapshot.ManifestID(), true)
+	if err == nil || result.RefreshError != nil || result.Snapshot.ManifestID() != "" {
+		t.Fatalf("provider switch reused RIPE evidence: result=%#v error=%v", result, err)
+	}
+	if len(result.Attempted) != 1 || result.Attempted[0].Value != "LI" {
+		t.Fatalf("attempted=%v", result.Attempted)
 	}
 }

@@ -108,6 +108,9 @@ func (c *Cache) Stage(records []Record) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	if err := validateDBIPBatch(canonical); err != nil {
+		return Snapshot{}, err
+	}
 	entries := make([]manifestEntry, 0, len(canonical))
 	for index, record := range canonical {
 		if (record.SourceKind == listSourceKind || record.SourceKind == providerSourceKind) && len(record.IPv4) == 0 && len(record.IPv6) == 0 {
@@ -132,7 +135,7 @@ func (c *Cache) Stage(records []Record) (Snapshot, error) {
 	}
 	source := "ripestat"
 	for _, record := range canonical {
-		if record.SourceKind == listSourceKind || record.SourceKind == providerSourceKind {
+		if record.SourceKind == listSourceKind || record.SourceKind == providerSourceKind || record.SourceKind == dbipSourceKind {
 			source = "static"
 			break
 		}
@@ -174,6 +177,9 @@ func (c *Cache) Load(id string) (Snapshot, error) {
 		}
 		records = append(records, record)
 		resolved = append(resolved, policy.ResolvedSelector{Selector: record.Selector, IPv4: record.IPv4, IPv6: record.IPv6})
+	}
+	if err := validateDBIPBatch(records); err != nil {
+		return Snapshot{}, fmt.Errorf("manifest %s: %w", id, err)
 	}
 	compiled, err := policy.NewSnapshot(resolved)
 	if err != nil {
@@ -311,7 +317,7 @@ func (c *Cache) loadObject(entry manifestEntry, schemaVersion int) (Record, erro
 	if err != nil {
 		return Record{}, fmt.Errorf("object %s: %w", entry.Object, err)
 	}
-	if object.Selector != entry.Selector || object.SourceKind != entry.SourceKind || object.SourceName != entry.SourceName || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt || object.Transport != entry.Transport {
+	if object.Selector != entry.Selector || object.SourceKind != entry.SourceKind || object.SourceName != entry.SourceName || object.Endpoint != entry.Endpoint || object.APIVersion != entry.APIVersion || object.Release != entry.Release || !maps.Equal(object.Parameters, entry.Parameters) || object.QueryStart != entry.QueryStart || object.QueryEnd != entry.QueryEnd || object.RetrievedAt != entry.RetrievedAt || object.Transport != entry.Transport {
 		return Record{}, errors.New("manifest metadata does not match selector object")
 	}
 	return record, nil
@@ -327,7 +333,7 @@ func recordFromObject(object objectFile) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
-	return Record{Selector: selector, SourceKind: object.SourceKind, SourceName: object.SourceName, Endpoint: object.Endpoint, APIVersion: object.APIVersion, Parameters: cloneParameters(object.Parameters), QueryStart: parseStoredTime(object.QueryStart), QueryEnd: parseStoredTime(object.QueryEnd), RetrievedAt: parseCanonicalTime(object.RetrievedAt), IPv4: ipv4, IPv6: ipv6, Transport: object.Transport}, nil
+	return Record{Selector: selector, SourceKind: object.SourceKind, SourceName: object.SourceName, Endpoint: object.Endpoint, APIVersion: object.APIVersion, Release: object.Release, Parameters: cloneParameters(object.Parameters), QueryStart: parseStoredTime(object.QueryStart), QueryEnd: parseStoredTime(object.QueryEnd), RetrievedAt: parseCanonicalTime(object.RetrievedAt), IPv4: ipv4, IPv6: ipv6, Transport: object.Transport}, nil
 }
 
 func validateCacheID(value, label string) error {

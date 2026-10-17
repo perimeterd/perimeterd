@@ -38,6 +38,9 @@ firewall:
         original_destination: false
 
 geo:
+  # Geographic country classification by DB-IP Lite; ripestat opts into registration country.
+  # Existing YAML now defaults to dbip-lite; set ripestat to retain pre-upgrade semantics.
+  country_provider: dbip-lite
   refresh_interval: 24h
   request_timeout: 30s
   refresh_jitter: 10m

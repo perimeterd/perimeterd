@@ -36,6 +36,8 @@ func benchmarkGeoRecords(count int) []policy.ResolvedSelector {
 func benchmarkGeoConfig(b *testing.B) config.Config {
 	b.Helper()
 	cfg, err := config.Parse([]byte(`version: 1
+geo:
+  country_provider: ripestat
 firewall:
   backend: nftables
   deny_action: reject

@@ -20,6 +20,8 @@ func TestStatusCompiledSetsCountPolicyMemberships(t *testing.T) {
 	for _, scenario := range []string{"nftables", "iptables", "ipv4-only"} {
 		t.Run(scenario, func(t *testing.T) {
 			cfg, err := config.Parse([]byte(`version: 1
+geo:
+  country_provider: ripestat
 firewall:
   backend: nftables
 global:

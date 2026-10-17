@@ -388,7 +388,7 @@ func writeDockerCoexistenceConfig(t *testing.T, path, action string, originalDes
 	if originalDestination {
 		yaml.WriteString("        original_destination: true\n")
 	}
-	yaml.WriteString("geo:\n  refresh_interval: 24h\n  request_timeout: 2s\n  refresh_jitter: 1s\ngroups: {}\npolicies:\n  - name: docker-ingress\n    priority: 10\n    direction: ingress\n    mode: allowlist\n    traffic: [\"18080/tcp\"]\n    include:\n      countries: [TW]\ncrowdsec:\n  enabled: false\n")
+	yaml.WriteString("geo:\n  country_provider: ripestat\n  refresh_interval: 24h\n  request_timeout: 2s\n  refresh_jitter: 1s\ngroups: {}\npolicies:\n  - name: docker-ingress\n    priority: 10\n    direction: ingress\n    mode: allowlist\n    traffic: [\"18080/tcp\"]\n    include:\n      countries: [TW]\ncrowdsec:\n  enabled: false\n")
 	if err := os.WriteFile(path, []byte(yaml.String()), 0o600); err != nil {
 		t.Fatalf("write Docker config: %v", err)
 	}

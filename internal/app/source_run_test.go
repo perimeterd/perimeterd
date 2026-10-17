@@ -107,6 +107,7 @@ metrics:
 firewall:
   backend: nftables
 geo:
+  country_provider: ripestat
   refresh_interval: 1s
   refresh_jitter: 1ns
   request_timeout: 3s

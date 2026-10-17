@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/control"
 	"github.com/perimeterd/perimeterd/internal/source"
 	"github.com/perimeterd/perimeterd/internal/state"
@@ -32,6 +33,7 @@ func TestHistoricalRecoveryFailedAndSuccessfulSharedMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.Geo.CountryProvider = config.CountryProviderRIPEstat
 	cfg.CrowdSec.UpdateFrequency = time.Hour
 	backend := &recordingBackend{}
 	dir := filepath.Join(t.TempDir(), "state")

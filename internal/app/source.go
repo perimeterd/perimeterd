@@ -33,6 +33,7 @@ type sourceRuntime struct {
 
 type sourceTimestamps struct {
 	ripe     int64
+	dbip     int64
 	ipList   int64
 	provider int64
 }
@@ -79,6 +80,10 @@ func (s *sourceRuntime) selectRevision(revision *state.Revision, nextSession *up
 			interval, jitter := spec.RefreshInterval, spec.RefreshJitter
 			stamp := &timestamps.ripe
 			switch record.Selector.Kind {
+			case policy.Country:
+				if record.SourceKind == config.CountryProviderDBIPLite {
+					stamp = &timestamps.dbip
+				}
 			case policy.IPList:
 				stamp = &timestamps.ipList
 			case policy.Provider:
@@ -201,6 +206,9 @@ func (s *sourceRuntime) manifest() string {
 func (s *sourceRuntime) age() time.Duration {
 	timestamps := s.snapshotTimestamps()
 	stamp := timestamps.ripe
+	if timestamps.dbip != 0 && (stamp == 0 || timestamps.dbip < stamp) {
+		stamp = timestamps.dbip
+	}
 	if stamp == 0 || (timestamps.ipList != 0 && timestamps.ipList < stamp) {
 		stamp = timestamps.ipList
 	}

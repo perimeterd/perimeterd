@@ -14,7 +14,7 @@ const (
 	// Endpoint versions the read-only HTTP method on the Unix socket.
 	Endpoint = "/v1/lookup"
 	// SchemaVersion identifies the complete response envelope.
-	SchemaVersion = 1
+	SchemaVersion = 2
 	// MaxRequestBytes bounds decoded query input.
 	MaxRequestBytes = 4 << 10
 	// MaxResponseBytes bounds a complete encoded result.
@@ -92,6 +92,8 @@ type Outcome struct {
 type Evidence struct {
 	Kind             string       `json:"kind"`
 	Name             string       `json:"name"`
+	Provider         string       `json:"provider,omitempty"`
+	Release          string       `json:"release,omitempty"`
 	Policy           string       `json:"policy,omitempty"`
 	Role             string       `json:"role"`
 	Via              []string     `json:"via,omitempty"`

@@ -21,6 +21,8 @@ const (
 	providerSourceKind = "provider"
 	listFormatVersion  = "1"
 	csvFormatVersion   = "csv-1"
+	dbipSourceKind     = "dbip-lite"
+	dbipFormatVersion  = "dbip-country-csv-1"
 )
 
 // SelectorSpec describes the authoritative source metadata for one canonical
@@ -86,6 +88,9 @@ func DescribeSelector(cfg config.Config, selector policy.Selector) (SelectorSpec
 			APIVersion:      listFormatVersion,
 		}, nil
 	case policy.Country:
+		if cfg.Geo.EffectiveCountryProvider() == config.CountryProviderDBIPLite {
+			return SelectorSpec{RefreshInterval: cfg.Geo.RefreshInterval, RequestTimeout: cfg.Geo.RequestTimeout, RefreshJitter: cfg.Geo.RefreshJitter, SourceKind: dbipSourceKind, APIVersion: dbipFormatVersion}, nil
+		}
 		return SelectorSpec{
 			RefreshInterval: cfg.Geo.RefreshInterval,
 			RequestTimeout:  cfg.Geo.RequestTimeout,
@@ -167,7 +172,7 @@ func providerEndpoint(id string) (string, error) {
 // Parameters are owned by the source layer; callers receive defensive copies
 // from cache snapshots.
 //
-// SourceKind and SourceName are populated for custom lists and providers.
+// DB-IP, custom-list, and provider records have explicit source metadata.
 // Existing RIPEstat records leave SourceKind empty for on-disk compatibility.
 type Record struct {
 	Selector    policy.Selector
@@ -175,6 +180,7 @@ type Record struct {
 	SourceName  string
 	Endpoint    string
 	APIVersion  string
+	Release     string
 	Parameters  map[string]string
 	QueryStart  time.Time
 	QueryEnd    time.Time
@@ -197,14 +203,15 @@ type Resolution struct {
 	Attempted []policy.Selector
 }
 
-// Resolver fetches RIPEstat, provider, and custom-list data and stages complete
-// immutable cache manifests.
+// Resolver fetches DB-IP, RIPEstat, provider, and custom-list data and stages
+// complete immutable cache manifests.
 type Resolver struct {
 	cache          *Cache
 	client         *http.Client
 	slots          chan struct{}
 	session        *upstream.Session
 	observeRequest func(source string, success bool)
+	now            func() time.Time
 }
 
 // WithTransports returns an immutable resolver view using the captured
@@ -219,9 +226,9 @@ func (r *Resolver) WithTransports(session *upstream.Session) *Resolver {
 	return &view
 }
 
-// WithRequestObserver returns an immutable resolver view that reports each
-// selector fetch with a fixed source kind and success outcome. Observer values
-// never include selector IDs, URLs, or error text.
+// WithRequestObserver reports logical source work items, including retries.
+// One DB-IP country batch is one observation, not one fetch per leaf. Observer
+// values contain only a fixed source kind and success, never IDs or URLs.
 func (r *Resolver) WithRequestObserver(observer func(source string, success bool)) *Resolver {
 	if r == nil {
 		return nil
@@ -232,8 +239,8 @@ func (r *Resolver) WithRequestObserver(observer func(source string, success bool
 }
 
 // NewResolver constructs a resolver. A nil client uses the standard HTTPS
-// client. Redirects are handled only for text-list requests; RIPEstat keeps
-// its existing final-response behavior.
+// client. Text-list and DB-IP requests share protected redirect handling;
+// RIPEstat keeps its existing final-response behavior.
 func NewResolver(cache *Cache, client *http.Client) *Resolver {
 	if client == nil {
 		client = http.DefaultClient
@@ -263,6 +270,21 @@ func NewResolver(cache *Cache, client *http.Client) *Resolver {
 	return &Resolver{cache: cache, client: &owned, slots: make(chan struct{}, maxConcurrent)}
 }
 
+// WithClock returns a resolver view with a transaction clock, for deterministic
+// release selection. It does not change scheduling or add a public setting.
+func (r *Resolver) WithClock(now func() time.Time) *Resolver {
+	view := *r
+	view.now = now
+	return &view
+}
+
+func (r *Resolver) utcNow() time.Time {
+	if r.now != nil {
+		return r.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
 // Resolve obtains every selector required by enabled policies and stages one
 // immutable snapshot. Only a committed manifest is considered for reuse or
 // stale fallback; the cache directory is never scanned to discover candidates.
@@ -290,7 +312,7 @@ func (s Snapshot) ValidateConfig(cfg config.Config) error {
 			return fmt.Errorf("source snapshot identity mismatch for %s/%s", selector.Kind, selector.Value)
 		}
 	}
-	return nil
+	return validateDBIPBatch(s.records)
 }
 
 func (r *Resolver) bindingForRoute(route config.TransportConfig) (upstream.Binding, error) {

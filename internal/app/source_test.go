@@ -19,6 +19,8 @@ import (
 func geoEngineConfig(t *testing.T) config.Config {
 	t.Helper()
 	cfg, err := config.Parse([]byte(`version: 1
+geo:
+  country_provider: ripestat
 metrics:
   listen: ""
 firewall:

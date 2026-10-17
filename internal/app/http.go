@@ -37,7 +37,7 @@ func bindMetricsWithCollector(listen string, health func() bool, snapshotTimesta
 	if snapshotTimestamps != nil {
 		timestamps = func() metricspkg.PrefixTimestamps {
 			value := snapshotTimestamps()
-			return metricspkg.PrefixTimestamps{RIPestat: value.ripe, IPList: value.ipList, Provider: value.provider}
+			return metricspkg.PrefixTimestamps{RIPestat: value.ripe, DBIPLite: value.dbip, IPList: value.ipList, Provider: value.provider}
 		}
 	}
 	handler := collector.Handler(health, timestamps, func() bool {

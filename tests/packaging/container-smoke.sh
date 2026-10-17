@@ -226,7 +226,8 @@ owner_inode_before=$(stat --format='%i' /run/perimeterd/owner.lock)
 
 case "$PACKAGE_SMOKE_DISTRO" in
     debian)
-        apt-get install -y -qq "$release_package"
+        apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+            install -y -qq "$release_package"
         ;;
     fedora)
         dnf install -y "$release_package"
@@ -239,6 +240,12 @@ esac
 [[ $(stat --format='%i' /run/perimeterd/owner.lock) == "$owner_inode_before" ]] || fail 'upgrade replaced the lifecycle lock inode'
 check_payload "$expected_arch"
 run_metadata_and_validate "$PACKAGE_EXPECTED_VERSION"
+
+# Attribution is part of the new package payload, not the older upgrade fixture.
+for document in README data-sources; do
+    grep -Fqx 'This product uses IP to Country Lite data by DB-IP, available at https://db-ip.com/, licensed under Creative Commons Attribution 4.0 International (https://creativecommons.org/licenses/by/4.0/). Perimeterd filters country records and converts address ranges into normalized CIDRs.' \
+        "/usr/share/doc/perimeterd/$document.md" || fail "installed $document is missing DB-IP attribution"
+done
 
 # Exercise both package managers' pre-removal failure semantics without starting
 # the daemon or creating any native firewall state in these containers.

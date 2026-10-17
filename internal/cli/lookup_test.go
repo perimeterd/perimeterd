@@ -81,13 +81,13 @@ func TestLookupHumanOutputIncludesEvidenceAndPartitions(t *testing.T) {
 				Managed:   true,
 				PortBasis: "destination",
 			},
-			Evidence: []lookup.Evidence{{Kind: "country", Name: "US", Role: "include", Prefix: netip.MustParsePrefix("8.0.0.0/8"), Contributing: true}},
+			Evidence: []lookup.Evidence{{Kind: "country", Name: "US", Provider: "dbip-lite", Release: "2026-10", Role: "include", Prefix: netip.MustParsePrefix("8.0.0.0/8"), Contributing: true}},
 		}},
 	}
 	if err := writeLookupHuman(&output, response); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"8.8.8.0/25", "external", "Evidence:", "8.0.0.0/8", "Revision: revision", "Manifest: manifest"} {
+	for _, want := range []string{"8.8.8.0/25", "external", "Evidence:", "8.0.0.0/8", "Revision: revision", "Manifest: manifest", "provider=dbip-lite", "release=2026-10"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("human output missing %q: %s", want, output.String())
 		}

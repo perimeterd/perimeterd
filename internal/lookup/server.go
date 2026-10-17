@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"reflect"
 	"strings"
+	"time"
 )
 
 // HTTPHandler exposes lookup semantics on the shared private control listener.
@@ -290,6 +291,29 @@ func isValidResponse(response Response) error {
 		for _, evidence := range outcome.Evidence {
 			if !evidence.Prefix.IsValid() || evidence.Kind == "" || evidence.Name == "" || evidence.Role == "" {
 				return errors.New("lookup evidence is incomplete")
+			}
+			switch evidence.Kind {
+			case "country":
+				switch evidence.Provider {
+				case "dbip-lite":
+					if release, err := time.Parse("2006-01", evidence.Release); err != nil || release.Format("2006-01") != evidence.Release {
+						return errors.New("invalid DB-IP evidence release")
+					}
+				case "ripestat":
+					if evidence.Release != "" {
+						return errors.New("unexpected RIPEstat evidence release")
+					}
+				default:
+					return errors.New("invalid country evidence provider")
+				}
+			case "asn":
+				if evidence.Provider != "ripestat" || evidence.Release != "" {
+					return errors.New("invalid ASN evidence provider")
+				}
+			default:
+				if evidence.Provider != "" || evidence.Release != "" {
+					return errors.New("unexpected evidence provider metadata")
+				}
 			}
 		}
 	}

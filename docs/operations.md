@@ -50,8 +50,8 @@ The runtime supports:
 - acknowledged `reload` through the running daemon's private Unix socket;
 - nftables and iptables/ipset policy application, including both legacy and
   nf_tables iptables tool families;
-- direct global address lists and RIPEstat country/ASN snapshots, with local
-  RIR and built-in/custom group expansion;
+- direct global lists, DB-IP Lite country snapshots (or explicit RIPEstat), and
+  independent RIPEstat ASN data, with local RIR and group country expansion;
 - reusable HTTP(S) custom IP-list sources and dynamically resolved named-provider
   feeds, with immutable snapshots, refresh, and cache fallback;
 - selected per-upstream OpenZiti transport for custom lists and CrowdSec;
@@ -106,11 +106,12 @@ ports. Perimeterd does not create Docker chains, permit services on behalf of
 Docker, or watch Docker lifecycle events. Preserve its tagged jumps when another
 manager edits the parent chain.
 
-Enabled policies using countries, RIRs, groups, or ASNs need access to RIPEstat
-on first resolution unless an acceptable committed snapshot covers each
-required selector. Enabled references to custom lists or providers need access
-to their source endpoints unless acceptable matching committed snapshots cover
-the required sources.
+Enabled country, RIR, or group policies need direct HTTPS access to
+`download.db-ip.com` by default, or RIPEstat when explicitly selected. ASN
+selectors always need RIPEstat. First resolution needs complete matching evidence;
+an acceptable committed snapshot can cover it under the normal fallback rules.
+Enabled custom lists/providers likewise need their endpoints unless matching
+committed snapshots cover all required sources.
 Installations with no enabled source-backed selectors and
 `crowdsec.enabled: false` make no source requests.
 
@@ -129,7 +130,7 @@ sudo bin/perimeterd run --config "$CONFIG"
 
 `validate` is local-only and does not require root; this example uses `sudo`
 because the configuration is kept root-readable only. It does not resolve
-selectors, read credentials, contact RIPEstat or CrowdSec, bind the metrics
+selectors, read credentials, contact DB-IP, RIPEstat, or CrowdSec, bind the metrics
 listener, or touch firewall state. Success establishes local schema and
 semantic validity, not runtime readiness. See
 [configuration validation phases](configuration.md#validation-phases) for the
@@ -170,14 +171,41 @@ referenced cache evidence before mutating the firewall. Unreferenced cache
 files are collected only after startup recovery or explicit cleanup, not while
 source workers may be staging candidates.
 
-RIPEstat refresh uses `geo.refresh_interval` (default `24h`) plus sampled jitter up to
-`geo.refresh_jitter` (default `10m`). Each request defaults to a `30s` timeout;
-at most four source requests are in flight and at most 512 selectors are
-accepted. Incomplete, malformed, oversized, or otherwise unacceptable source
-data leaves the committed policy unchanged. A committed snapshot is reused
-only when it covers every required selector; a newly introduced selector must
-resolve successfully. Failed refreshes retain the active policy and retry on
-the normal schedule.
+Country/ASN refresh uses `geo.refresh_interval` (default `24h`) plus jitter up to
+`geo.refresh_jitter` (default `10m`). Each attempt defaults to `30s`, covering slot
+admission, download, and parse; at most four source requests are in flight and
+512 selectors are accepted. DB-IP country work is one coherent batch for every
+required country whenever any is due/missing/mismatched. Monthly artifact release
+and retrieval time are different: refresh can replace bytes from the same month.
+Unacceptable data or source/native/durable capacity rejection leaves the committed
+policy and provenance unchanged. Failed refreshes retry on the normal schedule;
+provider changes and newly introduced countries require matching fresh evidence.
+
+### Country-provider upgrades and outages
+
+Newly parsed YAML, including old files with no provider key, defaults to DB-IP
+geographic country classification. To retain RIPEstat allocation/registration
+country behavior, add `geo.country_provider: ripestat` before upgrading/reloading.
+Country groups and RIR selections follow that choice; ASN remains RIPEstat.
+Historical committed configurations with no field recover as RIPEstat without
+rewriting immutable bytes. They may remain enforced after a failed switch, but
+status/lookup must keep their actual RIPEstat provenance.
+
+First DB-IP activation needs a complete validated country batch. There is no
+silent RIPE fallback, current-month-to-previous-month fallback is allowed only
+for HTTP 404, and committed releases never move backward. Same-provider restart
+fallback requires complete valid coverage; a new provider/missing country cannot
+reuse incompatible evidence. Do not confuse this with binary rollback: older
+binaries cannot read new DB-IP commits. Never delete durable state to force a
+downgrade. See [configuration upgrades](configuration.md#country-provider-upgrades)
+and [source selection](data-sources.md#db-ip-lite-country-default).
+
+DB-IP's finer boundaries can exceed existing capacity fences. In the
+[measured real-data envelope](development.md#db-ip-lite-real-data-validation),
+EU data activated/recovered on iptables but an additional retained generation
+was rejected; a RIPE-region-plus-US policy exceeded native/durable limits.
+Review large group/RIR deployments before changing provider. Rejection is not
+permission to truncate data, widen ranges, or remove recovery evidence.
 
 Encoded-state and native-input limits are safety fences, not tuning knobs.
 Admission accounts for the candidate and required retained state; rejection
@@ -407,8 +435,8 @@ report and never falls back to disk.
 | `1` | Degraded/unavailable state, stale/unknown enabled CrowdSec state, transport/protocol failure, or output failure |
 | `2` | Invalid command usage |
 
-Example source/compiled excerpt with identical ingress/egress country sets
-and a distinct SSH selection; totals also include global/internal sets:
+Example source/compiled excerpt with explicitly selected RIPEstat country mode,
+identical ingress/egress country sets, and a distinct SSH selection:
 
 ```text
 Loaded source prefix elements (per family/source/type; not unique IPs or packet counts):
@@ -436,8 +464,10 @@ Compiled firewall sets (static target memberships; shared sets counted once; not
   Dynamic CrowdSec memberships excluded; decision counts reported separately.
 ```
 
-JSON retains full identifiers and uses `schema_version: 3`. Applied details
-require `compiled_sets.sets` rows (`family`, `id`, unsigned `count`, sorted unique
+JSON retains full identifiers and uses `schema_version: 4`. Applied details
+include deterministic `sources` rows (`provider`, optional `release`, oldest
+`retrieved_at` per provider/release) and require
+`compiled_sets.sets` rows (`family`, `id`, unsigned `count`, sorted unique
 `policies`) and `compiled_sets.totals` rows (`family`, unsigned `count`).
 Consumer arrays must be present even when empty. Collections are non-null
 arrays; each present family has one total, even when zero. Empty or
@@ -445,12 +475,13 @@ unavailable applied states retain their existing absence of details.
 Historical unshared revisions show their actual separate rows until a new
 shared representation commits. Migration and failed-reload recovery use the
 ordinary journal protocol; do not delete state to force sharing.
-For example, select all three count concepts without parsing text labels:
+For example, inspect source provenance and all three count concepts without parsing text labels:
 
 ```sh
 sudo bin/perimeterd status --json |
   jq '{state: .applied.state, revision: .applied.revision,
        firewall: .applied.details.firewall,
+       sources: .applied.details.sources,
        prefix_counts: .applied.details.prefix_counts,
        compiled_sets: .applied.details.compiled_sets,
        crowdsec: .applied.details.crowdsec}'
@@ -532,9 +563,9 @@ Allowlist misses are denial by absence, not evidence of membership in a blocking
 feed. "Not blocked" deliberately does not mean ACCEPT: other firewall rules can
 still deny after perimeterd returns.
 
-The implemented version-1 result contract requires an envelope containing:
+The lookup response uses schema 2 on the unchanged `/v1/lookup` path:
 
-- `schema_version: 1`, canonical query and effective new-flow assumptions,
+- `schema_version: 2`, canonical query and effective new-flow assumptions,
   aggregate `verdict`, and an explicit error code/message when not complete;
 - `observed_at`, selected revision/configuration epoch, exact static manifest
   identity when present, and acknowledged CrowdSec epoch/operation identity
@@ -543,11 +574,15 @@ The implemented version-1 result contract requires an envelope containing:
   and interface/port-basis conditions, verdict/action, deciding stage and policy
   name/priority when applicable, and a reason for pass or denial;
 - source evidence separately identifying matching includes, exclusions, and
-  shadowed memberships, with relevant normalized ranges and static retrieval
-  timestamps or dynamic decision/lease deadlines. A matching source is marked
-  as contributing only in the context of the deciding rule, not as another
-  terminal decision. [Data sources](data-sources.md#lookup-source-attribution)
+  shadowed memberships, with normalized ranges and static retrieval timestamps
+  or dynamic decision/lease deadlines. Country/ASN keep semantic kind/name;
+  `provider` is `dbip-lite` or `ripestat`, with `release` only for DB-IP.
+  A matching source contributes only in the deciding rule's context.
+  [Data sources](data-sources.md#lookup-source-attribution)
   defines available provenance and its limits.
+
+Status and lookup clients reject mixed response schema versions explicitly;
+the reload protocol and all HTTP paths remain unchanged.
 
 Sort scopes, ranges, and source identities deterministically. Human output
 summarizes the same complete result as `--json`, without silently hiding mixed
@@ -1002,9 +1037,9 @@ gauges alongside the accounting and outcome metrics below:
   enforcement is healthy; it becomes `0` during degraded recovery. A listener
   failure terminates `run`, so the endpoint is no longer served.
 - `perimeterd_prefix_snapshot_timestamp_seconds{source}` (gauge), emitted
-  separately for each required static source kind: `ripestat`, `ip_list`, and `provider`.
-  It is the oldest committed retrieval time for that kind, not manifest
-  publication time. Unreferenced source kinds emit no timestamp.
+  separately for each required static source kind: `dbip-lite`, `ripestat`,
+  `ip_list`, and `provider`. It is the oldest committed retrieval time for that
+  kind, never month start or manifest publication time. Unreferenced kinds emit no timestamp.
 - `perimeterd_crowdsec_connected` (unlabeled gauge): the active integration's
   synchronization/poll outcome. It is `0` when disabled, not yet synchronized,
   or after a failed poll/reconnect, and `1` after successful polling/activation.
@@ -1057,11 +1092,16 @@ The endpoint also exports:
 - `perimeterd_firewall_counter_timestamp_seconds{backend}` (gauge): timestamp
   of the last successful native counter read.
 
-The prefix gauge includes built-in local, configured global, RIPEstat, and
-custom-list prefixes through fixed `source` and `type` label values;
-custom lists use `source="ip_list"` and `type="ip_list"`.
+The prefix gauge includes built-in local, configured global, DB-IP Lite,
+RIPEstat, and custom-list prefixes through fixed labels. Country counts use the
+committed provider (`dbip-lite/country` or `ripestat/country`); ASN stays
+`ripestat/asn`. Custom lists use `source="ip_list"` and `type="ip_list"`.
 Provider data uses the fixed `source="provider"` and
 `type="provider"` values, not per-provider label values.
+Source request observations count one logical DB-IP country batch, including
+its retries, not one imagined download per country. Release, country, digest,
+and URL never become metric labels. Failed candidates do not advance committed
+freshness, overall source age, counts, or provider summaries.
 
 Each scrape sees one complete prefix snapshot, including when a reconcile
 re-publishes unchanged counts.

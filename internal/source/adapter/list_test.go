@@ -19,7 +19,7 @@ func listSourceConfig(url string, countries, lists []string) config.Config {
 	return config.Config{
 		Version:  1,
 		Firewall: config.FirewallConfig{Backend: "nftables", DenyAction: "drop", IPv4: true, IPv6: true},
-		Geo:      config.GeoConfig{RequestTimeout: time.Second, RefreshInterval: time.Hour},
+		Geo:      config.GeoConfig{CountryProvider: config.CountryProviderRIPEstat, RequestTimeout: time.Second, RefreshInterval: time.Hour},
 		IPLists: map[string]config.IPListConfig{
 			"feed": {URL: url, RefreshInterval: time.Hour, RequestTimeout: time.Second},
 		},

@@ -87,6 +87,7 @@ global:
   allowlist: ["8.60.0.0/24", "2600:60::/64"]
   blocklist: ["8.62.0.0/24", "2600:62::/64"]
 geo:
+  country_provider: ripestat
   refresh_interval: 1h
   request_timeout: 2s
 policies:

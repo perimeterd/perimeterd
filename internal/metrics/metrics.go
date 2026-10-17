@@ -17,6 +17,7 @@ import (
 // static source kind. Zero values are not exposed.
 type PrefixTimestamps struct {
 	RIPestat int64
+	DBIPLite int64
 	IPList   int64
 	Provider int64
 }
@@ -37,6 +38,7 @@ func (c timestampCollector) Collect(ch chan<- prometheus.Metric) {
 		stamp  int64
 	}{
 		{source: "ripestat", stamp: values.RIPestat},
+		{source: "dbip-lite", stamp: values.DBIPLite},
 		{source: "ip_list", stamp: values.IPList},
 		{source: "provider", stamp: values.Provider},
 	} {
@@ -516,7 +518,7 @@ func reconcileReason(value string) string {
 
 func sourceKind(value string) string {
 	switch value {
-	case "ripestat", "ip_list", "provider", "crowdsec":
+	case "ripestat", "dbip-lite", "ip_list", "provider", "crowdsec":
 		return value
 	default:
 		return "unknown"
@@ -549,7 +551,7 @@ func validDenyReason(value string) bool {
 
 func validPrefixSource(value string) bool {
 	switch value {
-	case "local", "global", "ripestat", "ip_list", "provider":
+	case "local", "global", "ripestat", "dbip-lite", "ip_list", "provider":
 		return true
 	default:
 		return false

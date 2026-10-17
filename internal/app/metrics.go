@@ -67,6 +67,9 @@ func prefixCounts(candidate Candidate) []metricspkg.PrefixCount {
 	}
 	for _, record := range candidate.snapshot.Records() {
 		source, kind := selectorMetricLabels(record.Selector.Kind)
+		if record.Selector.Kind == policy.Country && record.SourceKind == config.CountryProviderDBIPLite {
+			source = config.CountryProviderDBIPLite
+		}
 		for _, prefix := range record.IPv4 {
 			add(prefix, source, kind)
 		}

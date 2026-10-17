@@ -93,8 +93,8 @@ var regionalGroups = map[string][]string{
 // a geographic grouping. Reviewed 2026-09-15 against the RIPE NCC table:
 // https://www.ripe.net/community/internet-governance/internet-technical-community/the-rir-system/list-of-country-codes-and-rirs/
 // Cross-checked with the NRO table and individual RIR service-region lists.
-// RIR selectors resolve these countries through country-resource-list; they
-// never become independent source records.
+// RIR selectors resolve these countries through the selected country provider;
+// they never become independent raw registry resource source records.
 var rirServiceRegions = map[string][]string{
 	"AFRINIC": {
 		"AO", "BF", "BI", "BJ", "BW", "CD", "CF", "CG", "CI", "CM", "CV", "DJ",

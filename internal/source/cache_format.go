@@ -32,6 +32,7 @@ type objectFile struct {
 	SourceName    string            `json:"source_name,omitempty"`
 	Endpoint      string            `json:"endpoint"`
 	APIVersion    string            `json:"api_version"`
+	Release       string            `json:"release,omitempty"`
 	Parameters    map[string]string `json:"parameters"`
 	QueryStart    string            `json:"query_start"`
 	QueryEnd      string            `json:"query_end"`
@@ -68,6 +69,7 @@ type manifestEntry struct {
 	SourceName  string            `json:"source_name,omitempty"`
 	Endpoint    string            `json:"endpoint"`
 	APIVersion  string            `json:"api_version"`
+	Release     string            `json:"release,omitempty"`
 	Parameters  map[string]string `json:"parameters"`
 	QueryStart  string            `json:"query_start"`
 	QueryEnd    string            `json:"query_end"`
@@ -83,6 +85,7 @@ func objectFromRecord(record Record) objectFile {
 		SourceName:    record.SourceName,
 		Endpoint:      record.Endpoint,
 		APIVersion:    record.APIVersion,
+		Release:       record.Release,
 		Parameters:    cloneParameters(record.Parameters),
 		QueryStart:    storedTime(record.QueryStart), QueryEnd: storedTime(record.QueryEnd), RetrievedAt: canonicalTime(record.RetrievedAt),
 		ContentID: prefixContentID(record.IPv4, record.IPv6),
@@ -96,6 +99,7 @@ func manifestEntryFromRecord(record Record, object string) manifestEntry {
 		Selector: selectorWire{Kind: string(record.Selector.Kind), Value: record.Selector.Value},
 		Object:   object, SourceKind: record.SourceKind, SourceName: record.SourceName,
 		Endpoint: record.Endpoint, APIVersion: record.APIVersion,
+		Release:    record.Release,
 		Parameters: cloneParameters(record.Parameters),
 		QueryStart: storedTime(record.QueryStart), QueryEnd: storedTime(record.QueryEnd),
 		RetrievedAt: canonicalTime(record.RetrievedAt),
@@ -179,6 +183,28 @@ func canonicalRecord(record Record) (Record, error) {
 	sourceKind := record.SourceKind
 	if sourceKind == "" {
 		sourceKind = ripeSourceKind
+	}
+	if sourceKind != dbipSourceKind && record.Release != "" {
+		return Record{}, errors.New("release metadata is only allowed for DB-IP")
+	}
+	if sourceKind == dbipSourceKind {
+		if err := validateDBIPRecord(record); err != nil {
+			return Record{}, err
+		}
+		v4, err := normalizeFamily(record.IPv4, true)
+		if err != nil {
+			return Record{}, fmt.Errorf("IPv4: %w", err)
+		}
+		v6, err := normalizeFamily(record.IPv6, false)
+		if err != nil {
+			return Record{}, fmt.Errorf("IPv6: %w", err)
+		}
+		return Record{
+			Selector: selector, SourceKind: dbipSourceKind,
+			Endpoint: record.Endpoint, APIVersion: record.APIVersion, Release: record.Release,
+			Parameters: cloneParameters(record.Parameters), RetrievedAt: record.RetrievedAt.UTC(),
+			IPv4: v4, IPv6: v6, Transport: transport,
+		}, nil
 	}
 	if sourceKind == listSourceKind || sourceKind == providerSourceKind {
 		expectedKind, label := policy.IPList, "custom list"
@@ -406,6 +432,12 @@ func validateManifest(manifest manifestFile) error {
 		if manifest.SchemaVersion == legacyCacheSchemaVersionV1 && (entry.SourceKind != "" || entry.SourceName != "") {
 			return errors.New("legacy manifest contains custom source metadata")
 		}
+		if manifest.SchemaVersion <= legacyCacheSchemaVersionV2 && (entry.SourceKind == dbipSourceKind || entry.Release != "") {
+			return errors.New("legacy manifest contains DB-IP metadata")
+		}
+		if entry.SourceKind == dbipSourceKind && manifest.Source != "static" {
+			return errors.New("DB-IP manifest source must be static")
+		}
 		if manifest.SchemaVersion == cacheSchemaVersion && entry.Transport.Type == "" {
 			return fmt.Errorf("selector %d transport binding is missing", i)
 		}
@@ -444,7 +476,7 @@ func validateManifestEntry(entry manifestEntry, schemaVersion, index int) error 
 	start := parseStoredTime(entry.QueryStart)
 	end := parseStoredTime(entry.QueryEnd)
 	retrieved := parseCanonicalTime(entry.RetrievedAt)
-	record := Record{Selector: selector, SourceKind: entry.SourceKind, SourceName: entry.SourceName, Endpoint: entry.Endpoint, APIVersion: entry.APIVersion, Parameters: entry.Parameters, QueryStart: start, QueryEnd: end, RetrievedAt: retrieved, Transport: transport}
+	record := Record{Selector: selector, SourceKind: entry.SourceKind, SourceName: entry.SourceName, Endpoint: entry.Endpoint, APIVersion: entry.APIVersion, Release: entry.Release, Parameters: entry.Parameters, QueryStart: start, QueryEnd: end, RetrievedAt: retrieved, Transport: transport}
 	if _, err := canonicalRecord(record); err != nil {
 		return fmt.Errorf("selector %d metadata: %w", index, err)
 	}
@@ -460,6 +492,9 @@ func validateObject(object objectFile) (Record, error) {
 	}
 	if object.SchemaVersion == legacyCacheSchemaVersionV1 && (object.SourceKind != "" || object.SourceName != "") {
 		return Record{}, errors.New("legacy object contains custom source metadata")
+	}
+	if object.SchemaVersion <= legacyCacheSchemaVersionV2 && (object.SourceKind == dbipSourceKind || object.Release != "") {
+		return Record{}, errors.New("legacy object contains DB-IP metadata")
 	}
 	if object.SchemaVersion == cacheSchemaVersion && object.Transport.Type == "" {
 		return Record{}, errors.New("object transport binding is missing")

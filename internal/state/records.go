@@ -100,6 +100,11 @@ func (s *Store) validateRevision(revision *Revision) (resultErr error) {
 	if revision.Config.Version != 1 {
 		return fmt.Errorf("state: revision %s has unsupported configuration version %d", revision.ID, revision.Config.Version)
 	}
+	switch revision.Config.Geo.EffectiveCountryProvider() {
+	case config.CountryProviderDBIPLite, config.CountryProviderRIPEstat:
+	default:
+		return fmt.Errorf("state: revision %s has unsupported country provider %q", revision.ID, revision.Config.Geo.CountryProvider)
+	}
 	if err := firewall.ValidateConfig(revision.Config); err != nil {
 		return fmt.Errorf("state: revision %s configuration: %w", revision.ID, err)
 	}

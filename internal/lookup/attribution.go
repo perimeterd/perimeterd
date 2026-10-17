@@ -128,13 +128,14 @@ func containingPrefix(values []netip.Prefix, address netip.Addr) (netip.Prefix, 
 func sourceEvidence(value sourceRef, policyName, role string, covered netip.Prefix, contributing bool) Evidence {
 	kind := string(value.record.Selector.Kind)
 	name := value.record.Selector.Value
-	if value.record.SourceKind != "" {
-		kind = value.record.SourceKind
+	provider := ""
+	if kind == "country" || kind == "asn" {
+		provider = value.record.SourceKind
+		if provider == "" {
+			provider = "ripestat"
+		}
 	}
-	if value.record.SourceName != "" {
-		name = value.record.SourceName
-	}
-	return Evidence{Kind: kind, Name: name, Policy: policyName, Role: role, Via: append([]string(nil), value.via...), Prefix: covered, Contributing: contributing, RetrievedAt: value.record.RetrievedAt}
+	return Evidence{Kind: kind, Name: name, Provider: provider, Release: value.record.Release, Policy: policyName, Role: role, Via: append([]string(nil), value.via...), Prefix: covered, Contributing: contributing, RetrievedAt: value.record.RetrievedAt}
 }
 
 func evidenceLess(left, right Evidence) bool {
@@ -143,6 +144,12 @@ func evidenceLess(left, right Evidence) bool {
 	}
 	if left.Name != right.Name {
 		return left.Name < right.Name
+	}
+	if left.Provider != right.Provider {
+		return left.Provider < right.Provider
+	}
+	if left.Release != right.Release {
+		return left.Release < right.Release
 	}
 	if left.Policy != right.Policy {
 		return left.Policy < right.Policy

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/perimeterd/perimeterd/internal/config"
 	"github.com/perimeterd/perimeterd/internal/firewall"
 	"github.com/perimeterd/perimeterd/internal/policy"
 	"github.com/perimeterd/perimeterd/internal/source"
@@ -22,6 +23,8 @@ func historicalRevision(t *testing.T, store *Store, backend string) *Revision {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This fixture deliberately exercises the historical RIPE country contract.
+	cfg.Geo.CountryProvider = config.CountryProviderRIPEstat
 	now := time.Now().UTC().Truncate(time.Second)
 	var records []source.Record
 	for _, resolved := range historicalfixture.Records() {

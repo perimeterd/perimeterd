@@ -35,6 +35,7 @@ flowchart LR
     CS[Local config source] --> V[Strict validation]
     V --> R[Selector resolver and immutable cache]
     R --> C[Policy compiler]
+    DBIP[DB-IP Lite monthly country artifact] --> R
     RIPE[RIPEstat] --> R
     TXT[HTTP/S text or CSV IP lists] --> R
     PROVIDERS[jsDelivr main provider feeds] --> R
@@ -105,8 +106,8 @@ to the current files.
 
 The current configuration ingress is a local file, reloaded through acknowledged
 `perimeterd reload` or asynchronous manual `SIGHUP`;
-implemented static sources are RIPEstat, custom HTTP(S) lists, and dynamic
-named-provider feeds. Any future configuration or prefix providers must
+implemented static sources are DB-IP Lite countries, RIPEstat ASN/opt-in country,
+custom HTTP(S) lists, and dynamic named-provider feeds. Future prefix providers must
 preserve these boundaries and produce complete candidates rather than bypass
 admission or call a backend directly.
 
@@ -138,6 +139,33 @@ factored. Applicable empty sets can share, while inapplicable families gain no
 rules or sets. [Firewall backends](firewall-backends.md#shared-static-policy-sets)
 owns native realization and transition invariants.
 
+### Country-provider transactions
+
+New YAML explicitly selects DB-IP Lite by default; historical normalized configs
+with no provider retain RIPEstat meaning. This interpretation preserves durable
+JSON byte identity, not a second YAML default. Immutable revisions are never
+rewritten. ASN always remains RIPEstat; direct countries, groups, and embedded
+RIR service-region country unions all follow the selected country provider.
+
+A due, missing, or provider-mismatched DB-IP country expands one transaction-local
+work item to every required country. One fully validated monthly artifact yields
+one release/digest/completion timestamp, followed by the existing compiler,
+admission fence, serialized writer, compensation, and manifest publication.
+There is no global downloader cache, independent scheduler, or partial-country
+publication. Candidate metadata and metrics become active only with the
+acknowledged immutable snapshot. Provider changes cannot borrow another provider's
+committed records; complete same-provider stale fallback still obeys existing
+coverage/compilation rules. Removing countries may reuse a coherent subset;
+adding one forces a complete country batch.
+
+Cache schema 3 adds optional DB-IP `release` without changing old canonical
+objects; durable state stays version 2. Exact provider/parser/month/endpoint/
+parameters/transport and homogeneous batch provenance are validated at stage,
+load, candidate, and recovery boundaries, not merely by object hashes.
+Older readers cannot load a DB-IP commit; selecting RIPEstat in the new binary
+is not a promise of binary downgrade. See [country-provider upgrades](configuration.md#country-provider-upgrades)
+and the [source contract](data-sources.md#country-providers-and-asn-scope).
+
 ### Custom IP list integration
 
 Named `ip_lists` extend static source resolution, not the dynamic CrowdSec path.
@@ -148,13 +176,13 @@ defaults, validation, and policy semantics; [data sources](data-sources.md#custo
 owns the text format, fetch limits, source identity, scheduling, and cache rules.
 
 The resolver fetches only lists referenced by enabled policies, normalizes their
-IPv4/IPv6 prefixes, and stages them alongside any required RIPEstat selectors
+IPv4/IPv6 prefixes, and stages them alongside country/ASN sources
 in one complete immutable snapshot. The compiler performs the existing
 include-union minus exclude-union algebra without knowing URLs or making
 requests. Both backends consume the resulting static sets; list refreshes do
 not update live sets in place or create a new packet-path stage.
 
-A single static scheduler accounts for RIPEstat and per-list deadlines.
+A single static scheduler accounts for country/ASN and per-list deadlines.
 Refreshes still carry the active configuration epoch and global static refresh
 sequence; separate list timers must not publish independently or overwrite
 another source's newer result. Reload stages list definitions and scheduling
@@ -228,7 +256,7 @@ preserve today's behavior. A direct-only deployment does not load identity
 files, initialize SDK contexts, contact Ziti, or acquire another runtime
 prerequisite. Unused identity profiles likewise remain inactive. Do not mutate
 process-global HTTP transports, DNS, host routes, or network interfaces.
-RIPEstat and fixed jsDelivr provider downloads retain their existing transport;
+DB-IP Lite, RIPEstat, and fixed jsDelivr provider downloads remain direct;
 a private provider mirror can be configured as a custom list.
 
 Each opted-in upstream names an identity profile and one exact Ziti service.
@@ -431,10 +459,11 @@ via `POST /v1/reload` and read-only status requests via `GET /v1/status`.
 Access is root-only; remote access, delegated group access, and arbitrary
 CLI socket paths are outside these features.
 
-The status payload uses `schema_version: 3` on the existing `/v1/status`
-route; lookup/reload schemas and routes are unchanged. Applied details require
-non-null `compiled_sets.sets` and `compiled_sets.totals` arrays. Each row requires
-a non-null `policies` array with sorted unique consumer names; global/internal
+The status payload uses `schema_version: 4` on `/v1/status`; lookup uses response
+schema 2 on `/v1/lookup`. Paths and the reload protocol are unchanged. Both
+clients fail explicitly on mixed response versions. Applied details require
+non-null `sources`, `compiled_sets.sets`, and `compiled_sets.totals` arrays.
+Each compiled-set row requires a non-null `policies` array with sorted unique consumer names; global/internal
 sets normally have an empty array. Static rows use logical family/set identities,
 not generated native names, and are sorted at publication (IPv4, IPv6, then set
 ID). Totals count each materialized set once, not once per consumer. Each present
@@ -444,6 +473,12 @@ families, duplicate identities/totals, inconsistent sums, and unsigned overflow.
 Empty/unavailable applied states still omit details. Mixed old/new status
 schemas fail explicitly in every state rather than synthesizing zero counts.
 The existing five-second round trip and 4 MiB response limit remain in force.
+
+Committed `sources` rows group by provider and optional release, sorted
+deterministically, with the oldest retrieval time per group. Lookup preserves
+semantic country/ASN kind while adding provider and optional DB-IP release;
+neither surface exposes source endpoints or artifact parameters. Pending or
+rejected candidates never replace these applied summaries.
 
 At startup, `run` acquires the existing lifecycle lock before managing the
 socket. Only that owner may remove a verified stale socket at the fixed path; a
@@ -820,9 +855,9 @@ idempotently.
 
 ## Security and trust boundaries
 
-Configuration and credential files are privileged local input. RIPEstat,
-CrowdSec, and custom HTTP(S) lists are network trust boundaries: responses are
-bounded, validated, and normalized before compilation. Firewall commands and netlink transactions are
+Configuration and credential files are privileged local input. DB-IP Lite,
+RIPEstat, CrowdSec, and custom HTTP(S) lists are network trust boundaries:
+responses are bounded, validated, and normalized before compilation. Firewall commands and netlink transactions are
 output boundaries and accept only typed desired state, never source-provided
 firewall syntax. No source adapter can select commands, chain names, or raw
 rules.

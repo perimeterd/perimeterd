@@ -149,6 +149,13 @@ func writeStatus(w io.Writer, result control.StatusResult) error {
 			}
 		}
 		out.WriteString("  Dynamic CrowdSec memberships excluded; decision counts reported separately.\n")
+		for _, source := range details.Sources {
+			fmt.Fprintf(&out, "Source: provider=%s", source.Provider)
+			if source.Release != "" {
+				fmt.Fprintf(&out, " release=%s", source.Release)
+			}
+			fmt.Fprintf(&out, " retrieved_at=%s\n", source.RetrievedAt.UTC().Format(time.RFC3339Nano))
+		}
 		crowdsec := details.CrowdSec
 		if !crowdsec.Enabled {
 			out.WriteString("CrowdSec: disabled\n")

@@ -144,6 +144,8 @@ firewall:
         direction: ingress
       - chain: OUTPUT
         direction: egress
+geo:
+  country_provider: ripestat
 crowdsec:
   enabled: true
   lapi_url: %q

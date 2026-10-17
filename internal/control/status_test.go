@@ -34,6 +34,7 @@ func statusReport(state string) StatusResult {
 			Firewall:     StatusFirewall{Backend: "iptables", Families: []string{"ipv4", "ipv6"}, DenyAction: "reject", Attachments: []StatusAttachment{{Chain: "FORWARD", Direction: "egress", OutputInterfaces: []string{"eth0"}, OriginalDestination: true}}},
 			Policies:     []StatusPolicy{{Name: "web", Priority: -10, Direction: "ingress", Mode: "allowlist", Traffic: StatusTraffic{TCP: []StatusPortRange{{Start: 80, End: 443}}, ICMP: true}}},
 			PrefixCounts: []StatusPrefixCount{{Family: "ipv4", Source: "global", Type: "allowlist", Count: 12}},
+			Sources:      []StatusSource{},
 			CompiledSets: StatusCompiledSets{
 				Sets:   []StatusCompiledSet{{Family: "ipv4", ID: "global_allowlist", Policies: []string{}, Count: 12}},
 				Totals: []StatusCompiledTotal{{Family: "ipv4", Count: 12}, {Family: "ipv6", Count: 0}},
@@ -153,7 +154,7 @@ func TestStatusRejectsProtocolFailures(t *testing.T) {
 		{"null", "null", 200},
 		{"empty", "{}", 200},
 		{"malformed", "{", 200},
-		{"schema", strings.Replace(valid, `"schema_version":3`, `"schema_version":2`, 1), 200},
+		{"schema", strings.Replace(valid, `"schema_version":4`, `"schema_version":3`, 1), 200},
 		{"unknown", strings.Replace(valid, `"state":"empty"`, `"state":"empty","extra":true`, 1), 200},
 		{"trailing", valid + " {}", 200},
 		{"state", strings.Replace(valid, `"state":"empty"`, `"state":"invented"`, 1), 200},

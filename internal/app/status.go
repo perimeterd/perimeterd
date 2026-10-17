@@ -76,6 +76,7 @@ func buildStatusDetails(candidate Candidate, target *firewall.Target) (*control.
 		Firewall:     control.StatusFirewall{Backend: target.Backend(), DenyAction: cfg.Firewall.DenyAction, Families: make([]string, 0, len(target.Families))},
 		Policies:     make([]control.StatusPolicy, 0, len(cfg.Policies)),
 		PrefixCounts: make([]control.StatusPrefixCount, 0, len(candidate.prefixes)),
+		Sources:      make([]control.StatusSource, 0),
 		CompiledSets: control.StatusCompiledSets{
 			Sets:   make([]control.StatusCompiledSet, 0, setCapacity),
 			Totals: make([]control.StatusCompiledTotal, 0, len(target.Families)),
@@ -152,6 +153,28 @@ func buildStatusDetails(candidate Candidate, target *firewall.Target) (*control.
 	for _, count := range candidate.prefixes {
 		details.PrefixCounts = append(details.PrefixCounts, control.StatusPrefixCount{Family: count.Family, Source: count.Source, Type: count.Type, Count: uint64(count.Count)})
 	}
+	type sourceKey struct{ provider, release string }
+	sources := make(map[sourceKey]time.Time)
+	for _, record := range candidate.snapshot.Records() {
+		provider, _ := selectorMetricLabels(record.Selector.Kind)
+		if record.Selector.Kind == policy.Country && record.SourceKind == config.CountryProviderDBIPLite {
+			provider = config.CountryProviderDBIPLite
+		}
+		key := sourceKey{provider: provider, release: record.Release}
+		if previous, exists := sources[key]; !exists || record.RetrievedAt.Before(previous) {
+			sources[key] = record.RetrievedAt
+		}
+	}
+	for key, retrieved := range sources {
+		details.Sources = append(details.Sources, control.StatusSource{Provider: key.provider, Release: key.release, RetrievedAt: retrieved})
+	}
+	sort.Slice(details.Sources, func(i, j int) bool {
+		a, b := details.Sources[i], details.Sources[j]
+		if a.Provider != b.Provider {
+			return a.Provider < b.Provider
+		}
+		return a.Release < b.Release
+	})
 	return details, nil
 }
 
@@ -182,6 +205,7 @@ func cloneStatusDetails(value *control.StatusDetails) *control.StatusDetails {
 		result.Policies[i].Traffic.UDP = slices.Clone(value.Policies[i].Traffic.UDP)
 	}
 	result.PrefixCounts = slices.Clone(value.PrefixCounts)
+	result.Sources = slices.Clone(value.Sources)
 	result.CompiledSets.Sets = slices.Clone(value.CompiledSets.Sets)
 	for i := range result.CompiledSets.Sets {
 		result.CompiledSets.Sets[i].Policies = slices.Clone(value.CompiledSets.Sets[i].Policies)

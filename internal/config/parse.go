@@ -151,6 +151,7 @@ type rawAttachment struct {
 }
 
 type rawGeo struct {
+	CountryProvider *string `yaml:"country_provider"`
 	RefreshInterval *string `yaml:"refresh_interval"`
 	RequestTimeout  *string `yaml:"request_timeout"`
 	RefreshJitter   *string `yaml:"refresh_jitter"`
@@ -286,7 +287,7 @@ func checkGlobal(node *yaml.Node, path string) error {
 }
 
 func checkGeo(node *yaml.Node, path string) error {
-	return checkMappingFields(node, path, map[string]nodeKind{"refresh_interval": kindString, "request_timeout": kindString, "refresh_jitter": kindString}, nil)
+	return checkMappingFields(node, path, map[string]nodeKind{"country_provider": kindString, "refresh_interval": kindString, "request_timeout": kindString, "refresh_jitter": kindString}, nil)
 }
 
 func checkProviders(node *yaml.Node, path string) error {

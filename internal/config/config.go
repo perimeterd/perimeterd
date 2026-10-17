@@ -139,11 +139,27 @@ type Attachment struct {
 	OriginalDestination bool     `yaml:"original_destination"`
 }
 
-// GeoConfig controls static prefix refresh timing.
+// Country provider identifiers are exact YAML enum values.
+const (
+	CountryProviderDBIPLite = "dbip-lite"
+	CountryProviderRIPEstat = "ripestat"
+)
+
+// GeoConfig selects country semantics and controls static prefix refresh timing.
 type GeoConfig struct {
+	CountryProvider string        `yaml:"country_provider" json:"CountryProvider,omitempty"`
 	RefreshInterval time.Duration `yaml:"refresh_interval"`
 	RequestTimeout  time.Duration `yaml:"request_timeout"`
 	RefreshJitter   time.Duration `yaml:"refresh_jitter"`
+}
+
+// EffectiveCountryProvider preserves the RIPEstat meaning of historical configs
+// whose immutable JSON predates CountryProvider. Fresh YAML always sets it.
+func (c GeoConfig) EffectiveCountryProvider() string {
+	if c.CountryProvider == "" {
+		return CountryProviderRIPEstat
+	}
+	return c.CountryProvider
 }
 
 // ProvidersConfig controls the shared refresh timing for named-provider feeds.

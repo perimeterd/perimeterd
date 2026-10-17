@@ -44,7 +44,7 @@ internal/policy/              immutable snapshots and backend-neutral compiler
 internal/metrics/             bounded-label instrumentation and native counter accumulation
 internal/prefix/              prefix normalization and set algebra
 internal/firewall/            typed targets, native backend routing and reconciliation
-internal/source/              RIPEstat, text-list/provider resolution and immutable cache
+internal/source/              DB-IP Lite, RIPEstat, text-list/provider resolution and immutable cache
 internal/state/               revision store, record codec/validation and durable filesystem IO
 internal/upstream/            identity capture, bounded SDK admission and service-bound HTTP pools
 configs/perimeterd.yaml       annotated complete configuration example
@@ -259,10 +259,11 @@ Compiled membership regressions keep source de-duplication separate from
 materialized per-set counts and explicit policy consumers, including shared
 ingress/egress data, distinct SSH selection, internal/global sets, empty sets,
 disabled families, deeply immutable returned slices, and count/revision
-consistency across publication and recovery. Control schema 3 requires coherent
-unsigned family totals, non-null collections, and sorted unique consumer arrays;
-malformed/old reports fail rather than defaulting missing data to zero. Focused
-checks include `go test ./internal/policy ./internal/firewall ./internal/state ./internal/app ./internal/control ./internal/cli ./internal/lookup`
+consistency across publication and recovery. Control schema 4 adds committed
+source summaries to coherent unsigned family totals, non-null collections,
+and sorted unique consumer arrays. Lookup schema 2 adds provider/release
+without renaming semantic country/ASN evidence; malformed/old reports fail.
+Focused checks include `go test ./internal/policy ./internal/firewall ./internal/state ./internal/app ./internal/control ./internal/cli ./internal/lookup`
 and `CGO_ENABLED=1 go test -race ./internal/prefix ./internal/policy ./internal/state ./internal/app ./internal/control ./internal/lookup`.
 
 The native `make test-e2e` gate includes `TestE2EStatusCompiledSets` for
@@ -381,8 +382,146 @@ runners.
 Use the [verification matrix](#verification-matrix) for required behavior and
 the [service and packaging matrix](#service-and-packaging) for shared isolation
 requirements. Unit and source-integration tests use local HTTP servers and
-checked-in official RIPEstat responses with provenance metadata. Large synthetic
-workloads belong to the opt-in [scale measurements](#opt-in-scale-measurements).
+checked-in official RIPEstat responses with provenance metadata. DB-IP uses
+isolated synthetic whole-artifact fixtures with explicit range/encoding/provenance
+boundaries; live downloads are opt-in smoke evidence, never unit-test constants.
+Large synthetic workloads belong to the opt-in [scale measurements](#opt-in-scale-measurements).
+
+### DB-IP Lite real-data validation
+
+Local smoke on 2026-10-17 used Go 1.27.2, nftables 1.1.6, and iptables 1.8.11
+(legacy and nf_tables). The actual `source.Resolver.Resolve` downloaded the
+vendor's `2026-10` artifact over HTTPS in one country batch. Encoded size was
+4,491,785 bytes, decoded CSV 31,210,433 bytes; gzip SHA-256 was
+`097426b8ddae89157d444a59ac1847e873f7943c32d52becc4371c8b0273af80`,
+and the recorded complete decoded-artifact SHA-256 was
+`53864a68fbfef02c27c717d08d431a6d453e9e00e77d9e8da841d382267fca88`.
+These are observations of mutable vendor bytes, not CI constants or a signature.
+
+A throwaway driver (removed after use) replayed those exact bytes through the
+same resolver/parser for each capacity profile, then used the real application
+engine, durable store, and native backend in disposable mount/network/PID
+namespaces. Every profile had two identical ingress/egress blocklists with both
+families enabled, default global/local handling, and no CrowdSec. `EU` means the
+embedded `european-union` group. `RIR+US` means
+`include: {rirs: [RIPE], countries: [SK, CZ, US]}`. No source/native/durable
+limits were raised, data truncated, or CIDRs widened.
+
+Body read/parse includes gzip validation, all unselected CSV rows, range
+conversion, and normalization. Resolve/stage also includes immutable cache
+publication and compilation. RSS is the process's Linux `VmHWM` after that
+stage, not inherited `getrusage` high-water values. Timings are local smoke
+observations under concurrent verification load, not isolated benchmarks or SLOs.
+The following resolver samples used the nftables profiles:
+
+| Profile | IPv4 CIDRs | IPv6 CIDRs | Read/parse ms | Resolve/stage ms | Stage peak KiB | Source object bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SK/CZ | 3,960 | 3,182 | 287 | 302 | 24,928 | 135,639 |
+| US | 155,176 | 97,738 | 310 | 649 | 110,632 | 4,879,475 |
+| EU | 151,394 | 322,876 | 411 | 1,210 | 138,560 | 9,131,381 |
+| RIR+US | 394,988 | 524,560 | 477 | 2,033 | 281,140 | 17,641,837 |
+
+The actual applied lookup view retained semantic `country` evidence, provider
+`dbip-lite`, release `2026-10`, the matching normalized prefix, and the shared
+successful retrieval timestamp. Live address observations:
+
+| Address | Country | Matching source prefix |
+| --- | --- | --- |
+| `92.180.233.6` | SK | `92.180.192.0/18` |
+| `187.14.124.226` | CZ | `187.14.124.0/24` |
+| `187.13.17.209` | SK | `187.13.16.0/23` |
+| `2a01:c847:23:6500:e14:d9c3:ff0d:f2cc` | SK | `2a01:c840::/28` |
+
+This geographic classification is not proof of the person's or hardware's
+location and may change in later vendor artifacts.
+
+For admitted profiles, another process exited at the real `after-switch`
+checkpoint before durable publication. The namespace-init keeper then required
+two journal-referenced revisions and recovered with a fresh engine/backend.
+The journal was still `prepared`, while native selection had already changed:
+recovery restored the original durable authority and retired the interrupted
+candidate. The peak below is the larger individual `VmHWM` of keeper and crash
+process, not their sum and not a daemon-only memory claim.
+
+| Backend | Profile | Preflight ms | Apply ms | Recovery ms | Revision bytes | Peak process KiB | Retained generation |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| nftables | SK/CZ | 6 | 32 | 325 | 147,274 | 35,248 | after-switch crash recovered |
+| nftables | US | 18 | 918 | 6,178 | 4,891,625 | 447,660 | after-switch crash recovered |
+| nftables | EU | 23 | 1,750 | 14,000 | 9,129,853 | 724,624 | after-switch crash recovered |
+| iptables-legacy | SK/CZ | 12 | 96 | 422 | 147,527 | 33,840 | after-switch crash recovered |
+| iptables-legacy | US | 126 | 1,673 | 6,978 | 4,891,878 | 356,084 | after-switch crash recovered |
+| iptables-legacy | EU | 262 | 3,883 | 18,880 | 9,130,106 | 501,868 | inspection rejection; original recovered |
+| iptables-nft | SK/CZ | 14 | 98 | 467 | 147,527 | 33,664 | after-switch crash recovered |
+| iptables-nft | US | 144 | 2,359 | 7,193 | 4,891,878 | 365,880 | after-switch crash recovered |
+| iptables-nft | EU | 242 | 3,625 | 16,297 | 9,130,106 | 491,760 | inspection rejection; original recovered |
+
+Two journal-referenced revision files at the interruption:
+
+| Backend | SK/CZ bytes | US bytes | EU bytes |
+| --- | ---: | ---: | ---: |
+| nftables | 295,496 | 9,784,198 | 18,260,654 |
+| iptables (either frontend) | 296,002 | 9,784,704 | not admitted |
+
+EU first activation and single-generation
+recovery passed on iptables, but `iptables retained generations exceed inspection
+budget` rejected the additional generation before a journal/native mutation.
+EU is therefore not a fully supported iptables refresh/reload envelope.
+
+The larger RIR+US candidate was attempted while SK/CZ was already committed:
+
+| Backend | Candidate rejection | New revision bytes | Original authority after recovery |
+| --- | --- | ---: | --- |
+| nftables | input requires 41,539,034 bytes, limit 33,554,432 | 0 | SK/CZ retained |
+| iptables-legacy | encoded durable record exceeds 16 MiB | 0 | SK/CZ retained |
+| iptables-nft | encoded durable record exceeds 16 MiB | 0 | SK/CZ retained |
+
+All three preserved the exact active revision/manifest and matching applied
+lookup provenance after recovery. The iptables durable-preparation refusal
+temporarily required recovery under existing health rules; it did not publish
+the oversized candidate. These are bounded capacity outcomes, not truncated
+country successes or permission to raise unrelated budgets.
+
+The original pre-DB-IP fixture was also recovered through a real nft backend.
+Positive IPv4/IPv6 TCP controls worked before recovery, the recovered recorded
+allowlist denied the probes, and cleanup restored the controls. All five raw
+fixture files kept the SHA-256 values in
+`internal/state/testdata/pre-dbip-provenance.json`, and status reported RIPEstat,
+not the new YAML default.
+
+`TestE2EDBIPNative` separately passed real CLI validation/startup/reload/status/
+lookup, RIPEstat → DB-IP → RIPEstat, failed provider/mixed-source/compiler/native/
+durable-publication candidates, unavailable-upstream restart, and interrupted
+provider-switch recovery. Its actual TCP/UDP packets cover both families on
+nftables, iptables-legacy, and iptables-nft. These deterministic fixtures are
+synthetic and do not redistribute vendor database rows.
+
+Local package smoke passed DEB/RPM install/upgrade/removal on Debian 13 and
+Fedora 44 for amd64 and arm64, including installed README/data-source attribution.
+Both binary release archives carried the notice in README; the packaged YAML
+names `dbip-lite`. Snapshot source archives still represent Git HEAD, not the
+uncommitted tree; local dirty-tree artifacts are not hosted release qualification.
+
+Completed local command evidence:
+
+```sh
+env GOTOOLCHAIN=auto make verify
+env GOTOOLCHAIN=auto make test-race
+env GOTOOLCHAIN=auto make support-check
+env GOTOOLCHAIN=auto make test-e2e E2E_SUDO=sudo
+sudo env PERIMETERD_E2E=1 E2E_BINARY="$PWD/bin/perimeterd" \
+  bin/perimeterd-e2e -test.v -test.count=1 -test.run '^TestE2EDBIPNative$'
+env GOTOOLCHAIN=auto make package
+env PACKAGE_CONTAINER_RUNTIME=podman make test-package
+env PACKAGE_CONTAINER_RUNTIME=podman make test-package PACKAGE_ARCH=arm64
+```
+
+All listed commands passed; lint reported zero issues and support checks ran
+80 release tests. This evidence does not imply hosted CI, publication, a pinned
+older-kernel VM pass, or an older-binary downgrade after DB-IP commitment.
+
+The one-shot driver/downloads were removed. The permanent native scenario runs
+through `GOTOOLCHAIN=auto make test-e2e E2E_SUDO=sudo`; no live vendor download is
+part of ordinary tests.
 
 ### Real Docker coexistence gate
 
@@ -838,6 +977,12 @@ than one layer when the real boundary matters.
 
 | Contract | Concrete behavior or boundary | Verification layer |
 | --- | --- | --- |
+| DB-IP configuration/history | New YAML explicitly defaults to `dbip-lite`; strict enums reject invalid/null values. Authentic pre-change RIPE revisions/cache retain exact bytes, provider meaning, recovery, and failed-switch authority. | Config/state/cache behavioral tests with original serializer fixture provenance |
+| DB-IP artifact/parser | Direct monthly HTTPS, current-404-only previous month, UTC rollover/clock rollback, existing retry budget, accepted gzip envelopes/trailers, whole-file UTF-8/range/country validation, all fixed streaming limits, XK/ZZ exclusion, exact CIDR boundaries and explicit empty families. | Isolated source/prefix fixtures; actual vendor smoke separately |
+| DB-IP batch/provenance | Any due/missing/new country refreshes all required leaves from one artifact. ASN-only/disabled fetch none; coherent subset reuse, complete stale fallback, forged metadata rejection, schema-3-only metadata, and unchanged historical bytes hold through Stage/Load/publication. | Source/cache/state/app transaction tests |
+| DB-IP applied surfaces | Status schema 4, lookup schema 2, semantic country/ASN evidence, provider/release ordering/coalescing, committed source summaries, URL/parameter secrecy, bounded metrics and one request per logical country batch. | Strict control/lookup/CLI and committed-publication tests |
+| DB-IP native lifecycle | Provider reload both ways, failed switch, same-provider unavailable-upstream restart, country+ASN, exact inclusion/exclusion and both families, recovery/publication failures. | Disposable nftables, iptables-nft and iptables-legacy namespace smoke with controlled artifacts |
+| DB-IP real-data envelope | Current vendor artifact release/digest/size and four investigated addresses are observations. Measure SK/CZ, US, EU and multi-country/RIR parser/RSS, object/revision sizes, native preflight/apply and retained recovery; over-capacity rejection must be bounded and atomic. Never truncate or casually raise unrelated limits. | Opt-in actual resolver/native smoke; report exact local evidence, not hosted qualification |
 | RIPEstat country adapter | Checked-in bounded actual-response fixtures cover country success without an echo, validation of an echo when present, unexpected/mismatched identities, and failed status. | Unit with checked-in fixtures; PR and release CI |
 | RIPEstat ASN adapter | Checked-in bounded actual-response fixtures cover normalized ASN identity checks, unexpected/mismatched echoes, failed status, and prefix visibility at `query_endtime`. | Unit with checked-in fixtures; PR and release CI |
 | Text list parsing | IPv4/IPv6 hosts and CIDRs, host-bit masking, duplicate/contained prefixes, LF/CRLF, blank/comment lines, and final lines without newline normalize correctly; malformed tails, empty/comment-only bodies, and disabled-family errors reject the entire response. | Unit fixtures |

@@ -90,6 +90,7 @@ firewall:
         direction: egress
 
 geo:
+  country_provider: dbip-lite
   refresh_interval: 24h
   request_timeout: 30s
   refresh_jitter: 10m
@@ -111,11 +112,36 @@ crowdsec:
   update_frequency: 10s
 ```
 
-`geo` uses RIPEstat as the only version 1 provider and has no configurable
-provider field; [data sources](data-sources.md) owns its endpoints, snapshots,
-and compatibility contract. `crowdsec.lapi_url` is an independent absolute
-HTTP or HTTPS URL; HTTP is permitted for a local LAPI. CrowdSec requires the
-supported remote deployment described below.
+`geo.country_provider` selects `dbip-lite` (default) or `ripestat` for all expanded
+country selectors. ASNs always use RIPEstat announced-prefixes, independently of
+this choice. [Data sources](data-sources.md) owns the provider semantics, endpoints,
+monthly artifacts, and cache contracts. `crowdsec.lapi_url` is an independent
+absolute HTTP or HTTPS URL; HTTP is permitted for a local LAPI. CrowdSec requires
+the supported remote deployment described below.
+
+### Country-provider upgrades
+
+Omitted `geo`, `geo: {}`, and an omitted `country_provider` all mean `dbip-lite`
+when parsing YAML. Only the exact strings `dbip-lite` and `ripestat` are accepted;
+null, empty, differently cased, unknown, and non-string values are invalid.
+To keep allocation/registration country behavior with a new binary, add:
+
+```yaml
+geo:
+  country_provider: ripestat
+```
+
+An old YAML file parsed again now requests DB-IP unless it opts out. Historical
+durable configurations with no provider field retain RIPEstat meaning; recovery
+does not reparse YAML or rewrite immutable revision bytes. Recovered or
+previously committed RIPE enforcement can remain authoritative after a failed
+switch, but it is never labeled DB-IP or used as a DB-IP candidate. First
+activation needs complete matching DB-IP evidence; failure follows the existing
+startup/readiness/reload failure contract and preserves old enforcement.
+
+Selecting RIPEstat in the new binary is supported. Binary downgrade after a
+DB-IP commit is not: older readers do not understand DB-IP source metadata.
+Do not delete durable state to bypass this restriction.
 
 ## Canonical field and default table
 
@@ -142,6 +168,7 @@ and are always validated; only the selected backend is applied.
 | `attachments[].input_interfaces` | list | `[]` | Input matches |
 | `attachments[].output_interfaces` | list | `[]` | Output matches |
 | `attachments[].original_destination` | bool | `false` | Pre-DNAT ports |
+| `geo.country_provider` | text | `dbip-lite` | Exactly `dbip-lite` or `ripestat`; ASN resolution is independent |
 | `geo.refresh_interval` | duration | `24h` | Positive |
 | `geo.request_timeout` | duration | `30s` | Positive, per request attempt |
 | `geo.refresh_jitter` | duration | `10m` | Positive upper delay |
@@ -643,8 +670,9 @@ Threat, sanctions, and geopolitical-adversary sets are intentionally not
 built-ins because their membership depends on an operator's jurisdiction and
 risk model. Define them as custom groups with an explicit country list.
 
-RIR selectors use embedded service-region country memberships and resolve
-those countries through the same RIPEstat country endpoint. Their names are
+RIR selectors use embedded service-region country memberships and resolve their
+union through the selected country provider, just like direct countries and
+built-in/custom groups. They are not raw registry resource feeds. RIR names are
 case-insensitive on input and normalized uppercase.
 
 If an enabled policy resolves prefixes overall but a selected address family
@@ -1052,7 +1080,8 @@ credential usability, and runtime firewall prerequisites remain unverified.
 `run` acquires lifecycle ownership and recovers durable state before reading
 the current YAML, so invalid current YAML does not prevent recovery from being
 attempted. After loading the document, runtime staging resolves enabled
-selectors from the RIPEstat/cache path, compiles the policy against a complete
+selectors from the selected country provider, RIPEstat ASN, and other static-source
+cache paths, compiles the policy against a complete
 snapshot, requires every enabled policy to resolve to a non-empty prefix set
 overall, binds the metrics listener, verifies configured parent chains for a
 non-empty target, and stages then applies a backend reconcile. Reload repeats
@@ -1067,9 +1096,9 @@ diagnostics and [backend capacity](firewall-backends.md#capacity-and-complete-in
 for the finite internal nft limits. These changes add no configuration fields
 and require no durable-state migration.
 
-The runtime supports RIPEstat-backed country/ASN policy and CrowdSec ingress
-bans on both nftables and iptables/ipset. CrowdSec enablement additionally
-requires the operator-verified remote deployment prerequisite. A configuration with
+The runtime supports DB-IP Lite or explicit RIPEstat country policy, independent
+RIPEstat ASN policy, and CrowdSec ingress bans on both nftables and iptables/ipset.
+CrowdSec enablement additionally requires the operator-verified remote deployment prerequisite. A configuration with
 both `firewall.ipv4: false` and `firewall.ipv6: false` is locally valid when
 it requests no artifacts, but runtime compilation rejects it when enforcement
 is requested. See [architecture](architecture.md) for freshness, commit,

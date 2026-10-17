@@ -104,6 +104,28 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 		}
 	}
 
+	// One due/missing country invalidates the transaction's entire country
+	// batch. A fresh leaf must never retain a different artifact identity.
+	if cfg.Geo.EffectiveCountryProvider() == config.CountryProviderDBIPLite {
+		countryDue := false
+		for _, selector := range stale {
+			if selector.Kind == policy.Country {
+				countryDue = true
+			}
+		}
+		if countryDue {
+			stale = stale[:0]
+			for _, selector := range required {
+				if selector.Kind == policy.Country {
+					delete(candidate, selector)
+				}
+				if _, fresh := candidate[selector]; !fresh {
+					stale = append(stale, selector)
+				}
+			}
+		}
+	}
+
 	refreshFailure := func(refreshErr error) (Resolution, error) {
 		if err := ctx.Err(); err != nil {
 			return Resolution{}, err
@@ -153,6 +175,16 @@ func (r *Resolver) resolve(ctx context.Context, cfg config.Config, committedMani
 	fetched, fetchErr := r.fetchAll(ctx, cfg, stale)
 	if fetchErr != nil {
 		return refreshFailure(fetchErr)
+	}
+	for _, record := range fetched {
+		if record.SourceKind != dbipSourceKind {
+			continue
+		}
+		for _, old := range committedBySelector {
+			if old.SourceKind == dbipSourceKind && record.Release < old.Release {
+				return refreshFailure(errors.New("source: DB-IP release downgrade rejected"))
+			}
+		}
 	}
 	for selector, record := range fetched {
 		candidate[selector] = record
@@ -249,6 +281,12 @@ func validateSelectorTiming(selector policy.Selector, refreshInterval, requestTi
 func recordMatchesConfig(record Record, cfg config.Config) bool {
 	spec, err := DescribeSelector(cfg, record.Selector)
 	if err != nil {
+		return false
+	}
+	if record.Selector.Kind == policy.Country && spec.SourceKind == dbipSourceKind {
+		return validateDBIPRecord(record) == nil
+	}
+	if record.Release != "" {
 		return false
 	}
 	switch record.Selector.Kind {
@@ -403,11 +441,20 @@ type fetchResult struct {
 	selector policy.Selector
 	record   Record
 	err      error
+	records  map[policy.Selector]Record
 }
 
 func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []policy.Selector) (map[policy.Selector]Record, error) {
 	requestCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	countries := make([]policy.Selector, 0)
+	if cfg.Geo.EffectiveCountryProvider() == config.CountryProviderDBIPLite {
+		for _, selector := range selectors {
+			if selector.Kind == policy.Country {
+				countries = append(countries, selector)
+			}
+		}
+	}
 	jobs := make(chan policy.Selector)
 	results := make(chan fetchResult, len(selectors))
 	workers := len(selectors)
@@ -427,9 +474,16 @@ func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []
 					if !ok {
 						return
 					}
-					record, err := r.fetchOne(requestCtx, cfg, selector)
+					var record Record
+					var batch map[policy.Selector]Record
+					var err error
+					if selector.Kind == policy.Country && len(countries) > 0 {
+						batch, err = r.fetchDBIP(requestCtx, cfg, countries)
+					} else {
+						record, err = r.fetchOne(requestCtx, cfg, selector)
+					}
 					select {
-					case results <- fetchResult{selector: selector, record: record, err: err}:
+					case results <- fetchResult{selector: selector, record: record, records: batch, err: err}:
 					case <-requestCtx.Done():
 					}
 					if err != nil {
@@ -442,6 +496,9 @@ func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []
 	go func() {
 		defer close(jobs)
 		for _, selector := range selectors {
+			if selector.Kind == policy.Country && len(countries) > 0 && selector != countries[0] {
+				continue
+			}
 			select {
 			case jobs <- selector:
 			case <-requestCtx.Done():
@@ -463,7 +520,13 @@ func (r *Resolver) fetchAll(ctx context.Context, cfg config.Config, selectors []
 			continue
 		}
 		if result.err == nil {
-			fetched[result.selector] = result.record
+			if result.records != nil {
+				for selector, record := range result.records {
+					fetched[selector] = record
+				}
+			} else {
+				fetched[result.selector] = result.record
+			}
 		}
 	}
 	if firstErr != nil {

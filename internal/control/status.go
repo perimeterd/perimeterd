@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"time"
 )
 
 const statusMaxBytes = 4 << 20
@@ -132,8 +133,31 @@ func validateStatus(result StatusResult) error {
 	details := applied.Details
 	if (details.Firewall.Backend != "nftables" && details.Firewall.Backend != "iptables") ||
 		len(details.Firewall.Families) == 0 || (details.Firewall.DenyAction != "drop" && details.Firewall.DenyAction != "reject") ||
-		details.Policies == nil || details.PrefixCounts == nil {
+		details.Policies == nil || details.PrefixCounts == nil || details.Sources == nil {
 		return errors.New("incomplete applied policy summary")
+	}
+	for i, source := range details.Sources {
+		if source.RetrievedAt.IsZero() {
+			return errors.New("source summary omitted retrieval time")
+		}
+		switch source.Provider {
+		case "dbip-lite":
+			if release, err := time.Parse("2006-01", source.Release); err != nil || release.Format("2006-01") != source.Release {
+				return errors.New("invalid DB-IP source release")
+			}
+		case "ripestat", "ip_list", "provider":
+			if source.Release != "" {
+				return errors.New("unexpected source release")
+			}
+		default:
+			return errors.New("invalid source summary provider")
+		}
+		if i > 0 {
+			previous := details.Sources[i-1]
+			if previous.Provider > source.Provider || previous.Provider == source.Provider && previous.Release >= source.Release {
+				return errors.New("source summaries are not unique and sorted")
+			}
+		}
 	}
 	if err := validateStatusCompiledSets(details.Firewall.Families, details.CompiledSets); err != nil {
 		return err

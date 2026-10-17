@@ -581,7 +581,7 @@ func attachmentEqual(left, right Attachment) bool {
 }
 
 func evidenceEqual(left, right Evidence) bool {
-	if left.Kind != right.Kind || left.Name != right.Name || left.Policy != right.Policy || left.Role != right.Role || left.Prefix != right.Prefix || left.Contributing != right.Contributing || left.DecisionID != right.DecisionID || !left.RetrievedAt.Equal(right.RetrievedAt) || !left.DecisionDeadline.Equal(right.DecisionDeadline) || !left.LeaseDeadline.Equal(right.LeaseDeadline) || len(left.Via) != len(right.Via) {
+	if left.Kind != right.Kind || left.Name != right.Name || left.Provider != right.Provider || left.Release != right.Release || left.Policy != right.Policy || left.Role != right.Role || left.Prefix != right.Prefix || left.Contributing != right.Contributing || left.DecisionID != right.DecisionID || !left.RetrievedAt.Equal(right.RetrievedAt) || !left.DecisionDeadline.Equal(right.DecisionDeadline) || !left.LeaseDeadline.Equal(right.LeaseDeadline) || len(left.Via) != len(right.Via) {
 		return false
 	}
 	for index := range left.Via {

@@ -8,8 +8,8 @@ import (
 // StatusEndpoint is the read-only applied-state endpoint.
 const StatusEndpoint = "/v1/status"
 
-// StatusSchemaVersion requires explicit consumers for static compiled sets.
-const StatusSchemaVersion = 3
+// StatusSchemaVersion requires explicit consumers for committed source provenance.
+const StatusSchemaVersion = 4
 
 // StatusResult reports daemon-owned, last-acknowledged state, not a kernel audit.
 type StatusResult struct {
@@ -42,8 +42,16 @@ type StatusDetails struct {
 	Firewall     StatusFirewall      `json:"firewall"`
 	Policies     []StatusPolicy      `json:"policies"`
 	PrefixCounts []StatusPrefixCount `json:"prefix_counts"`
+	Sources      []StatusSource      `json:"sources"`
 	CompiledSets StatusCompiledSets  `json:"compiled_sets"`
 	CrowdSec     StatusCrowdSec      `json:"crowdsec"`
+}
+
+// StatusSource summarizes committed retrievals without exposing source endpoints.
+type StatusSource struct {
+	Provider    string    `json:"provider"`
+	Release     string    `json:"release,omitempty"`
+	RetrievedAt time.Time `json:"retrieved_at"`
 }
 
 // StatusFirewall identifies the selected backend and managed address families.

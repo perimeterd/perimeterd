@@ -105,6 +105,7 @@ firewall:
     table: %q
     priority: -10
 geo:
+  country_provider: ripestat
   refresh_interval: 1s
   request_timeout: 1s
   refresh_jitter: 1ns
