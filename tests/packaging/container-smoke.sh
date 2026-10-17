@@ -91,6 +91,36 @@ check_rpm_dependency_alternative() {
     rpm --query --quiet --whatprovides ipset || fail 'RPM dependency resolution omitted iptables/ipset pair'
 }
 
+check_completion() (
+    # Isolate Bash's completion globals from the rest of the package lifecycle.
+    # shellcheck source=/dev/null
+    source /usr/share/bash-completion/completions/perimeterd
+    COMP_WORDS=(perimeterd sta)
+    COMP_CWORD=1
+    _perimeterd
+    [[ ${COMPREPLY[*]} == status ]] || fail 'Bash completion did not offer the status command'
+
+    COMP_WORDS=(perimeterd status --j)
+    COMP_CWORD=2
+    _perimeterd
+    [[ ${COMPREPLY[*]} == --json ]] || fail 'Bash completion did not offer the status JSON flag'
+
+    COMP_WORDS=(perimeterd lookup 192.0.2.1 --direction e)
+    COMP_CWORD=4
+    _perimeterd
+    [[ ${COMPREPLY[*]} == egress ]] || fail 'Bash completion did not offer lookup direction values'
+
+    COMP_WORDS=(perimeterd lookup --protocol=t)
+    COMP_CWORD=2
+    _perimeterd
+    [[ ${COMPREPLY[*]} == --protocol=tcp ]] || fail 'Bash completion did not support an inline option value'
+
+    COMP_WORDS=(perimeterd lookup --port '')
+    COMP_CWORD=3
+    _perimeterd
+    [[ ${#COMPREPLY[@]} -eq 0 ]] || fail 'Bash completion offered flags instead of a required port value'
+)
+
 check_payload() {
     local expected_arch=$1
     check_mode /usr/bin/perimeterd 755
@@ -104,6 +134,8 @@ check_payload() {
     [[ ! -e /run/perimeterd/control.sock ]] || fail 'tmpfiles unexpectedly created the daemon-owned control socket'
     check_mode /usr/lib/systemd/system/perimeterd.service 644
     check_mode /usr/lib/tmpfiles.d/perimeterd.conf 644
+    check_mode /usr/share/bash-completion/completions/perimeterd 644
+    check_completion
     check_mode /usr/share/doc/perimeterd/README.md 644
     check_mode /usr/share/doc/perimeterd/copyright 644
     for document in architecture configuration data-sources firewall-backends operations; do
@@ -231,6 +263,7 @@ exec 9>&-
 "${remove_command[@]}"
 [[ ! -e /usr/bin/perimeterd ]] || fail 'successful removal retained the executable'
 [[ ! -e /usr/lib/systemd/system/perimeterd.service ]] || fail 'successful removal retained the service'
+[[ ! -e /usr/share/bash-completion/completions/perimeterd ]] || fail 'successful removal retained Bash completion'
 if [[ $PACKAGE_SMOKE_DISTRO == debian ]]; then
     dpkg --purge perimeterd
 fi

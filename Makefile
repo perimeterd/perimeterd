@@ -2,6 +2,7 @@ SHELL := /bin/sh
 
 MODULE := github.com/perimeterd/perimeterd
 BINARY := bin/perimeterd
+BASH_COMPLETION := bin/completions/perimeterd
 GO ?= go
 GOOS ?= linux
 GOARCH ?= $(shell $(GO) env GOHOSTARCH)
@@ -34,6 +35,7 @@ SYSTEMD_PACKAGE ?=
 
 .PHONY: fmt fmt-check lint test test-race vuln build build-e2e test-e2e test-crowdsec test-openziti test-docker verify bench-scale-small bench-scale-large bench-native-scale-small bench-native-scale-large
 .PHONY: release-tools support-tools support-check package package-fixtures test-package test-systemd test-release
+.PHONY: completions
 
 fmt:
 	@files="$$($(GO_SOURCES))" || exit $$?; \
@@ -66,9 +68,13 @@ test-race:
 vuln:
 	$(GOVULNCHECK) ./...
 
-build:
+build: completions
 	mkdir -p "$(dir $(BINARY))"
 	$(GO) build -trimpath -ldflags "$$LDFLAGS" -o "$(BINARY)" ./cmd/perimeterd
+
+completions:
+	mkdir -p "$(dir $(BASH_COMPLETION))"
+	GOOS="$$($(GO) env GOHOSTOS)" GOARCH="$$($(GO) env GOHOSTARCH)" $(GO) run ./scripts/generate-bash-completion.go -output "$(BASH_COMPLETION)"
 
 build-e2e: build
 	@for tool in nft ip ipset unshare nsenter iptables-nft ip6tables-nft iptables-legacy ip6tables-legacy; do \

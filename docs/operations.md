@@ -136,6 +136,17 @@ semantic validity, not runtime readiness. See
 complete validation/runtime boundary. Only `run` synchronizes and enforces
 source-backed or CrowdSec decisions.
 
+`make build` also writes Bash completion to `bin/completions/perimeterd`.
+For a source build, load it into the current Bash session:
+
+```bash
+source bin/completions/perimeterd
+```
+
+Completion offers commands, their options, configuration paths, and enumerated
+lookup values. It does not contact the daemon, read configuration or credentials,
+or access the network or firewall.
+
 The default persistent paths are `/var/lib/perimeterd` for revisions, journals,
 and immutable prefix snapshots, and `/run/perimeterd/owner.lock` for the
 lifecycle lock. Invoked as root, the runtime creates missing directories. Do
@@ -808,6 +819,9 @@ DEB/RPM packages install the following layout. A source build alone does not
 install these paths or create a service:
 
 - `/usr/bin/perimeterd`: root-owned static executable;
+- `/usr/share/bash-completion/completions/perimeterd`: root-owned, mode `0644`,
+  generated Bash completion; loaded on demand when the distribution's
+  `bash-completion` support is installed and enabled;
 - `/etc/perimeterd/perimeterd.yaml`: `root:root`, mode `0600`;
 - `/etc/perimeterd/credentials.d/`: `root:root`, mode `0700`, with files mode
   `0600`;
@@ -1099,8 +1113,8 @@ reach logs.
 The release builds one `perimeterd` package as RPM and DEB through GoReleaser
 v2's nFPM integration. Builds are
 static Linux binaries (`CGO_ENABLED=0`) for amd64 (`GOAMD64=v1`) and arm64.
-Each package contains the binary, systemd unit, packaged
-`/usr/lib/tmpfiles.d/perimeterd.conf` (or the distribution equivalent),
+Each package contains the binary, generated Bash completion, systemd unit,
+packaged `/usr/lib/tmpfiles.d/perimeterd.conf` (or the distribution equivalent),
 commented example configuration, MIT license, and this documentation. The
 example configuration is installed as `config|noreplace`; upgrades never
 replace an operator-edited file.

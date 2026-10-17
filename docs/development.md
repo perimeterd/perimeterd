@@ -185,6 +185,13 @@ inject that shared package's linker variables. CI supplies its revision and UTC
 build timestamp. CLI, metrics, and status retain the raw version; CrowdSec uses
 the same version in its sanitized `perimeterd/<version>` User-Agent.
 
+`make build` also generates `bin/completions/perimeterd` for Bash. The
+`completions` target reads the CLI's offline command help with a host-native Go
+generator, so cross-builds never execute the target binary. Commands, options,
+and enumerated option values come from that help rather than a second CLI
+definition. GoReleaser runs the same target before release builds and includes
+the result in both DEB and RPM packages.
+
 `perimeterd validate` is an offline local check. It does not fetch sources or
 touch the firewall. `make verify` runs `go mod verify`, `fmt-check`, `lint`,
 `vuln`, `build`, and `test`; supporting-file checks, race tests, privileged
@@ -518,7 +525,8 @@ The executable target inventory is:
 | `vuln` | Run pinned `govulncheck ./...` |
 | `test` | Run shuffled unit tests and write `coverage.out` |
 | `test-race` | Run all package tests with the race detector and shuffled order |
-| `build` | Build the current CLI with version metadata |
+| `build` | Build the current CLI with version metadata and generate Bash completion |
+| `completions` | Generate Bash completion from the CLI's offline command help |
 | `build-e2e` | Build the E2E binary and check native tool prerequisites |
 | `test-e2e` | Build and run the isolated Linux namespace/backend scenarios |
 | `test-crowdsec` | Run the digest-pinned real LAPI streaming compatibility scenarios |

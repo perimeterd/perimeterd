@@ -1,6 +1,10 @@
 version: 2
 project_name: perimeterd
 
+before:
+  hooks:
+    - make completions
+
 builds:
   - id: linux
     main: ./cmd/perimeterd
@@ -79,6 +83,12 @@ nfpms:
           group: root
       - src: packaging/perimeterd.tmpfiles.conf
         dst: /usr/lib/tmpfiles.d/perimeterd.conf
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
+      - src: bin/completions/perimeterd
+        dst: /usr/share/bash-completion/completions/perimeterd
         file_info:
           mode: 0644
           owner: root
