@@ -741,6 +741,10 @@ of the same change. Exercise dependency-sensitive runtime paths as well:
 live metrics scrapes for Prometheus changes and immutable cache publication
 and reload for `golang.org/x/sys` changes.
 
+Keep the CodeQL `init`, `autobuild`, and `analyze` steps pinned to the same
+release commit, with matching version comments. Validate workflow changes with
+the pinned `actionlint` and `shellcheck` tools.
+
 | Tool | Go module | Used by |
 | --- | --- | --- |
 | `gofumpt` | `mvdan.cc/gofumpt` | `fmt`, `fmt-check` |
