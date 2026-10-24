@@ -159,6 +159,7 @@ Go is older. The race target requires a native C compiler and enables CGO.
 export GOTOOLCHAIN=auto
 make fmt
 make verify
+make gohawk
 make support-check
 make test-race
 bin/perimeterd validate --config configs/perimeterd.yaml
@@ -173,6 +174,12 @@ the lint pass uses the `e2e,crowdsec` build tags. `make vuln` runs
 detector and shuffled order. The coverage artifact is diagnostic and has no
 vanity threshold: behavior coverage in the [verification
 matrix](#verification-matrix), not a percentage, is the release gate.
+
+`make gohawk` runs the pinned standalone analyzer's default core checks with
+the `e2e,crowdsec` build tags. Experimental checks are not enabled. Gohawk
+analyzes production code, not `_test.go` functions; it supplements rather than
+replaces race and lifecycle tests. Review diagnostics on tool upgrades instead
+of adding blanket suppressions.
 
 `make build` writes `bin/perimeterd` with `GOOS=linux`, the host `GOARCH`, and
 `CGO_ENABLED=0` by default. Override these variables when a different local
@@ -194,8 +201,8 @@ the result in both DEB and RPM packages.
 
 `perimeterd validate` is an offline local check. It does not fetch sources or
 touch the firewall. `make verify` runs `go mod verify`, `fmt-check`, `lint`,
-`vuln`, `build`, and `test`; supporting-file checks, race tests, privileged
-integration, package, and systemd gates run separately.
+`vuln`, `build`, and `test`; gohawk, supporting-file checks, race tests,
+privileged integration, package, and systemd gates run separately.
 
 ### Native namespace gate
 
@@ -505,6 +512,7 @@ Completed local command evidence:
 
 ```sh
 env GOTOOLCHAIN=auto make verify
+env GOTOOLCHAIN=auto make gohawk
 env GOTOOLCHAIN=auto make test-race
 env GOTOOLCHAIN=auto make support-check
 env GOTOOLCHAIN=auto make test-e2e E2E_SUDO=sudo
@@ -661,6 +669,7 @@ The executable target inventory is:
 | `fmt` | Rewrite Go sources selected with `e2e,crowdsec` build tags using pinned `gofumpt` followed by `goimports` |
 | `fmt-check` | Check pinned `gofumpt` and `goimports` formatting without modifying files |
 | `lint` | Run golangci-lint's pinned `gci` diff check, then lint with `e2e,crowdsec` build tags |
+| `gohawk` | Run pinned gohawk core checks with `e2e,crowdsec` build tags; production code only |
 | `vuln` | Run pinned `govulncheck ./...` |
 | `test` | Run shuffled unit tests and write `coverage.out` |
 | `test-race` | Run all package tests with the race detector and shuffled order |
@@ -751,6 +760,7 @@ the pinned `actionlint` and `shellcheck` tools.
 | `goimports` | `golang.org/x/tools` | `fmt`, `fmt-check` |
 | `golangci-lint` | `github.com/golangci/golangci-lint/v2` | `lint` |
 | `govulncheck` | `golang.org/x/vuln` | `vuln` |
+| `gohawk` | `github.com/kojah/gohawk` | `gohawk` |
 
 Formatting uses `gofumpt` followed by `goimports`; `.golangci.yml` separately
 enables the `gci` import-order formatter for its diff check. The pinned
@@ -1133,6 +1143,7 @@ reusable gate of the release workflow on main pushes and stable tags:
   and release regressions.
 - `verify (amd64)` runs `make verify`, then `make test-race`, and uploads
   `coverage.out`.
+- `gohawk (amd64)` runs `make gohawk` as a blocking core-analysis gate.
 - `build` runs `make build` for both `GOARCH=amd64` and `GOARCH=arm64`.
 - `privileged firewall E2E` installs the namespace prerequisites and runs
   `E2E_SUDO=sudo make test-e2e`, covering the nftables and both iptables tool

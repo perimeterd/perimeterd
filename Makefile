@@ -17,6 +17,7 @@ GOFUMPT := $(GO) tool gofumpt
 GOIMPORTS := $(GO) tool goimports -local $(MODULE)
 GOLANGCI := $(GO) tool golangci-lint
 GOVULNCHECK := $(GO) tool govulncheck
+GOHAWK := $(GO) tool gohawk
 LDFLAGS := -s -w -X '$(MODULE)/internal/buildinfo.Version=$(VERSION)' -X '$(MODULE)/internal/buildinfo.Commit=$(COMMIT)' -X '$(MODULE)/internal/buildinfo.BuildTime=$(BUILD_TIME)'
 GO_SOURCES := $(GO) list -tags=e2e,crowdsec -f '{{range .GoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .TestGoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .XTestGoFiles}}{{$$.Dir}}/{{.}} {{end}}' ./...
 E2E_TEST_BINARY := bin/perimeterd-e2e
@@ -36,6 +37,7 @@ SYSTEMD_PACKAGE ?=
 .PHONY: fmt fmt-check lint test test-race vuln build build-e2e test-e2e test-crowdsec test-openziti test-docker verify bench-scale-small bench-scale-large bench-native-scale-small bench-native-scale-large
 .PHONY: release-tools support-tools support-check package package-fixtures test-package test-systemd test-release
 .PHONY: completions
+.PHONY: gohawk
 
 fmt:
 	@files="$$($(GO_SOURCES))" || exit $$?; \
@@ -58,6 +60,9 @@ fmt-check:
 lint:
 	$(GOLANGCI) fmt --diff --config .golangci.yml .
 	$(GOLANGCI) run --build-tags=e2e,crowdsec --config .golangci.yml ./...
+
+gohawk:
+	$(GOHAWK) -tags=e2e,crowdsec ./...
 
 test:
 	$(GO) test -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
