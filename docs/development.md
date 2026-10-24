@@ -747,8 +747,9 @@ Update Go patch releases in the `go` directive; CI uses
 versions, regenerate checksums with `go mod tidy`, and run `make verify` and
 `make test-race` with the selected toolchain. Review transitive updates as part
 of the same change. Exercise dependency-sensitive runtime paths as well:
-live metrics scrapes for Prometheus changes and immutable cache publication
-and reload for `golang.org/x/sys` changes.
+live metrics scrapes for Prometheus changes, immutable cache publication
+and reload for `golang.org/x/sys` changes, and real identity loading and
+private list/LAPI transport (`make test-openziti`) for OpenZiti module changes.
 
 Keep the CodeQL `init`, `autobuild`, and `analyze` steps pinned to the same
 release commit, with matching version comments. Validate workflow changes with
