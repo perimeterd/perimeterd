@@ -751,6 +751,11 @@ live metrics scrapes for Prometheus changes, immutable cache publication
 and reload for `golang.org/x/sys` changes, and real identity loading and
 private list/LAPI transport (`make test-openziti`) for OpenZiti module changes.
 
+For analyzer pin updates, also run `make gohawk`. For YAML parser updates,
+smoke-test the built CLI with
+`bin/perimeterd validate --config configs/perimeterd.yaml`; this check stays offline
+and does not touch the firewall.
+
 Keep the CodeQL `init`, `autobuild`, and `analyze` steps pinned to the same
 release commit, with matching version comments. Validate workflow changes with
 the pinned `actionlint` and `shellcheck` tools.
