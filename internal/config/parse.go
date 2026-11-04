@@ -7,7 +7,7 @@ import (
 	"io"
 	"os"
 
-	"go.yaml.in/yaml/v3"
+	"go.yaml.in/yaml/v4"
 )
 
 // Parse strictly decodes one YAML document, applies documented defaults, and

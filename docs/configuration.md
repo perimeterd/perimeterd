@@ -26,6 +26,10 @@ user-defined names as mapping keys. Scalar types are checked without coercion,
 and `version` must be exactly `1`. Explicit nulls, aliases, and merge keys are
 rejected rather than silently defaulted or expanded.
 
+Configuration loading uses go-yaml v4's classic decoder API. The library major
+version does not change the version 1 schema or enable the excluded YAML
+features above.
+
 ## Contents
 
 - [Document and fragment forms](#document-and-fragment-forms)
