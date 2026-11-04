@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -76,7 +78,22 @@ func assertNativeProjectionCount(t *testing.T, target *firewall.Target, want int
 				} `json:"set"`
 			} `json:"nftables"`
 		}
-		if err := json.Unmarshal(command(t, 30*time.Second, "nft", "-j", "list", "table", "inet", target.Table), &response); err != nil {
+		// Bound diagnostic capture separately; the daemon's own finite native
+		// deadline is exercised by subsequent production lifecycle operations.
+		started := time.Now()
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		// #nosec G204 -- fixed nft executable; validated fixture table is one argv value, never shell input.
+		cmd := exec.CommandContext(ctx, "nft", "-j", "list", "table", "inet", target.Table)
+		output, err := cmd.Output()
+		if cmd.ProcessState != nil {
+			usage := cmd.ProcessState.SysUsage().(*syscall.Rusage)
+			t.Logf("complete nft inspection wall=%s bytes=%d child-user=%s child-system=%s child-maxrss-kib=%d", time.Since(started), len(output), cmd.ProcessState.UserTime(), cmd.ProcessState.SystemTime(), usage.Maxrss)
+		}
+		if err != nil {
+			t.Fatalf("complete nft inspection failed after %s: %v", time.Since(started), err)
+		}
+		if err := json.Unmarshal(output, &response); err != nil {
 			t.Fatal(err)
 		}
 		for _, row := range response.NFTables {
@@ -152,8 +169,8 @@ func TestE2ECrowdSecNativeScale(t *testing.T) {
 		probeIngress(t, peer, network, address, "reject", "tcp")
 		assertNativeProjectionCount(t, target, len(values))
 		if ipv6 {
-			// Disjoint replacement needs more than one bounded ipset restore:
-			// removal and addition text together exceed the 16 MiB call limit.
+			// Replace disjoint memberships through the bounded restore path;
+			// private boundary tests separately force whole-command chunking.
 			for index := range len(values) - 1 {
 				address := values[index].Prefix.Addr().As16()
 				binary.BigEndian.PutUint32(address[12:], 0x10000000+uint32(index)*4)
@@ -216,14 +233,14 @@ func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, scenario := range []string{"supported", "over-budget"} {
 			t.Run(scenario, func(t *testing.T) {
-				t.Logf("%s", runIsolated(t, "TestE2ECrowdSecNFTInventoryCapacity", scenario))
+				t.Logf("%s", runIsolatedFor(t, "TestE2ECrowdSecNFTInventoryCapacity", scenario, 45*time.Minute))
 			})
 		}
 		return
 	}
 	requireIsolatedChild(t)
 	prepareMounts(t)
-	peer := newPeerNamespace(t)
+	peer := newPeerNamespaceFor(t, 46*time.Minute)
 	makePrefix := func(index uint32, dynamic bool) netip.Prefix {
 		address := [16]byte{0x20, 0x01, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd}
 		if dynamic {
@@ -232,7 +249,7 @@ func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
 		binary.BigEndian.PutUint32(address[12:], 0xa0000000+index*4)
 		return netip.PrefixFrom(netip.AddrFrom16(address), 127)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	for _, tc := range []struct {
 		name         string
@@ -241,7 +258,7 @@ func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
 		reject       bool
 	}{
 		{name: "supported", staticCount: 340000, dynamicCount: 319000},
-		{name: "over-budget", staticCount: 460000, dynamicCount: 319000, reject: true},
+		{name: "over-budget", staticCount: 700000, dynamicCount: 638000, reject: true},
 	} {
 		if tc.name != os.Getenv(e2eScenario) {
 			continue
@@ -285,14 +302,29 @@ func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.reject {
-				err := backend.UpdateDynamic(ctx, target, values)
+				// Each static generation and the projection fit independently;
+				// the transition's union must still reject their combined peak.
+				candidate := *target
+				candidate.Generation = "cccccccccccccccccccccccccccccccc"
+				if err := backend.Preflight(ctx, target, &candidate, nil); err != nil {
+					t.Fatalf("static-only transition does not fit: %v", err)
+				}
+				values[0] = retained[0]
+				if err := backend.UpdateDynamic(ctx, target, values); err != nil {
+					t.Fatalf("single-generation static and dynamic contents do not fit: %v", err)
+				}
+				assertNativeProjectionCount(t, target, len(values))
+				// Observe the already-live timed contents, rather than charging
+				// an unrelated combined static+dynamic installation batch.
+				err := backend.Preflight(ctx, target, &candidate, nil)
 				var capacity *firewall.CapacityError
-				if !errors.As(err, &capacity) || capacity.Scope != "inventory" || capacity.RequiredBytes <= capacity.LimitBytes {
+				if !errors.As(err, &capacity) || capacity.Backend != "nftables" || capacity.Resource != "nft-table" || capacity.Scope != "inventory" ||
+					capacity.RequiredBytes <= capacity.LimitBytes || capacity.StaticGenerations != 2 || capacity.DynamicGenerations != 1 {
 					t.Fatalf("combined inventory must exceed its budget, not an input or native-operation limit: %v", err)
 				}
 				t.Logf("combined inventory rejected: required=%d limit=%d", capacity.RequiredBytes, capacity.LimitBytes)
-				// Rejection preserves the IPv4 set this replacement would flush.
-				assertNativeProjectionCount(t, target, len(retained))
+				// Rejection preserves the full old authority, including IPv4.
+				assertNativeProjectionCount(t, target, len(values))
 			} else {
 				values[0] = retained[0]
 				if err := backend.UpdateDynamic(ctx, target, values); err != nil {
@@ -436,7 +468,7 @@ func TestE2ECrowdSecIPSetInterruptedWrites(t *testing.T) {
 func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, kind := range []string{"legacy", "nft"} {
-			t.Run(kind, func(t *testing.T) { runIsolated(t, "TestE2ECrowdSecIPSetProjectionCapacity", kind) })
+			t.Run(kind, func(t *testing.T) { t.Logf("%s", runIsolated(t, "TestE2ECrowdSecIPSetProjectionCapacity", kind)) })
 		}
 		return
 	}
@@ -445,18 +477,20 @@ func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 	peer := newPeerNamespace(t)
 	installIPTablesTools(t, os.Getenv(e2eScenario))
 	backend := firewall.NewNative(nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	// Two overlapping source decisions yield five disjoint native prefixes.
-	// This valid snapshot exceeds one restore invocation, but not inspection.
+	// The million-prefix snapshot requires multiple individually bounded restore
+	// chunks. Its live maxelem rounds up to 1,048,576.
+	const sourcePairs = 200000
 	now := time.Now()
-	decisions := make([]crowdsec.Decision, 100000)
-	for index := range 50000 {
+	decisions := make([]crowdsec.Decision, 2*sourcePairs)
+	for index := range sourcePairs {
 		address := [16]byte{0x20, 0x01, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd}
 		binary.BigEndian.PutUint32(address[12:], 0xa0000000+uint32(index)*32)
 		parent := netip.PrefixFrom(netip.AddrFrom16(address), 124)
-		if index == 49999 {
+		if index == sourcePairs-1 {
 			parent = netip.MustParsePrefix(fixtureIPv6Peer + "/124").Masked()
 		}
 		decisions[2*index] = crowdsec.Decision{ID: int64(2*index + 1), Prefix: parent, Deadline: now.Add(25 * time.Hour)}
@@ -467,10 +501,23 @@ func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	values := store.Projection(now)
-	if len(values) != 250000 {
+	if len(values) != 5*sourcePairs {
 		t.Fatalf("unexpected source projection: %d prefixes", len(values))
 	}
 	target := nativeScaleTarget(t, "iptables", nil)
+	// Sparse /127s cannot coalesce. Two million entries fit the 256 MiB
+	// inventory budget alone, but force a resize of the million-entry live set.
+	desired := make([]policy.TimedPrefix, 2000000)
+	for index := range desired {
+		address := [16]byte{0x20, 0x02, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd}
+		binary.BigEndian.PutUint32(address[12:], 0xa0000000+uint32(index)*4)
+		desired[index] = policy.TimedPrefix{Prefix: netip.PrefixFrom(netip.AddrFrom16(address), 127), Deadline: now.Add(25 * time.Hour)}
+	}
+	// No sets exist yet: admission here proves rejection later is genuinely
+	// about coexistence, without installing or otherwise mutating desired state.
+	if err := backend.Preflight(ctx, nil, target, &firewall.DynamicState{Prefixes: desired}); err != nil {
+		t.Fatalf("standalone resize projection does not fit: %v", err)
+	}
 	projection := &firewall.DynamicState{Prefixes: values}
 	if err := backend.Preflight(ctx, nil, target, projection); err != nil {
 		t.Fatalf("admit chunked initial snapshot: %v", err)
@@ -495,11 +542,12 @@ func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 		t.Fatalf("admit unchanged authority: %v", err)
 	}
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18796", "reject", "tcp")
-	if err := store.Apply(crowdsec.Batch{Deleted: []int64{99999}}, 2, time.Now()); err != nil {
+	parentID := int64(2*sourcePairs - 1)
+	if err := store.Apply(crowdsec.Batch{Deleted: []int64{parentID}}, 2, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	values = store.Projection(time.Now())
-	if len(values) != 249996 {
+	if len(values) != 5*sourcePairs-4 {
 		t.Fatalf("unexpected projection after deletion: %d prefixes", len(values))
 	}
 	if err := backend.UpdateDynamic(ctx, target, values); err != nil {
@@ -508,18 +556,71 @@ func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 	assertNativeProjectionCount(t, target, len(values))
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18797", "success", "tcp")
 
-	// A resize must still reserve both the current live set and the populated
-	// spare. The desired set fits alone, but their combined peak does not.
-	oversized := make([]policy.TimedPrefix, 350000)
-	for index := range oversized {
-		address := [16]byte{0x20, 0x02, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd, 0xab, 0xcd}
-		binary.BigEndian.PutUint32(address[12:], 0xa0000000+uint32(index)*4)
-		oversized[index] = policy.TimedPrefix{Prefix: netip.PrefixFrom(netip.AddrFrom16(address), 127), Deadline: now.Add(25 * time.Hour)}
+	// Renew the removed parent with newer source authority. This must restore
+	// its four non-overlapped native pieces and the original packet denial.
+	renewed := decisions[len(decisions)-2]
+	renewed.Deadline = now.Add(26 * time.Hour)
+	if err := store.Apply(crowdsec.Batch{New: []crowdsec.Decision{renewed}}, 3, time.Now()); err != nil {
+		t.Fatal(err)
 	}
-	if err := backend.UpdateDynamic(ctx, target, oversized); err == nil {
-		t.Fatal("resize exceeded combined live/spare inspection capacity")
+	values = store.Projection(time.Now())
+	if len(values) != 5*sourcePairs {
+		t.Fatalf("unexpected renewed source projection: %d prefixes", len(values))
 	}
+	if err := backend.UpdateDynamic(ctx, target, values); err != nil {
+		t.Fatalf("renew original source authority: %v", err)
+	}
+	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18798", "reject", "tcp")
+
+	// A resize reserves the actual current live contents alongside the populated
+	// spare. Standalone admission above rules out an oversized desired set.
+	err := backend.UpdateDynamic(ctx, target, desired)
+	var capacity *firewall.CapacityError
+	if !errors.As(err, &capacity) || capacity.Backend != "iptables" || capacity.Resource != "ipsets" ||
+		capacity.Scope != "inventory" || capacity.RequiredBytes <= capacity.LimitBytes || capacity.LimitBytes != 256<<20 {
+		t.Fatalf("resize lost numeric live/spare inventory rejection: %+v (%v)", capacity, err)
+	}
+	// Classification must also survive higher-level wrapping and joining.
+	var wrapped *firewall.CapacityError
+	if !errors.As(fmt.Errorf("update authority: %w", errors.Join(errors.New("context"), err)), &wrapped) || wrapped != capacity {
+		t.Fatal("wrapped resize rejection lost its typed capacity cause")
+	}
+	t.Logf("resize coexistence rejected: live=%d desired=%d required=%d limit=%d", len(values), len(desired), capacity.RequiredBytes, capacity.LimitBytes)
 	assertNativeProjectionCount(t, target, len(values))
+	// Compare every native member, not just its count, after rejected replacement.
+	remaining := make(map[netip.Prefix]bool, len(values))
+	for _, value := range values {
+		remaining[value.Prefix] = true
+	}
+	timedNames := make(map[string]bool)
+	for line := range strings.SplitSeq(string(command(t, 2*time.Minute, "ipset", "save")), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		if fields[0] == "create" && strings.Contains(line, " timeout ") {
+			timedNames[fields[1]] = true
+			continue
+		}
+		if fields[0] != "add" || !timedNames[fields[1]] {
+			continue
+		}
+		member, err := netip.ParsePrefix(fields[2])
+		if err != nil {
+			if address, addressErr := netip.ParseAddr(fields[2]); addressErr == nil {
+				member, err = netip.PrefixFrom(address, address.BitLen()), nil
+			}
+		}
+		if err != nil || !remaining[member] {
+			t.Fatalf("rejected resize changed native membership: %q (%v)", fields[2], err)
+		}
+		delete(remaining, member)
+	}
+	if len(remaining) != 0 {
+		t.Fatalf("rejected resize removed %d live prefixes", len(remaining))
+	}
+	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18799", "reject", "tcp")
+	probeIngress(t, peer, "tcp4", fixtureIPv4Host+":18800", "success", "tcp")
 	if err := backend.UpdateDynamic(ctx, target, nil); err != nil {
 		t.Fatalf("clear authority after capacity rejection: %v", err)
 	}

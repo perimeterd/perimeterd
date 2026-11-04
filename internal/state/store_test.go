@@ -659,6 +659,43 @@ func TestStoreRejectsOversizedOrCorruptRevisionWithoutChangingPermissions(t *tes
 	}
 }
 
+func TestStoreReopensLargeRevision(t *testing.T) {
+	store, dir := openTestStore(t, nil)
+	revision := storeTestRevision(t, store, strings.Repeat("1", 32))
+	// Unused configuration is still durable authority. This revision exceeds
+	// the former ceiling without requiring a large compiler/native fixture.
+	group := strings.Repeat("large", (17<<20)/5)
+	revision.Config.Groups = map[string][]string{group: {"DE"}}
+	expected, err := json.Marshal(revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Prepare(nil, revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := reopened.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := json.Marshal(view.Active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Journal != nil || !bytes.Equal(actual, expected) {
+		t.Fatal("large revision did not survive durable reopen intact")
+	}
+}
+
 func TestOversizedCandidatePreservesRecoverableActiveRevision(t *testing.T) {
 	store, dir := openTestStore(t, nil)
 	previous := persistStoreRevision(t, store, strings.Repeat("1", 32))

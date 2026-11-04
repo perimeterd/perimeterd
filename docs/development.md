@@ -316,11 +316,12 @@ in separate disposable namespaces. The supported 340,000-static /
 319,000-dynamic prefix combination must be admitted, completely inspected,
 and recovered by a fresh backend with nil dynamic activation. Packet probes
 verify static IPv6 and dynamic IPv4 enforcement after recovery. The
-460,000-static / 319,000-dynamic fixture first proves that each payload fits
-independently, then requires a combined-inventory `CapacityError` whose scope
-is `inventory` and required bytes exceed its limit. Rejection must preserve
-prior enforcement and permit a later admissible replacement, renewal,
-dynamic removal, and owned cleanup. These are native capacity/recovery
+700,000-static-per-generation / 638,000-dynamic fixture first proves that the
+static-only two-generation transition and the dynamic payload fit independently,
+then requires a combined-inventory `CapacityError` whose scope is `inventory`
+and required bytes exceed its limit. Rejection must preserve prior enforcement
+and permit a later admissible replacement, renewal, dynamic removal, and owned
+cleanup. These are native capacity/recovery
 boundaries, not assumptions about an obsolete output ceiling.
 
 Internal durable records use version 2 while the configuration schema remains
@@ -386,6 +387,579 @@ claiming that membership savings imply proportional RSS savings. Native
 verification on nftables 1.1.6 does not qualify untested versions or hosted
 runners.
 
+#### Shared DB-IP-era capacity gate
+
+`TestE2EDBIPCapacity` extends the existing isolated daemon harness to nftables,
+iptables-legacy, and iptables-nft. The historical production nft workload above
+is retained separately. The new offline source profile requires these unique
+post-normalization memberships:
+
+| Static set | IPv4 | IPv6 |
+| --- | ---: | ---: |
+| Shared Euro-Atlantic ingress/egress | 400,098 | 482,656 |
+| Distinct CZ/SK SSH | 3,977 | 5,749 |
+| Global/eligibility | 123 | 56 |
+
+Total static storage is 892,659 memberships. The local LAPI supplies 150,000
+unexpired, sparse, effective IP/range projections across both families, not
+just raw decision rows. Growth to 300,000 exercises ipset resizing beyond
+initial capacity. The SSH policy uses TCP-only `22`; UDP is not implicitly
+restricted by that shorthand.
+
+The iptables incident variant explicitly attaches INPUT and interface-scoped
+DOCKER-USER ingress only. A separate variant adds OUTPUT before testing egress;
+compiling an egress policy alone is not enforcement evidence. nftables retains
+its intrinsic ingress/egress hooks. The gate requires TCP/UDP and both-family
+packet behavior, real changed-country refresh, in-place ban replacement/
+deletion/renewal, resize-spare retirement, clean restart, prepared/partially
+switched recovery, genuine over-budget rejection, later admissible work, and
+foreign-object preservation.
+
+Replacement/deletion/renewal compares every native timed member with the new
+projection, including finite expiry within measured update and native read
+windows plus whole-second rounding. Update/read windows are bounded at
+10m/3m, both below the one-hour renewal. Source leases start at 12h and renew
+to 13h, below
+the 24h native grant cap; unchanged capped grants cannot prove renewal.
+Focused regressions reject the same-count/no-replacement counterexample and,
+separately, correct membership with stale leases.
+
+The over-budget stage sends a staged daemon reload a real startup LAPI
+snapshot, not a direct backend call. Its 131,072 source decisions split 65,536
+IPv6 /64 parents around longer-lived /128 exceptions into 4,259,840 timed
+pieces. The source response and durable envelope must fit their own fences.
+The gate requires the reload's numeric native-capacity diagnostic, unchanged
+active revision/target/configuration epoch, a completed journal, exact retained
+native membership/expiry, and packet enforcement. Resuming the old LAPI client
+can allocate a fresh client epoch without selecting the rejected contents;
+the acknowledged epoch/operation pair must not regress.
+A subsequent admissible source/configuration reload changes both sparse
+membership and deadlines and must acknowledge a new authority with exact
+native contents. Separate native-capacity cases retain direct preflight tests.
+
+Unchanged direct-LAPI reload retains nft identities. iptables deliberately
+replaces both generations for fresh authority; the capacity change preserves
+that contract rather than adding non-atomic authority sharing. Same-identity
+recovery and ordinary source refresh with retained dynamic identity remain
+required on every backend.
+
+Large-profile reloads use the existing asynchronous `SIGHUP` path and require
+a newer acknowledged configuration epoch/revision plus completed journal,
+then inspect the kernel and probe packets. This does not assert that these
+large reloads finish inside the unchanged 75-second CLI / 80-second server /
+90-second service-manager deadlines. The separate acknowledged-reload tests
+continue to exercise that public contract.
+
+One complete sparse nft inventory was 60,880,072 bytes and took 34.38 seconds
+(2.46 seconds user CPU, 31.60 seconds system CPU). Stopping the daemon to remove
+update contention did not make the old production preflight succeed: its child
+deadline expired after 30.10 seconds. The approved nft native-call deadline is
+therefore 120 seconds; iptables/ipset remains 30 seconds. These measurements
+qualified the operation responsible, rather than treating a timeout as a
+capacity rejection or silently changing retries.
+
+The scale scenario has a two-hour namespace deadline and a peer lifetime one
+minute longer. These are test-harness lifetimes, not production startup/retry policy.
+The peer must not expire at the original small-fixture 900-second lifetime
+while recovery and packet checks are still running.
+
+Run through `make build-e2e`, then the existing isolated runner:
+
+```sh
+sudo env PERIMETERD_E2E=1 E2E_BINARY="$PWD/bin/perimeterd" \
+  bin/perimeterd-e2e -test.v -test.count=1 -test.run '^TestE2EDBIPCapacity$'
+```
+
+The opt-in `PERIMETERD_CAPACITY_DBIP_FILE` and
+`PERIMETERD_CAPACITY_DBIP_REFRESH_FILE` environment variables select downloaded
+and controlled-refresh local artifacts. The same production DB-IP parser runs
+through the injected HTTP transport; permanent tests never download live data.
+Synthetic packet-address expectations are omitted only in this live-source
+mode, not in the deterministic packet gate.
+
+The durable-record ceiling is 32 MiB with no schema migration. A real November
+2026 incident-shaped revision payload measured 17,207,875 bytes: it failed
+`Store.Prepare` under the former 16 MiB bound and succeeded after the increase.
+The controlled source refresh relabeled one US `/24` range as JP and measured
+17,207,859 payload bytes. These are payload sizes, not native inventory or RSS.
+Both records retain the same version-2 format.
+
+The initial 64/192/256 MiB firewall proposal was not sufficient for the full
+growth-transition profile: the existing nft estimator required 211,401,178
+inventory bytes for two distinct static generations and 300,000 projected
+memberships, above 201,326,592. The accepted coordinated limits are therefore
+64/256/384 MiB (input/inventory/output). Neither the workload nor the mutation
+input ceiling was relaxed.
+
+An offline probe of the production estimators produced the following byte
+counts. nft input is the candidate batch estimate; nft inventory is the
+identity union with projected dynamic representation headroom. ipset inventory
+assumes empty observed inventory, includes shared projected contents once, and
+does **not** measure a populated resize spare or live observed formatting.
+These are estimates, not native output or memory measurements:
+
+| Static generations | Dynamic generations | Bans per dynamic identity | nft input bytes | nft inventory bytes | ipset inventory bytes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 150,000 | 52,673,818 | 105,434,676 | 60,361,172 |
+| 2 | 1 | 150,000 | 52,873,913 | 191,612,050 | 110,565,343 |
+| 1 | 1 | 300,000 | 62,568,382 | 125,223,804 | 70,818,236 |
+| 2 | 1 | 300,000 | 62,768,477 | 211,401,178 | 121,022,407 |
+| 2 | 2 | 300,000 | 62,568,382 | 250,384,200 | 141,636,472 |
+
+The final row measures identical memberships under distinct static and dynamic
+identities, with a full projected population on each; the earlier two-static
+rows use changed-country data. This is projected representation headroom, not
+an exact live-recovery estimate. Native observation can change the charge.
+
+The same production iptables admission calculator estimated per-family
+restore input as follows. These rule batches exclude separately chunked
+`ipset restore` membership commands; the shared 64 MiB fence applies to each
+native invocation:
+
+| Attachment shape | Deny action | IPv4 restore estimate bytes | IPv6 restore estimate bytes |
+| --- | --- | ---: | ---: |
+| Incident ingress only | DROP | 14,213 | 14,213 |
+| Incident ingress only | REJECT | 16,175 | 16,171 |
+| Explicit bidirectional | DROP | 17,835 | 17,835 |
+| Explicit bidirectional | REJECT | 20,239 | 20,234 |
+
+The opt-in download used release `2026-11`: 4,623,153 encoded bytes,
+32,485,911 decoded CSV bytes, 732,796 rows. Encoded SHA-256 was
+`e5c8459d638a272ece7f4d7cfa49dce18d91b4f403f6940ba9249bf0db3781fd`;
+the production resolver recorded decoded-artifact SHA-256
+`5e968a64a29b973f794c5abc46d0711a0ba87c8a16c411e1cd70312db7a5d4e1`.
+The controlled refresh's decoded SHA-256 was
+`84b4527eb03c5f9fa58c5405a64072b2ae84539962f65885511f6f1633d67116`.
+It removed one Euro-Atlantic IPv4 membership (400,098 to 400,097), leaving
+892,658 total static memberships. These observations are mutable-vendor
+smoke evidence, not permanent expected values or authenticity signatures.
+
+Boundary regressions also ran natively on Go 1.27.3, nftables 1.1.6,
+ipset 7.24, iptables 1.8.11 (legacy and nf_tables), and kernel
+`7.2.11-200.fc44.x86_64`. These are separate from the DB-IP daemon matrix.
+Representative complete nft inspection samples:
+
+| Boundary fixture | Complete output bytes | Wall seconds | Child user seconds | Child system seconds | Child rusage max RSS KiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Supported: 340k static inputs / 319k bans | 68,264,661 | 24.843 | 1.894 | 22.609 | 1,067,200 |
+| Standalone: 638k bans | 84,191,406 | 46.664 | 2.185 | 44.089 | 1,382,540 |
+| Live: 700k static inputs / 638k bans | 138,047,889 | 97.287 | 4.201 | 91.835 | 2,151,800 |
+
+Input-profile labels above exclude unrelated compiler defaults; output includes
+the complete table. Child `rusage` peak can include inherited pre-exec fixture
+RSS and is not an isolated native-child heap measurement. It must not be added
+to daemon `VmHWM` or treated as kernel-memory usage.
+
+Independent source/durable fences and combined native rejection samples:
+
+| Boundary | Resource / scope | Bytes | Limit bytes | Outcome |
+| --- | --- | ---: | ---: | --- |
+| Enlarged country response | Source JSON, not native I/O | 32,153,300 | 33,554,432 | Fits size fence |
+| Encoded candidate envelope | State record, not native I/O | 32,159,394 | 33,554,432 | Fits size fence; not published |
+| Second static generation with live 638k bans | nft-table / inventory | 285,738,708 | 268,435,456 | Rejected |
+| Changed country plus renewable projected authority | nft-table / input | 71,354,210 | 67,108,864 | Rejected |
+| Populated ipset resize spare, both iptables variants | ipsets / inventory | 280,203,408 | 268,435,456 | Rejected |
+
+The inventory regression admitted the static-only transition and the dynamic
+contents independently, rejected their union before mutation, retained previous
+packet enforcement, then admitted replacement/removal and owned cleanup.
+Both iptables variants also passed the 1,000,000-live / 2,000,000-desired resize
+regression: desired contents fit alone, while old live contents plus populated
+spare were rejected without losing any live member.
+
+The source-refresh fixture ruled out an independent source/durable rejection,
+retained the acknowledged target and bans on native input rejection, and
+renewed the exact prior projection after stopping the writer.
+
+##### Native lifecycle measurements (2026-11-02)
+
+These measurements predate the scale-gate assertion corrections. At that time,
+delete/replace/renew checked only counts and two peer removals; those rows do
+not prove exact replacement membership or renewed leases. The over-budget rows
+used direct backend `Preflight`, not a candidate submitted to the daemon, so
+they prove backend rejection only, not daemon rejection/recovery handling.
+
+The complete `make test-e2e E2E_SUDO='sudo -n'` gate passed, including the
+historical production nft workload. The older large-snapshot resync test also
+passed five additional repetitions after replacing its packet-before-status
+race with the existing bounded acknowledgement wait. Docker, OpenZiti, and the
+opt-in native-measurement scenario were not enabled; no requested capacity
+backend was skipped. Tool/kernel versions are the same as the boundary run
+above. All mutations used disposable namespaces, never the host firewall.
+
+Each committed target below contains 892,659 unique normalized static
+memberships with the per-family/set distribution above. Recorded S/D counts
+are distinct durable static/dynamic identities, not the number of target
+arguments. At a prepared interruption, the candidate's objects need not yet
+exist in the kernel. At the distinct switched interruption, nft inspection
+observed 600,000 timed elements across two containers, representing two copies
+of the 300,000-member authority rather than 600,000 distinct effective bans.
+
+nft inventory bytes cover the complete owned table. iptables inventory cells
+are **ipset save / IPv4 rules / IPv6 rules**, three separate scopes, including
+the deliberately foreign ipset/rules. They must not be summed into one
+admission budget. Native interval formatting can differ from normalized CIDR
+membership counts. These observed bytes are not the estimator values above.
+
+Wall times include status waits, packet probes and diagnostic reads. Recovered
+rows are cumulative from the corresponding interruption's start; do not sum
+those rows with the interrupted rows. Country refresh includes installing the
+alternate source, the ordinary changed-membership return with retained dynamic
+identity, and restoring normal refresh cadence. The asynchronous reload helper
+requires a coherent pre-signal epoch, then a newer acknowledged epoch/revision
+and completed journal; an unavailable pre-signal view is not epoch zero.
+
+Daemon peaks are process-lifetime `VmHWM`: cumulative until stop, fresh after
+restart/recovery. A dash means the interrupted process had exited before the
+sample. Child CPU covers the diagnostic inspection command only (summed over
+the three iptables inspection children); child RSS is their maximum, not sum.
+Linux child `rusage` may inherit the fixture parent's pre-exec RSS peak. These
+are not isolated child heaps or kernel-memory measurements.
+
+**Deterministic offline lifecycle**
+
+All admitted stages passed. Both-family TCP/UDP probes verified allowlists,
+TCP-only SSH and CrowdSec ingress precedence; egress probes ran only after the
+explicit OUTPUT attachment on iptables. Every recovered/healthy checkpoint
+verified projection counts, removal of obsolete owned sets/spares, and
+foreign-object preservation. nft same-ID switched interruption uses the
+durable `switched` phase after recovery's native apply; distinct nft switching
+and iptables IPv4 partial switching occur before the journal phase advances.
+
+**nftables**
+
+| Stage | Bans / identity | Recorded S/D | Complete inventory bytes | Journal sample |
+| --- | ---: | --- | --- | --- |
+| Incident first start | 150,000 | 1/1 | 60,880,077 | none |
+| Bidirectional attachment | 150,000 | 1/1 | 60,880,105 | none |
+| Unchanged policy reload | 150,000 | 1/1 | 60,880,107 | none |
+| Country refresh | 150,000 | 1/1 | 60,880,169 | none |
+| Delete/replace/renew | 149,998 | 1/1 | 60,880,919 | none |
+| Growth; spare retired | 300,000 | 1/1 | 74,526,233 | none |
+| Rejected candidate; old retained | 300,000 | 1/1 | 74,526,234 | none |
+| Later admissible reload | 300,000 | 1/1 | 74,526,234 | none |
+| Clean restart | 300,000 | 1/1 | 74,526,237 | none |
+| Prepared same-ID; interrupted | 300,000 | 1/1 | 74,526,237 | prepared |
+| Prepared same-ID; recovered | 300,000 | 1/1 | 74,526,237 | none |
+| Switched same-ID; interrupted | 300,000 | 1/1 | 74,526,237 | switched |
+| Switched same-ID; recovered | 300,000 | 1/1 | 74,526,239 | none |
+| Prepared distinct-ID; interrupted | 300,000 | 2/2 | 74,526,239 | prepared |
+| Prepared distinct-ID; recovered | 300,000 | 1/1 | 74,526,239 | committed |
+| Switched distinct-ID; interrupted | 300,000 | 2/2 | 149,047,372 | prepared |
+| Switched distinct-ID; recovered | 300,000 | 1/1 | 74,526,239 | none |
+
+| Stage | Phase wall seconds | Daemon peak KiB | Inspection child user/system seconds | Child rusage peak KiB |
+| --- | ---: | ---: | --- | ---: |
+| Incident first start | 128.988 | 2,167,216 | 2.506 / 33.235 | 1,317,248 |
+| Bidirectional attachment | 322.529 | 2,167,216 | 2.536 / 32.579 | 1,317,176 |
+| Unchanged policy reload | 294.654 | 2,167,216 | 2.540 / 31.791 | 1,317,116 |
+| Country refresh | 688.637 | 2,287,176 | 2.602 / 30.367 | 1,316,700 |
+| Delete/replace/renew | 198.943 | 2,287,176 | 2.459 / 30.217 | 1,316,968 |
+| Growth; spare retired | 218.095 | 2,287,176 | 2.970 / 32.026 | 1,556,620 |
+| Rejected candidate; old retained | 106.105 | 2,287,176 | 3.055 / 31.891 | 1,556,616 |
+| Later admissible reload | 302.161 | 2,468,064 | 3.320 / 34.345 | 1,556,500 |
+| Clean restart | 533.381 | 2,081,652 | 3.573 / 35.731 | 1,554,844 |
+| Prepared same-ID; interrupted | 56.903 | — | 3.365 / 35.385 | 1,554,948 |
+| Prepared same-ID; recovered | 580.579 | 2,643,432 | 3.835 / 41.956 | 1,554,900 |
+| Switched same-ID; interrupted | 123.678 | — | 3.672 / 40.244 | 1,554,780 |
+| Switched same-ID; recovered | 630.526 | 2,291,076 | 3.639 / 38.765 | 1,554,716 |
+| Prepared distinct-ID; interrupted | 201.679 | — | 2.880 / 31.815 | 1,554,928 |
+| Prepared distinct-ID; recovered | 656.727 | 2,471,584 | 2.914 / 36.305 | 1,555,088 |
+| Switched distinct-ID; interrupted | 304.767 | — | 5.952 / 62.359 | 3,101,268 |
+| Switched distinct-ID; recovered | 816.376 | 1,994,564 | 2.810 / 30.957 | 1,554,968 |
+
+**iptables-legacy**
+
+| Stage | Bans / identity | Recorded S/D | Complete inventory bytes | Journal sample |
+| --- | ---: | --- | --- | --- |
+| Incident first start | 150,000 | 1/1 | 60,089,768 / 6,600 / 6,575 | none |
+| Bidirectional attachment | 150,000 | 1/1 | 60,089,768 / 8,785 / 8,757 | none |
+| Unchanged policy reload | 150,000 | 1/1 | 60,089,768 / 8,783 / 8,738 | none |
+| Country refresh | 150,000 | 1/1 | 60,089,768 / 8,812 / 8,769 | none |
+| Delete/replace/renew | 149,998 | 1/1 | 60,090,530 / 8,824 / 8,789 | none |
+| Growth; spare retired | 300,000 | 1/1 | 70,285,824 / 8,829 / 8,795 | none |
+| Rejected candidate; old retained | 300,000 | 1/1 | 70,285,824 / 8,833 / 8,799 | none |
+| Later admissible reload | 300,000 | 1/1 | 70,285,824 / 8,803 / 8,767 | none |
+| Clean restart | 300,000 | 1/1 | 70,285,824 / 8,807 / 8,767 | none |
+| Prepared same-ID; interrupted | 300,000 | 1/1 | 70,285,824 / 8,807 / 8,767 | prepared |
+| Prepared same-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,829 / 8,787 | none |
+| Switched same-ID; interrupted | 300,000 | 1/1 | 70,285,824 / 8,829 / 8,787 | prepared |
+| Switched same-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,832 / 8,787 | none |
+| Prepared distinct-ID; interrupted | 300,000 | 2/2 | 70,285,824 / 8,835 / 8,787 | prepared |
+| Prepared distinct-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,832 / 8,787 | none |
+| Switched distinct-ID; interrupted | 300,000 | 2/2 | 140,571,508 / 15,605 / 15,558 | prepared |
+| Switched distinct-ID; recovered | 300,000 | 1/1 | 70,285,825 / 8,832 / 8,787 | none |
+
+| Stage | Phase wall seconds | Daemon peak KiB | Inspection child user/system seconds | Child rusage peak KiB |
+| --- | ---: | ---: | --- | ---: |
+| Incident first start | 24.195 | 977,228 | 0.308 / 0.161 | 404,156 |
+| Bidirectional attachment | 74.145 | 1,535,356 | 0.289 / 0.173 | 511,872 |
+| Unchanged policy reload | 43.332 | 1,535,356 | 0.329 / 0.155 | 519,656 |
+| Country refresh | 173.163 | 1,599,112 | 0.293 / 0.164 | 519,656 |
+| Delete/replace/renew | 33.612 | 1,599,112 | 0.316 / 0.151 | 519,656 |
+| Growth; spare retired | 44.081 | 1,599,112 | 0.315 / 0.222 | 579,980 |
+| Rejected candidate; old retained | 42.806 | 1,599,112 | 0.340 / 0.203 | 2,296,180 |
+| Later admissible reload | 46.394 | 1,738,656 | 0.354 / 0.194 | 2,296,180 |
+| Clean restart | 77.449 | 1,445,100 | 0.350 / 0.205 | 2,296,180 |
+| Prepared same-ID; interrupted | 15.083 | — | 0.378 / 0.195 | 2,296,180 |
+| Prepared same-ID; recovered | 115.462 | 1,400,224 | 0.329 / 0.228 | 2,296,180 |
+| Switched same-ID; interrupted | 20.268 | — | 0.391 / 0.171 | 2,296,180 |
+| Switched same-ID; recovered | 122.553 | 1,402,976 | 0.361 / 0.181 | 2,296,180 |
+| Prepared distinct-ID; interrupted | 52.907 | — | 0.364 / 0.197 | 2,296,180 |
+| Prepared distinct-ID; recovered | 157.898 | 1,394,776 | 0.334 / 0.225 | 2,296,180 |
+| Switched distinct-ID; interrupted | 67.365 | — | 0.722 / 0.401 | 2,296,180 |
+| Switched distinct-ID; recovered | 179.136 | 1,347,136 | 0.343 / 0.188 | 2,296,180 |
+
+**iptables-nft**
+
+| Stage | Bans / identity | Recorded S/D | Complete inventory bytes | Journal sample |
+| --- | ---: | --- | --- | --- |
+| Incident first start | 150,000 | 1/1 | 60,089,768 / 6,616 / 6,591 | none |
+| Bidirectional attachment | 150,000 | 1/1 | 60,089,768 / 8,801 / 8,773 | none |
+| Unchanged policy reload | 150,000 | 1/1 | 60,089,768 / 8,799 / 8,754 | none |
+| Country refresh | 150,000 | 1/1 | 60,089,768 / 8,828 / 8,785 | none |
+| Delete/replace/renew | 149,998 | 1/1 | 60,090,530 / 8,840 / 8,805 | none |
+| Growth; spare retired | 300,000 | 1/1 | 70,285,824 / 8,845 / 8,811 | none |
+| Rejected candidate; old retained | 300,000 | 1/1 | 70,285,824 / 8,849 / 8,815 | none |
+| Later admissible reload | 300,000 | 1/1 | 70,285,824 / 8,819 / 8,783 | none |
+| Clean restart | 300,000 | 1/1 | 70,285,824 / 8,819 / 8,783 | none |
+| Prepared same-ID; interrupted | 300,000 | 1/1 | 70,285,824 / 8,819 / 8,783 | prepared |
+| Prepared same-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,843 / 8,803 | none |
+| Switched same-ID; interrupted | 300,000 | 1/1 | 70,285,824 / 8,843 / 8,803 | prepared |
+| Switched same-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,843 / 8,803 | none |
+| Prepared distinct-ID; interrupted | 300,000 | 2/2 | 70,285,824 / 8,848 / 8,803 | prepared |
+| Prepared distinct-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,848 / 8,803 | none |
+| Switched distinct-ID; interrupted | 300,000 | 2/2 | 140,571,508 / 15,621 / 15,574 | prepared |
+| Switched distinct-ID; recovered | 300,000 | 1/1 | 70,285,824 / 8,848 / 8,803 | none |
+
+| Stage | Phase wall seconds | Daemon peak KiB | Inspection child user/system seconds | Child rusage peak KiB |
+| --- | ---: | ---: | --- | ---: |
+| Incident first start | 24.201 | 961,660 | 0.312 / 0.165 | 384,244 |
+| Bidirectional attachment | 74.648 | 1,558,896 | 0.288 / 0.157 | 430,568 |
+| Unchanged policy reload | 44.072 | 1,578,812 | 0.309 / 0.186 | 562,216 |
+| Country refresh | 175.143 | 1,691,552 | 0.293 / 0.157 | 562,216 |
+| Delete/replace/renew | 34.206 | 1,691,552 | 0.312 / 0.185 | 562,216 |
+| Growth; spare retired | 43.927 | 1,691,552 | 0.335 / 0.211 | 562,216 |
+| Rejected candidate; old retained | 43.569 | 1,691,552 | 0.341 / 0.215 | 2,266,624 |
+| Later admissible reload | 47.125 | 1,711,048 | 0.381 / 0.190 | 2,266,624 |
+| Clean restart | 78.191 | 1,295,776 | 0.392 / 0.196 | 2,266,624 |
+| Prepared same-ID; interrupted | 15.189 | — | 0.381 / 0.213 | 2,266,624 |
+| Prepared same-ID; recovered | 119.015 | 1,395,420 | 0.369 / 0.182 | 2,266,624 |
+| Switched same-ID; interrupted | 22.871 | — | 0.364 / 0.252 | 2,266,624 |
+| Switched same-ID; recovered | 134.726 | 1,380,000 | 0.385 / 0.232 | 2,266,624 |
+| Prepared distinct-ID; interrupted | 59.538 | — | 0.394 / 0.216 | 2,266,624 |
+| Prepared distinct-ID; recovered | 170.639 | 1,393,332 | 0.368 / 0.215 | 2,266,624 |
+| Switched distinct-ID; interrupted | 69.370 | — | 0.729 / 0.408 | 2,266,624 |
+| Switched distinct-ID; recovered | 183.087 | 1,346,840 | 0.341 / 0.193 | 2,266,624 |
+
+Each backend ended with owned cleanup, no active record or journal, and foreign
+objects retained. Complete cleanup wall seconds were 45.100 (nftables), 11.881
+(iptables-legacy), and 11.769 (iptables-nft). Complete scenario wall seconds were
+5,529.14, 1,148.57, and 1,186.85 respectively; this includes repeated full
+inspection and crash/recovery exercises, not just a production reload.
+
+The direct backend preflights rejected nft input at
+175,413,689 required / 67,108,864 allowed bytes, and ipset inventory at
+351,362,799 / 268,435,456 on both iptables frontends. Observed counts and
+packets stayed intact; a subsequent reload and cleanup passed. The daemon
+did not receive these rejected candidates.
+
+**Live DB-IP lifecycle**
+
+The opt-in run used the November artifact and controlled single-range refresh
+whose digests are recorded above, with the same isolated synthetic LAPI.
+First-start and settled checkpoints had 892,659 static memberships; the
+alternate artifact temporarily removed one membership before the ordinary
+scheduled return restored it. Projected bans were 150,000, then 149,998 after
+delete/replacement, then 300,000 after growth. All three backends completed the
+same lifecycle/recovery/rejection/cleanup matrix. Synthetic packet-address
+assertions were intentionally omitted in this mode; packet proof belongs to
+the deterministic matrix, not to assumed geography of live addresses.
+
+**nftables**
+
+| Stage | Bans / identity | Recorded S/D | Complete inventory bytes | Journal sample |
+| --- | ---: | --- | --- | --- |
+| Incident first start | 150,000 | 1/1 | 23,557,005 | none |
+| Bidirectional attachment | 150,000 | 1/1 | 23,557,020 | none |
+| Unchanged policy reload | 150,000 | 1/1 | 23,557,020 | none |
+| Country refresh | 150,000 | 1/1 | 23,557,076 | none |
+| Delete/replace/renew | 149,998 | 1/1 | 23,557,824 | none |
+| Growth; spare retired | 300,000 | 1/1 | 37,203,134 | none |
+| Rejected candidate; old retained | 300,000 | 1/1 | 37,203,134 | none |
+| Later admissible reload | 300,000 | 1/1 | 37,203,134 | none |
+| Clean restart | 300,000 | 1/1 | 37,203,136 | none |
+| Prepared same-ID; interrupted | 300,000 | 1/1 | 37,203,136 | prepared |
+| Prepared same-ID; recovered | 300,000 | 1/1 | 37,203,136 | none |
+| Switched same-ID; interrupted | 300,000 | 1/1 | 37,203,136 | switched |
+| Switched same-ID; recovered | 300,000 | 1/1 | 37,203,136 | none |
+| Prepared distinct-ID; interrupted | 300,000 | 2/2 | 37,203,137 | prepared |
+| Prepared distinct-ID; recovered | 300,000 | 1/1 | 37,203,137 | none |
+| Switched distinct-ID; interrupted | 300,000 | 2/2 | 74,401,204 | prepared |
+| Switched distinct-ID; recovered | 300,000 | 1/1 | 37,203,138 | none |
+
+| Stage | Phase wall seconds | Daemon peak KiB | Inspection child user/system seconds | Child rusage peak KiB |
+| --- | ---: | ---: | --- | ---: |
+| Incident first start | 25.189 | 1,612,156 | 0.862 / 0.915 | 449,440 |
+| Bidirectional attachment | 39.055 | 1,825,840 | 0.891 / 0.759 | 449,420 |
+| Unchanged policy reload | 40.199 | 1,825,840 | 0.895 / 0.821 | 502,872 |
+| Country refresh | 134.198 | 2,478,160 | 0.860 / 0.750 | 502,872 |
+| Delete/replace/renew | 15.539 | 2,478,160 | 0.897 / 1.272 | 502,872 |
+| Growth; spare retired | 27.907 | 2,478,160 | 1.422 / 3.395 | 688,320 |
+| Rejected candidate; old retained | 13.567 | 2,478,160 | 1.424 / 3.369 | 688,472 |
+| Later admissible reload | 66.217 | 2,478,160 | 1.558 / 4.662 | 688,280 |
+| Clean restart | 108.100 | 2,405,640 | 1.417 / 3.470 | 688,304 |
+| Prepared same-ID; interrupted | 21.358 | — | 1.503 / 3.773 | 688,208 |
+| Prepared same-ID; recovered | 121.657 | 2,404,788 | 1.428 / 3.984 | 687,864 |
+| Switched same-ID; interrupted | 36.005 | — | 1.489 / 3.692 | 688,312 |
+| Switched same-ID; recovered | 140.269 | 2,137,456 | 1.415 / 3.354 | 688,096 |
+| Prepared distinct-ID; interrupted | 69.894 | — | 1.517 / 3.563 | 688,256 |
+| Prepared distinct-ID; recovered | 174.340 | 2,401,440 | 1.508 / 3.944 | 688,308 |
+| Switched distinct-ID; interrupted | 93.589 | — | 2.914 / 9.335 | 1,369,684 |
+| Switched distinct-ID; recovered | 207.063 | 2,214,684 | 1.502 / 3.430 | 688,132 |
+
+**iptables-legacy**
+
+| Stage | Bans / identity | Recorded S/D | Complete inventory bytes | Journal sample |
+| --- | ---: | --- | --- | --- |
+| Incident first start | 150,000 | 1/1 | 57,632,881 / 6,596 / 6,575 | none |
+| Bidirectional attachment | 150,000 | 1/1 | 57,632,881 / 8,743 / 8,700 | none |
+| Unchanged policy reload | 150,000 | 1/1 | 57,632,881 / 8,767 / 8,700 | none |
+| Country refresh | 150,000 | 1/1 | 57,632,881 / 8,773 / 8,703 | none |
+| Delete/replace/renew | 149,998 | 1/1 | 57,633,643 / 8,776 / 8,703 | none |
+| Growth; spare retired | 300,000 | 1/1 | 67,828,937 / 8,779 / 8,703 | none |
+| Rejected candidate; old retained | 300,000 | 1/1 | 67,828,937 / 8,779 / 8,703 | none |
+| Later admissible reload | 300,000 | 1/1 | 67,828,937 / 8,779 / 8,703 | none |
+| Clean restart | 300,000 | 1/1 | 67,828,937 / 8,779 / 8,703 | none |
+| Prepared same-ID; interrupted | 300,000 | 1/1 | 67,828,937 / 8,779 / 8,703 | prepared |
+| Prepared same-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,780 / 8,703 | none |
+| Switched same-ID; interrupted | 300,000 | 1/1 | 67,828,937 / 8,780 / 8,703 | prepared |
+| Switched same-ID; recovered | 300,000 | 1/1 | 67,828,938 / 8,783 / 8,703 | none |
+| Prepared distinct-ID; interrupted | 300,000 | 2/2 | 67,828,938 / 8,789 / 8,703 | prepared |
+| Prepared distinct-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,788 / 8,703 | none |
+| Switched distinct-ID; interrupted | 300,000 | 2/2 | 135,657,735 / 15,566 / 15,474 | prepared |
+| Switched distinct-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,788 / 8,703 | none |
+
+| Stage | Phase wall seconds | Daemon peak KiB | Inspection child user/system seconds | Child rusage peak KiB |
+| --- | ---: | ---: | --- | ---: |
+| Incident first start | 26.385 | 930,364 | 0.300 / 0.188 | 378,940 |
+| Bidirectional attachment | 45.879 | 1,507,228 | 0.298 / 0.211 | 379,064 |
+| Unchanged policy reload | 46.017 | 1,515,480 | 0.303 / 0.195 | 465,172 |
+| Country refresh | 147.982 | 1,550,908 | 0.307 / 0.191 | 465,172 |
+| Delete/replace/renew | 12.772 | 1,550,908 | 0.302 / 0.210 | 465,172 |
+| Growth; spare retired | 15.321 | 1,550,908 | 0.383 / 0.218 | 591,928 |
+| Rejected candidate; old retained | 12.436 | 1,550,908 | 0.398 / 0.185 | 1,823,268 |
+| Later admissible reload | 48.772 | 1,622,576 | 0.373 / 0.219 | 1,823,268 |
+| Clean restart | 80.468 | 1,287,104 | 0.410 / 0.223 | 1,823,268 |
+| Prepared same-ID; interrupted | 16.564 | — | 0.360 / 0.220 | 1,823,268 |
+| Prepared same-ID; recovered | 90.389 | 1,366,784 | 0.347 / 0.228 | 1,823,268 |
+| Switched same-ID; interrupted | 21.952 | — | 0.354 / 0.219 | 1,823,268 |
+| Switched same-ID; recovered | 97.189 | 1,289,784 | 0.378 / 0.212 | 1,823,268 |
+| Prepared distinct-ID; interrupted | 57.294 | — | 0.396 / 0.248 | 1,823,268 |
+| Prepared distinct-ID; recovered | 134.640 | 1,285,696 | 0.408 / 0.204 | 1,823,268 |
+| Switched distinct-ID; interrupted | 71.743 | — | 0.744 / 0.433 | 1,823,268 |
+| Switched distinct-ID; recovered | 155.949 | 1,230,352 | 0.359 / 0.218 | 1,823,268 |
+
+**iptables-nft**
+
+| Stage | Bans / identity | Recorded S/D | Complete inventory bytes | Journal sample |
+| --- | ---: | --- | --- | --- |
+| Incident first start | 150,000 | 1/1 | 57,632,881 / 6,612 / 6,591 | none |
+| Bidirectional attachment | 150,000 | 1/1 | 57,632,881 / 8,757 / 8,709 | none |
+| Unchanged policy reload | 150,000 | 1/1 | 57,632,881 / 8,783 / 8,716 | none |
+| Country refresh | 150,000 | 1/1 | 57,632,881 / 8,789 / 8,719 | none |
+| Delete/replace/renew | 149,998 | 1/1 | 57,633,643 / 8,792 / 8,719 | none |
+| Growth; spare retired | 300,000 | 1/1 | 67,828,937 / 8,795 / 8,719 | none |
+| Rejected candidate; old retained | 300,000 | 1/1 | 67,828,937 / 8,795 / 8,719 | none |
+| Later admissible reload | 300,000 | 1/1 | 67,828,938 / 8,795 / 8,719 | none |
+| Clean restart | 300,000 | 1/1 | 67,828,937 / 8,795 / 8,719 | none |
+| Prepared same-ID; interrupted | 300,000 | 1/1 | 67,828,937 / 8,795 / 8,719 | prepared |
+| Prepared same-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,796 / 8,719 | none |
+| Switched same-ID; interrupted | 300,000 | 1/1 | 67,828,937 / 8,796 / 8,719 | prepared |
+| Switched same-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,799 / 8,719 | none |
+| Prepared distinct-ID; interrupted | 300,000 | 2/2 | 67,828,937 / 8,803 / 8,719 | prepared |
+| Prepared distinct-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,804 / 8,719 | none |
+| Switched distinct-ID; interrupted | 300,000 | 2/2 | 135,657,734 / 15,582 / 15,490 | prepared |
+| Switched distinct-ID; recovered | 300,000 | 1/1 | 67,828,937 / 8,804 / 8,719 | none |
+
+| Stage | Phase wall seconds | Daemon peak KiB | Inspection child user/system seconds | Child rusage peak KiB |
+| --- | ---: | ---: | --- | ---: |
+| Incident first start | 25.578 | 945,972 | 0.328 / 0.167 | 377,316 |
+| Bidirectional attachment | 45.021 | 1,489,580 | 0.330 / 0.175 | 392,220 |
+| Unchanged policy reload | 45.678 | 1,489,580 | 0.324 / 0.182 | 483,604 |
+| Country refresh | 147.419 | 1,545,512 | 0.352 / 0.146 | 483,604 |
+| Delete/replace/renew | 12.730 | 1,545,512 | 0.310 / 0.197 | 483,604 |
+| Growth; spare retired | 15.107 | 1,545,512 | 0.334 / 0.228 | 596,732 |
+| Rejected candidate; old retained | 12.212 | 1,545,512 | 0.384 / 0.222 | 2,245,308 |
+| Later admissible reload | 50.009 | 1,666,396 | 0.393 / 0.219 | 2,245,308 |
+| Clean restart | 81.239 | 1,246,376 | 0.420 / 0.201 | 2,245,308 |
+| Prepared same-ID; interrupted | 16.826 | — | 0.377 / 0.239 | 2,245,308 |
+| Prepared same-ID; recovered | 91.200 | 1,350,496 | 0.367 / 0.219 | 2,245,308 |
+| Switched same-ID; interrupted | 21.919 | — | 0.352 / 0.233 | 2,245,308 |
+| Switched same-ID; recovered | 97.261 | 1,275,924 | 0.387 / 0.234 | 2,245,308 |
+| Prepared distinct-ID; interrupted | 56.810 | — | 0.384 / 0.218 | 2,245,308 |
+| Prepared distinct-ID; recovered | 134.146 | 1,279,500 | 0.384 / 0.199 | 2,245,308 |
+| Switched distinct-ID; interrupted | 70.181 | — | 0.750 / 0.461 | 2,245,308 |
+| Switched distinct-ID; recovered | 153.531 | 1,226,884 | 0.357 / 0.211 | 2,245,308 |
+
+Live owned-cleanup wall seconds were 14.239, 12.607 and 12.051 for nftables,
+iptables-legacy and iptables-nft. Each ended with no active record/journal or
+owned native objects, with foreign objects retained. Complete live scenario
+wall seconds were 1,128.45, 927.77 and 924.12. Direct backend preflights
+rejected nft input at 172,963,498 / 67,108,864 bytes and ipset inventory at
+348,912,608 / 268,435,456 on both frontends; later daemon work was admitted,
+but these were not daemon-side rejection scenarios.
+
+`make verify`, `make test-race`, formatting, lint, the complete native suite,
+and both capacity matrices passed. The 75-second CLI / 80-second server /
+90-second service reload deadlines remain unchanged: these lifecycle results
+are not a claim of synchronous CLI completion for the large nft profile.
+
+##### Scale gate assertion corrections (2026-11-04)
+
+The corrected deterministic lifecycle passed separately on nftables,
+iptables-legacy and iptables-nft, with the same 892,659-static / 150,000-ban
+initial profile and growth to 300,000. The replacement stage verified every
+one of the 149,998 desired native members and its renewed lease, not just
+counts and the two removed peer bans. Retained authority after rejection and
+the later changed admissible authority also passed exact native inspection.
+
+The daemon received the oversized LAPI startup snapshot during a real
+`SIGHUP` reload and emitted the following numeric native rejection. Source
+body sizes fit 256 MiB. The unchanged static durable envelope fit 32 MiB
+with an additional 1 KiB metadata reserve; no dynamic decision list was
+persisted or rejected at the durable fence.
+
+| Backend | Native resource/scope | Required bytes | Limit bytes | LAPI body bytes | Static durable envelope bytes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| nftables | nft-table/input | 423,753,620 | 67,108,864 | 18,295,793 | 19,658,245 |
+| iptables-legacy | ipsets/inventory | 458,247,128 | 268,435,456 | 18,295,793 | 19,658,736 |
+| iptables-nft | ipsets/inventory | 458,247,128 | 268,435,456 | 18,295,793 | 19,658,736 |
+
+Each backend retained its active revision, full target and configuration
+epoch with no journal after rejection. Exact prior membership/lease and
+packet checks passed. The later admissible snapshot moved sparse membership
+offset 1,000 to 2,000 and renewed 13h authority to 14h, acknowledged a newer
+revision/client epoch, and matched every native member/lease. Clean restart,
+all existing interruption/recovery checkpoints, obsolete-object retirement
+and owned cleanup passed; final active record/journal were absent and foreign
+objects remained.
+
+The expiry oracle includes measured write/read windows because relative
+grants are calculated before native encoding/execution. A short isolated
+native smoke verified preservation and changed admissible work when nft
+resumed the old source under a fresh client epoch. The comparator regressions
+also cover observed write latency and prove that this allowance cannot hide
+a one-hour stale lease. Both helper regressions passed with and without
+`-race`; `make verify`, lint/formatting and `make test-race` passed.
+
+The scale runs used `-test.run '^TestE2EDBIPCapacity$/^nftables$'` and
+`-test.run '^TestE2EDBIPCapacity$/^iptables-'` in disposable namespaces.
+This correction run did not repeat the entire native suite or opt-in live
+artifact matrix; the older measurements above retain their explicit scope.
+Temporary native diagnostic drivers were removed. Production behavior and
+capacity/deadline settings were not changed by these assertion corrections.
+
 Use the [verification matrix](#verification-matrix) for required behavior and
 the [service and packaging matrix](#service-and-packaging) for shared isolation
 requirements. Unit and source-integration tests use local HTTP servers and
@@ -395,6 +969,11 @@ boundaries; live downloads are opt-in smoke evidence, never unit-test constants.
 Large synthetic workloads belong to the opt-in [scale measurements](#opt-in-scale-measurements).
 
 ### DB-IP Lite real-data validation
+
+These measurements predate the coordinated capacity change and retain its
+former native/durable fences as a historical baseline. Their feasibility
+outcomes do not qualify or disqualify the current binary; current workload
+evidence is recorded in the [shared capacity gate](#shared-db-ip-era-capacity-gate).
 
 Local smoke on 2026-10-17 used Go 1.27.2, nftables 1.1.6, and iptables 1.8.11
 (legacy and nf_tables). The actual `source.Resolver.Resolve` downloaded the
@@ -472,7 +1051,7 @@ Two journal-referenced revision files at the interruption:
 EU first activation and single-generation
 recovery passed on iptables, but `iptables retained generations exceed inspection
 budget` rejected the additional generation before a journal/native mutation.
-EU is therefore not a fully supported iptables refresh/reload envelope.
+At those former limits, EU was not a fully supported iptables refresh/reload envelope.
 
 The larger RIR+US candidate was attempted while SK/CZ was already committed:
 

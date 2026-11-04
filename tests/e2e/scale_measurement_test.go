@@ -118,22 +118,6 @@ func nativeMeasurementTarget(t *testing.T, backend string, geoPrefixes, offset u
 	return target
 }
 
-func nativeCapacityError(err error) bool {
-	if err == nil {
-		return false
-	}
-	message := strings.TrimSpace(err.Error())
-	switch message {
-	case "nft backend: complete target exceeds input limit",
-		"nft backend: retained generations exceed inspection capacity",
-		"nft backend: combined static and dynamic contents exceed inspection capacity",
-		"iptables complete family exceeds input budget",
-		"iptables retained generations exceed inspection budget":
-		return true
-	}
-	return strings.HasSuffix(message, " input exceeds 16777216 bytes")
-}
-
 func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 	if os.Getenv(nativeMeasurementEnabled) != "1" {
 		t.Skip("set PERIMETERD_NATIVE_MEASURE=1 to run the isolated native measurement")
@@ -184,10 +168,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 
 			preflightStarted := time.Now()
 			if err := backend.Preflight(ctx, nil, target, dynamic); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s admission=rejected-capacity phase=activation-preflight elapsed=%s error=%v", profile.name, backendName, time.Since(preflightStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s admission=error phase=activation-preflight elapsed=%s: %v", profile.name, backendName, time.Since(preflightStarted), err)
 			}
 			t.Logf("profile=%s backend=%s admission=accepted phase=activation-preflight elapsed=%s", profile.name, backendName, time.Since(preflightStarted))
@@ -195,10 +175,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			owned = append(owned, target)
 			applyStarted := time.Now()
 			if err := backend.Apply(ctx, nil, target, dynamic); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s execution=rejected-capacity phase=activation-apply elapsed=%s error=%v", profile.name, backendName, time.Since(applyStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s execution=error phase=activation-apply elapsed=%s: %v", profile.name, backendName, time.Since(applyStarted), err)
 			}
 			t.Logf("profile=%s backend=%s execution=accepted phase=activation-apply elapsed=%s", profile.name, backendName, time.Since(applyStarted))
@@ -206,10 +182,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			// Renewal writes the exact unchanged source projection and deadlines.
 			renewalStarted := time.Now()
 			if err := backend.UpdateDynamic(ctx, target, projection); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s execution=rejected-capacity phase=renewal elapsed=%s error=%v", profile.name, backendName, time.Since(renewalStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s execution=error phase=renewal elapsed=%s: %v", profile.name, backendName, time.Since(renewalStarted), err)
 			}
 			t.Logf("profile=%s backend=%s execution=accepted phase=renewal elapsed=%s prefixes=%d", profile.name, backendName, time.Since(renewalStarted), len(projection))
@@ -221,10 +193,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			}
 			reconnectedProjection := reconnected.Projection(reconnectStarted)
 			if err := backend.UpdateDynamic(ctx, target, reconnectedProjection); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s execution=rejected-capacity phase=cold-reconnect elapsed=%s error=%v", profile.name, backendName, time.Since(reconnectStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s execution=error phase=cold-reconnect elapsed=%s: %v", profile.name, backendName, time.Since(reconnectStarted), err)
 			}
 			t.Logf("profile=%s backend=%s execution=accepted phase=cold-reconnect elapsed=%s prefixes=%d", profile.name, backendName, time.Since(reconnectStarted), len(reconnectedProjection))
@@ -235,10 +203,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			refreshedTarget := nativeMeasurementTarget(t, backendName, profile.geoPrefixes, 500_000, "cccccccccccccccccccccccccccccccc", target)
 			refreshPreflightStarted := time.Now()
 			if err := backend.Preflight(ctx, target, refreshedTarget, dynamic); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s admission=rejected-capacity phase=geo-refresh-preflight elapsed=%s error=%v", profile.name, backendName, time.Since(refreshPreflightStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s admission=error phase=geo-refresh-preflight elapsed=%s: %v", profile.name, backendName, time.Since(refreshPreflightStarted), err)
 			}
 			t.Logf("profile=%s backend=%s admission=accepted phase=geo-refresh-preflight elapsed=%s", profile.name, backendName, time.Since(refreshPreflightStarted))
@@ -246,10 +210,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			owned = append(owned, refreshedTarget)
 			refreshApplyStarted := time.Now()
 			if err := backend.Apply(ctx, target, refreshedTarget, nil); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s execution=rejected-capacity phase=geo-refresh-apply elapsed=%s error=%v", profile.name, backendName, time.Since(refreshApplyStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s execution=error phase=geo-refresh-apply elapsed=%s: %v", profile.name, backendName, time.Since(refreshApplyStarted), err)
 			}
 			t.Logf("profile=%s backend=%s execution=accepted phase=geo-refresh-apply elapsed=%s", profile.name, backendName, time.Since(refreshApplyStarted))
@@ -262,10 +222,6 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 
 			refreshReconcileStarted := time.Now()
 			if err := backend.UpdateDynamic(ctx, target, projection); err != nil {
-				if profile.decisions > 1_024 && nativeCapacityError(err) {
-					t.Logf("profile=%s backend=%s execution=rejected-capacity phase=geo-refresh-reconcile elapsed=%s error=%v", profile.name, backendName, time.Since(refreshReconcileStarted), err)
-					return
-				}
 				t.Fatalf("profile=%s backend=%s execution=error phase=geo-refresh-reconcile elapsed=%s: %v", profile.name, backendName, time.Since(refreshReconcileStarted), err)
 			}
 			t.Logf("profile=%s backend=%s execution=accepted phase=geo-refresh-reconcile elapsed=%s", profile.name, backendName, time.Since(refreshReconcileStarted))

@@ -200,10 +200,11 @@ binaries cannot read new DB-IP commits. Never delete durable state to force a
 downgrade. See [configuration upgrades](configuration.md#country-provider-upgrades)
 and [source selection](data-sources.md#db-ip-lite-country-default).
 
-DB-IP's finer boundaries can exceed existing capacity fences. In the
-[measured real-data envelope](development.md#db-ip-lite-real-data-validation),
-EU data activated/recovered on iptables but an additional retained generation
-was rejected; a RIPE-region-plus-US policy exceeded native/durable limits.
+DB-IP's finer boundaries can exceed capacity fences. The
+[historical real-data envelope](development.md#db-ip-lite-real-data-validation)
+records failures under the former native and durable limits; it is not a
+measurement of the current coordinated limits. Admission must cover both
+static generations and live CrowdSec contents through refresh and recovery.
 Review large group/RIR deployments before changing provider. Rejection is not
 permission to truncate data, widen ranges, or remove recovery evidence.
 
@@ -755,6 +756,15 @@ An ordinary pre-apply rejection leaves the daemon running without a restart and
 keeps the old policy. An old daemon without this endpoint fails safely.
 Manual `SIGHUP` remains asynchronous: signal delivery does not acknowledge
 application, and an admitted signal can supersede an older staging request.
+Large admitted nft inventories can require more than 30 seconds for one native
+inspection; the nft child deadline is 120 seconds, while iptables/ipset remains
+30 seconds. A reload involving several inspections can outlast the unchanged
+CLI/server bounds above even when it eventually applies successfully.
+For an intentionally asynchronous large reload, send `SIGHUP` and verify a
+new acknowledged configuration epoch/revision, healthy status, and actual
+enforcement. Signal delivery alone is not completion. This is not an automatic
+fallback: do not send another signal to retry a CLI result whose completion is
+still unknown.
 Startup requests are explicitly rejected as `not_ready`, rather than queued.
 
 Backend-specific mixed-family windows, migration overlap, retained ownership,
@@ -963,16 +973,29 @@ Permanent runtime recovery failures also terminate the daemon rather than
 leaving an unrecoverable writer retrying indefinitely. systemd's existing
 restart/rate-limit policy remains separate from in-process recovery.
 
-A bootstrap logger reports the first recovery failure before current YAML,
-metrics, or the control socket are available. New recovery diagnostics use
-fixed safe categories, attempt and retry-delay fields, and numeric capacity
-required/limit bytes and static/dynamic generation counts when available.
-They do not echo native output, remote payloads, prefixes, or credentials.
+A bootstrap logger reports recovery failures before current YAML, metrics, or
+the control socket are available. Both initial apply and persisted-state
+recovery capacity failures expose fixed safe `backend`, `resource`, `scope`,
+`required_bytes`, and `limit_bytes` fields, plus static/dynamic generation
+counts when available. Recovery reports also include attempt and retry delay.
+They never echo native output, remote payloads, prefixes, or credentials.
+Zero generation counts may mean unknown. A native output overflow reports an
+observed lower bound, not the complete output size at the canceled command.
 Timeout diagnostics distinguish a recovery operation timing out from the
 overall startup deadline expiring.
-An old `retained generations exceed inspection budget` message is not evidence
-that there are stale generations: repeated references to one native generation
-must not be charged as distinct objects.
+
+The old `retained generations exceed inspection budget` message does not
+establish stale generations. The reported first-start incident had an empty
+ipset census and small rule inventories; a large DB-IP policy plus CrowdSec
+can exceed a combined budget without any old generation. Diagnose the failing
+resource numerically: `ipsets` is aggregate recorded-set inspection,
+`ipv4-rules`/`ipv6-rules` each include that family's foreign rules, and
+`nft-table` is a unique-object table budget. Do not sum these independent scopes.
+`native-io` identifies native input/capture where no narrower resource is known.
+
+The durable record ceiling is separately bounded at 32 MiB; the state schema
+remains version 2. This admits the required DB-IP-era revision without a state
+migration. It does not make native budgets or total process memory unbounded.
 
 Preserve the active record, journal, immutable revisions, source manifests, and
 native objects when investigating. Collect `systemctl status perimeterd`,

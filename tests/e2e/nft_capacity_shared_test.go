@@ -234,7 +234,7 @@ func capacityAssertStatusAndNative(t *testing.T, revision *state.Revision, split
 // generation paths, rather than assuming a geo ID suffix names its consumer.
 func capacityNativeReferences(t *testing.T, target *firewall.Target, separate bool) int {
 	t.Helper()
-	output := command(t, 60*time.Second, "nft", "-j", "list", "table", "inet", target.Table)
+	output := command(t, 3*time.Minute, "nft", "-j", "list", "table", "inet", target.Table)
 	var envelope struct {
 		Nftables []map[string]json.RawMessage `json:"nftables"`
 	}

@@ -12,7 +12,7 @@ import (
 // policy. Callers select fixed native tools and their own input/output limits.
 func executeNative(ctx context.Context, command string, args []string, input []byte, inputLimit, outputLimit int) ([]byte, error) {
 	if len(input) > inputLimit {
-		return nil, fmt.Errorf("%s input exceeds %d bytes", command, inputLimit)
+		return nil, &CapacityError{Resource: "native-io", Scope: "input", RequiredBytes: int64(len(input)), LimitBytes: int64(inputLimit)}
 	}
 	// #nosec G204 -- callers select fixed native firewall tools; configuration is passed as arguments or stdin, never shell code.
 	cmd := exec.CommandContext(ctx, command, args...)
@@ -38,12 +38,21 @@ func executeNative(ctx context.Context, command string, args []string, input []b
 	return stdout.Bytes(), nil
 }
 
-type nativeOutputLimitError struct{ required, limit int }
+// required is the observed lower bound when capture stopped, not the complete
+// size of native output that was discarded after interruption.
+type nativeOutputLimitError struct {
+	required int64
+	limit    int
+}
 
 func (e *nativeOutputLimitError) Error() string {
 	return fmt.Sprintf("command output exceeds %d bytes", e.limit)
 }
 func (*nativeOutputLimitError) RecoveryRetryable() bool { return false }
+
+func (e *nativeOutputLimitError) Unwrap() error {
+	return &CapacityError{Resource: "native-io", Scope: "output", RequiredBytes: e.required, LimitBytes: int64(e.limit)}
+}
 
 type boundedBuffer struct {
 	buffer   bytes.Buffer
@@ -53,7 +62,7 @@ type boundedBuffer struct {
 
 func (b *boundedBuffer) Write(value []byte) (int, error) {
 	if len(value) > b.limit-b.buffer.Len() {
-		b.overflow = &nativeOutputLimitError{required: b.buffer.Len() + len(value), limit: b.limit}
+		b.overflow = &nativeOutputLimitError{required: int64(b.buffer.Len()) + int64(len(value)), limit: b.limit}
 		return 0, b.overflow
 	}
 	return b.buffer.Write(value)

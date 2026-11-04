@@ -85,8 +85,8 @@ func ipsetSaveRecords(data string) iter.Seq2[[]string, error] {
 }
 
 func parseIPSetSave(data []byte) (map[string]iptObservedSet, error) {
-	if len(data) > maxIPTablesOutput {
-		return nil, errors.New("oversized ipset save")
+	if len(data) > maxNativeOutputBytes {
+		return nil, &CapacityError{Backend: "iptables", Resource: "ipsets", Scope: "output", RequiredBytes: int64(len(data)), LimitBytes: maxNativeOutputBytes}
 	}
 	result := make(map[string]iptObservedSet)
 	for fields, err := range ipsetSaveRecords(string(data)) {

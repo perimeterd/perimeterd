@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,14 +31,19 @@ type refreshCapacityBackend struct {
 	firewall.Backend
 	initial           chan *firewall.Target
 	initialProjection chan []policy.TimedPrefix
-	refresh           chan error
+	refresh           chan refreshCapacityResult
+}
+
+type refreshCapacityResult struct {
+	candidate *firewall.Target
+	err       error
 }
 
 func (b *refreshCapacityBackend) Preflight(ctx context.Context, previous, candidate *firewall.Target, dynamic *firewall.DynamicState) error {
 	err := b.Backend.Preflight(ctx, previous, candidate, dynamic)
 	if previous != nil {
 		select {
-		case b.refresh <- err:
+		case b.refresh <- refreshCapacityResult{candidate: candidate, err: err}:
 		default:
 		}
 	}
@@ -88,7 +94,7 @@ func (s *refreshCapacitySources) RoundTrip(request *http.Request) (*http.Respons
 
 func TestE2ECrowdSecGeoRefreshCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		runIsolated(t, "TestE2ECrowdSecGeoRefreshCapacity", "nftables")
+		t.Logf("%s", runIsolated(t, "TestE2ECrowdSecGeoRefreshCapacity", "nftables"))
 		return
 	}
 	requireIsolatedChild(t)
@@ -109,7 +115,12 @@ func TestE2ECrowdSecGeoRefreshCapacity(t *testing.T) {
 		}
 		return []byte(strings.Replace(countryFixtureBody, `["2600:20::/64"]`, string(encoded), 1))
 	}
-	prefixes := make([]string, 250000)
+	// The enlarged source still fits the 32 MiB source/cache/durable bounds,
+	// and its static-only native input fits 64 MiB. Together with the 200,000
+	// timed prefixes, however, the encoded candidate exceeds 64 MiB before any
+	// mutation. Rejecting that combination must leave the old bans renewable.
+	const staticPrefixes = 700000
+	prefixes := make([]string, staticPrefixes)
 	for index := range prefixes {
 		prefixes[index] = makePrefix(uint32(index)*4, false, 127).String()
 	}
@@ -135,7 +146,10 @@ func TestE2ECrowdSecGeoRefreshCapacity(t *testing.T) {
 	}
 	grow := make(chan struct{})
 	fixture := &refreshCapacitySources{initial: countryBody(prefixes[:1]), enlarged: countryBody(prefixes), decisions: wire, grow: grow}
-	backend := &refreshCapacityBackend{Backend: firewall.NewNative(nil), initial: make(chan *firewall.Target, 1), initialProjection: make(chan []policy.TimedPrefix, 1), refresh: make(chan error, 1)}
+	if len(fixture.enlarged) >= 32<<20 || len(wire) >= 32<<20 {
+		t.Fatalf("fixture exceeds source bound: country=%d decisions=%d", len(fixture.enlarged), len(wire))
+	}
+	backend := &refreshCapacityBackend{Backend: firewall.NewNative(nil), initial: make(chan *firewall.Target, 1), initialProjection: make(chan []policy.TimedPrefix, 1), refresh: make(chan refreshCapacityResult, 1)}
 	key := filepath.Join(t.TempDir(), "key")
 	if err := os.WriteFile(key, []byte("test-key"), 0o600); err != nil {
 		t.Fatal(err)
@@ -223,12 +237,23 @@ policies:
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
+	if len(initialProjection) != 200000 {
+		t.Fatalf("initial effective projection has %d prefixes, want 200000", len(initialProjection))
+	}
 	close(grow)
+	var rejected *firewall.Target
 	select {
-	case err := <-backend.refresh:
-		if err == nil {
-			t.Fatal("static refresh admitted contents that prevent CrowdSec renewal")
+	case result := <-backend.refresh:
+		var capacity *firewall.CapacityError
+		if !errors.As(result.err, &capacity) || capacity.Backend != "nftables" ||
+			capacity.Resource != "nft-table" || capacity.Scope != "input" ||
+			capacity.LimitBytes != 64<<20 || capacity.RequiredBytes <= capacity.LimitBytes ||
+			capacity.StaticGenerations != 2 || capacity.DynamicGenerations != 1 {
+			t.Fatalf("refresh did not reject combined encoded candidate capacity: %+v (%v)", capacity, result.err)
 		}
+		rejected = result.candidate
+		t.Logf("rejected static-prefixes=%d projected-prefixes=%d resource=%s scope=%s required-bytes=%d limit-bytes=%d static-generations=%d dynamic-generations=%d",
+			staticPrefixes, len(initialProjection), capacity.Resource, capacity.Scope, capacity.RequiredBytes, capacity.LimitBytes, capacity.StaticGenerations, capacity.DynamicGenerations)
 	case err := <-done:
 		stopped = true
 		t.Fatalf("runtime stopped during refresh: %v", err)
@@ -262,6 +287,47 @@ policies:
 	}
 	if view.Journal != nil || view.Active == nil || view.Active.Target.Generation != initial.Generation {
 		t.Fatal("rejected refresh changed durable authority")
+	}
+	if rejected == nil || rejected.Generation == initial.Generation || rejected.DynamicGeneration != initial.DynamicGeneration {
+		t.Fatal("refresh did not preserve shared dynamic authority for a distinct static candidate")
+	}
+	var memberships int
+	for _, family := range rejected.Families {
+		for _, set := range family.Sets {
+			if set.ID == "geo/country" {
+				memberships += len(set.Prefixes)
+			}
+		}
+	}
+	if memberships != staticPrefixes {
+		t.Fatalf("rejected candidate has %d country memberships, want %d", memberships, staticPrefixes)
+	}
+	// Rule out the independent durable bound: this is the same revision shape
+	// and envelope as the active selection, with the enlarged target substituted.
+	revision := *view.Active
+	revision.ID = rejected.Generation
+	revision.Target = rejected
+	revision.Epoch++
+	revision.RefreshSequence++
+	payload, err := json.Marshal(revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := json.Marshal(map[string]any{"version": 2, "checksum": strings.Repeat("0", 64), "payload": json.RawMessage(payload)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(record) >= 32<<20 {
+		t.Fatalf("enlarged candidate would fail durable capacity independently: %d bytes", len(record))
+	}
+	t.Logf("admissible country-source-bytes=%d decisions-source-bytes=%d candidate-durable-bytes=%d", len(fixture.enlarged), len(wire), len(record))
+	// A real, read-only preflight without the projected bans must still fit.
+	// This proves the input rejection above is combined static/dynamic pressure,
+	// not an independently oversized source target or retained native inventory.
+	staticCtx, staticCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer staticCancel()
+	if err := backend.Backend.Preflight(staticCtx, initial, rejected, nil); err != nil {
+		t.Fatalf("static refresh alone is not admissible: %v", err)
 	}
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18796", "reject", "tcp")
 	renewCtx, renewCancel := context.WithTimeout(context.Background(), time.Minute)

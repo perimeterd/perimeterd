@@ -167,10 +167,12 @@ func TestE2ECrowdSecLargeSnapshot(t *testing.T) {
 	fixture.set("resync")
 	waitCrowdPacket(t, peer, "tcp4", fixtureIPv4Host+":18784", "success")
 	probeIngress(t, peer, "tcp6", "["+fixtureIPv6Host+"]:18784", "reject", "tcp")
-	resynced := largeCrowdStatus(t)
-	if resynced.Applied.Details == nil || resynced.Applied.Details.CrowdSec.Counts == nil || *resynced.Applied.Details.CrowdSec.Counts != (control.StatusDecisionCounts{IPv6: 1}) {
-		t.Fatalf("valid resync did not replace failed state: %+v", resynced)
-	}
+	waitCrowdCondition(t, "valid resync acknowledged", func() bool {
+		resynced := largeCrowdStatus(t)
+		return resynced.Successful() && resynced.Applied.Details != nil &&
+			resynced.Applied.Details.CrowdSec.Counts != nil &&
+			*resynced.Applied.Details.CrowdSec.Counts == (control.StatusDecisionCounts{IPv6: 1})
+	})
 	daemon.stop(t)
 	for _, mode := range []string{"http", "overflow"} {
 		fixture.set(mode)

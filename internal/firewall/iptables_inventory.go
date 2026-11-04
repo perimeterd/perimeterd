@@ -66,7 +66,8 @@ func (r iptObservedRule) references(kind iptReferenceKind) iter.Seq[string] {
 type (
 	iptObservedChain struct {
 		iptChainKey
-		Rules []iptObservedRule
+		Rules           []iptObservedRule
+		SerializedBytes int64
 	}
 	iptObservedSet struct {
 		Name, Type, Family string
@@ -76,7 +77,7 @@ type (
 		Extended           bool
 		UnknownOptions     bool
 		References         uint64
-		InspectionBytes    int
+		InspectionBytes    int64
 	}
 )
 
@@ -84,12 +85,12 @@ type iptInventory struct {
 	Chains     map[iptChainKey]iptObservedChain
 	Sets       map[string]iptObservedSet
 	Rules      []iptObservedRule
-	TableBytes map[policy.Family]int
-	SetBytes   int
+	TableBytes map[policy.Family]int64
+	SetBytes   int64
 }
 
 func newIPTInventory() *iptInventory {
-	return &iptInventory{Chains: make(map[iptChainKey]iptObservedChain), Sets: make(map[string]iptObservedSet), TableBytes: make(map[policy.Family]int)}
+	return &iptInventory{Chains: make(map[iptChainKey]iptObservedChain), Sets: make(map[string]iptObservedSet), TableBytes: make(map[policy.Family]int64)}
 }
 
 func familyName(family policy.Family) string {
@@ -117,7 +118,7 @@ func (i *IPTables) inspect(ctx context.Context, expectedSets map[string]iptSet) 
 		if err != nil {
 			return nil, err
 		}
-		result.TableBytes[family] = len(output)
+		result.TableBytes[family] = int64(len(output))
 		parsed, err := parseIPTablesSave(family, output)
 		if err != nil {
 			return nil, fmt.Errorf("%s save: %w", familyName(family), err)
@@ -168,8 +169,8 @@ func (i *IPTables) inspectSets(ctx context.Context, expected map[string]iptSet, 
 			// permission to adopt, overwrite, or forget recorded ownership.
 			return err
 		}
-		if len(output) > maxIPTablesOutput-inventory.SetBytes {
-			return errors.New("recorded ipsets exceed inspection limit")
+		if required := inventory.SetBytes + int64(len(output)); required > maxNativeOutputBytes {
+			return &CapacityError{Backend: "iptables", Scope: "output", Resource: "ipsets", RequiredBytes: required, LimitBytes: maxNativeOutputBytes}
 		}
 		sets, err := parseIPSetSave(output)
 		if err != nil {
@@ -183,14 +184,14 @@ func (i *IPTables) inspectSets(ctx context.Context, expected map[string]iptSet, 
 		if err != nil {
 			return err
 		}
-		if len(header) > maxIPTablesOutput-inventory.SetBytes-len(output) {
-			return errors.New("recorded ipsets exceed inspection limit")
+		if required := inventory.SetBytes + int64(len(output)) + int64(len(header)); required > maxNativeOutputBytes {
+			return &CapacityError{Backend: "iptables", Scope: "output", Resource: "ipsets", RequiredBytes: required, LimitBytes: maxNativeOutputBytes}
 		}
 		observed.References, err = parseIPSetReferences(header, name)
 		if err != nil {
 			return err
 		}
-		observed.InspectionBytes = len(output) + len(header)
+		observed.InspectionBytes = int64(len(output)) + int64(len(header))
 		inventory.SetBytes += observed.InspectionBytes
 		inventory.Sets[name] = observed
 	}
@@ -494,15 +495,15 @@ func (i *IPTables) preflightTargets(ctx context.Context, expected *iptExpected, 
 	return inventory, nil
 }
 
-func ipsetInspectionSize(set iptSet) int {
-	size := 1024 // Save definition plus the terse XML header.
+func ipsetInspectionSize(set iptSet) int64 {
+	size := int64(1024) // Save definition plus the terse XML header.
 	entryOverhead := len(set.Name) + 6
 	var buffer [64]byte
 	if set.Dynamic {
 		entryOverhead += len(" timeout ") + len(strconv.AppendUint(buffer[:0], uint64(maximumLease/time.Second), 10))
 	}
 	for _, prefix := range set.Prefixes {
-		size += entryOverhead + len(prefix.AppendTo(buffer[:0]))
+		size += int64(entryOverhead + len(prefix.AppendTo(buffer[:0])))
 	}
 	return size
 }
@@ -510,18 +511,34 @@ func ipsetInspectionSize(set iptSet) int {
 // Leave capture headroom for counters and native formatting. Budget the full
 // rule inventories and recorded sets so staging cannot prevent later inspection.
 func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
-	const budget = 48 << 20
-	setBytes := inventory.SetBytes
-	tableBytes := map[policy.Family]int{policy.IPv4: inventory.TableBytes[policy.IPv4], policy.IPv6: inventory.TableBytes[policy.IPv6]}
-	chainSize := func(chain iptChain) int {
-		size := len(chain.Name) + 64
-		for _, rule := range chain.Rules {
-			size += len(chain.Name) + 128
-			for _, arg := range rule.Args {
-				size += len(arg) + 3
-			}
+	return validateIPTCapacityWithLimits(inventory, expected, maxNativeInputBytes, maxInventoryBudgetBytes)
+}
+
+func iptChainInspectionSize(chain iptChain) int64 {
+	size := int64(len(chain.Name) + 64)
+	for _, rule := range chain.Rules {
+		size += int64(len(chain.Name) + 128)
+		for _, arg := range rule.Args {
+			size += int64(len(arg) + 3)
 		}
-		return size
+	}
+	return size
+}
+
+func validateIPTCapacityWithLimits(inventory *iptInventory, expected *iptExpected, inputLimit, inventoryLimit int64) error {
+	setBytes := inventory.SetBytes
+	tableBytes := map[policy.Family]int64{policy.IPv4: inventory.TableBytes[policy.IPv4], policy.IPv6: inventory.TableBytes[policy.IPv6]}
+	staticIDs, dynamicIDs := make(map[string]bool), make(map[string]bool)
+	for target := range expected.models {
+		if target.Generation != "" {
+			staticIDs[target.Generation] = true
+		}
+		if target.DynamicGeneration != "" {
+			dynamicIDs[target.DynamicGeneration] = true
+		}
+	}
+	capacityError := func(scope, resource string, required, limit int64) error {
+		return &CapacityError{Backend: "iptables", Scope: scope, Resource: resource, RequiredBytes: required, LimitBytes: limit, StaticGenerations: len(staticIDs), DynamicGenerations: len(dynamicIDs)}
 	}
 	for name, set := range expected.sets {
 		observed, exists := inventory.Sets[name]
@@ -546,8 +563,8 @@ func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
 				return err
 			}
 			if len(set.Prefixes) > capacity {
-				// Only resizing holds old live contents alongside a populated
-				// spare. An existing spare is destroyed before either operation.
+				// A resize holds old live contents alongside the populated spare.
+				// An existing spare is destroyed before either operation.
 				planned += observed.InspectionBytes
 			}
 		}
@@ -556,30 +573,61 @@ func validateIPTCapacity(inventory *iptInventory, expected *iptExpected) error {
 		setBytes += max(0, planned-current)
 	}
 	for key, chains := range expected.chains {
-		size := 0
+		observed := inventory.Chains[key]
+		var peak int64
 		for _, chain := range chains {
-			size = max(size, chainSize(chain))
+			size := iptChainInspectionSize(chain)
+			if observed.SerializedBytes > 0 && sameObservedChain(observed, chain) {
+				// The complete captured representation is exact for this variant.
+				size = observed.SerializedBytes
+			}
+			peak = max(peak, size)
 		}
-		tableBytes[key.Family] += size
+		// Subtract only bytes of this exact captured object, never its estimate.
+		// Missing measurements retain conservative headroom.
+		tableBytes[key.Family] += max(0, peak-observed.SerializedBytes)
 	}
+	inputBytes := make(map[policy.Family]int64)
+	attachments := make(map[iptChainKey]map[string]bool)
 	for _, models := range expected.models {
-		for _, model := range models {
-			rules := 4096
+		for family, model := range models {
+			rules := int64(4096)
 			for _, chains := range [][]iptChain{model.Staging, model.Active} {
 				for _, chain := range chains {
-					rules += chainSize(chain)
+					rules += iptChainInspectionSize(chain)
 				}
 			}
 			for _, attachment := range model.Attachments {
-				rules += chainSize(iptChain{Name: attachment.Parent, Rules: []iptRule{attachment.Rule}})
+				size := iptChainInspectionSize(iptChain{Name: attachment.Parent, Rules: []iptRule{attachment.Rule}})
+				rules += size
+				key := chainKey(family, attachment.Parent)
+				rule := iptRuleKey(attachment.Rule.Args)
+				if attachments[key] == nil {
+					attachments[key] = make(map[string]bool)
+				}
+				if !attachments[key][rule] && !observedAttachment(inventory, family, attachment) {
+					tableBytes[family] += size
+				}
+				attachments[key][rule] = true
 			}
-			if rules > maxIPTablesInput {
-				return errors.New("iptables complete family exceeds input budget")
-			}
+			inputBytes[family] = max(inputBytes[family], rules)
 		}
 	}
-	if setBytes > budget || tableBytes[policy.IPv4] > budget || tableBytes[policy.IPv6] > budget {
-		return errors.New("iptables retained generations exceed inspection budget")
+	// Stable resource order makes multi-resource failures reproducible.
+	if setBytes > inventoryLimit {
+		return capacityError("inventory", "ipsets", setBytes, inventoryLimit)
+	}
+	for _, family := range []policy.Family{policy.IPv4, policy.IPv6} {
+		resource := "ipv4-rules"
+		if family == policy.IPv6 {
+			resource = "ipv6-rules"
+		}
+		if tableBytes[family] > inventoryLimit {
+			return capacityError("inventory", resource, tableBytes[family], inventoryLimit)
+		}
+		if inputBytes[family] > inputLimit {
+			return capacityError("input", resource, inputBytes[family], inputLimit)
+		}
 	}
 	return nil
 }

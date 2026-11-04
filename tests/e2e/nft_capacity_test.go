@@ -43,6 +43,13 @@ const capacityHelper = "PERIMETERD_CAPACITY_HELPER"
 type capacityTransport struct{ local *url.URL }
 
 func (c capacityTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Host == "download.db-ip.com" && os.Getenv("PERIMETERD_CAPACITY_DBIP_FILE") != "" {
+		forwarded := request.Clone(request.Context())
+		endpoint := *c.local
+		endpoint.Path = "/dbip"
+		forwarded.URL, forwarded.Host = &endpoint, endpoint.Host
+		return http.DefaultTransport.RoundTrip(forwarded)
+	}
 	if strings.Contains(request.URL.Path, "country-resource-list") {
 		forwarded := request.Clone(request.Context())
 		endpoint := *c.local
@@ -76,6 +83,7 @@ func TestE2ECapacityDaemonHelper(t *testing.T) {
 		lockPath = "/run/perimeterd/owner.lock"
 	}
 	checkpoint := os.Getenv("PERIMETERD_CAPACITY_CRASH")
+	checkpointPhase := os.Getenv("PERIMETERD_CAPACITY_CRASH_PHASE")
 	err = app.Run(context.Background(), app.Options{
 		ConfigPath:   os.Getenv("PERIMETERD_CAPACITY_CONFIG"),
 		StateDir:     stateDir,
@@ -84,6 +92,26 @@ func TestE2ECapacityDaemonHelper(t *testing.T) {
 		Stderr:       os.Stderr,
 		Checkpoint: func(label string) error {
 			if checkpoint != "" && checkpoint == label {
+				distinct := os.Getenv("PERIMETERD_CAPACITY_CRASH_DISTINCT") == "1"
+				if distinct || checkpointPhase != "" {
+					store, err := state.Open(stateDir, nil)
+					if err != nil {
+						return err
+					}
+					view, err := store.Read()
+					if err != nil {
+						return err
+					}
+					if view.Journal == nil || (checkpointPhase != "" && view.Journal.Phase != checkpointPhase) {
+						return nil
+					}
+					if distinct {
+						previous, candidate := view.Revisions[view.Journal.Previous], view.Revisions[view.Journal.Candidate]
+						if previous == nil || candidate == nil || previous.ID == candidate.ID || previous.Target.Generation == candidate.Target.Generation {
+							return nil
+						}
+					}
+				}
 				os.Exit(97)
 			}
 			if label == "after-switch" {
@@ -116,11 +144,15 @@ type capacitySources struct {
 }
 
 func newCapacitySources(t *testing.T) (*capacitySources, *httptest.Server) {
+	return newCapacitySourcesFor(t, capacityfixture.Records)
+}
+
+func newCapacitySourcesFor(t *testing.T, records func(bool) []policy.ResolvedSelector) (*capacitySources, *httptest.Server) {
 	t.Helper()
 	f := &capacitySources{until: time.Now().Add(2 * time.Hour)}
 	for variant := range 2 {
 		f.countries[variant] = make(map[string][]byte)
-		for _, record := range capacityfixture.Records(variant == 1) {
+		for _, record := range records(variant == 1) {
 			v4, v6 := make([]string, 0, len(record.IPv4)), make([]string, 0, len(record.IPv6))
 			for _, prefix := range record.IPv4 {
 				v4 = append(v4, prefix.String())
@@ -259,7 +291,7 @@ func capacityAssertState(t *testing.T, ssh bool) *state.Revision {
 
 func capacityMeasure(t *testing.T, daemon *daemonProcess, table, phase string, started time.Time) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	// #nosec G204 -- table comes from the fixed local fixture in verified private namespaces.
 	cmd := exec.CommandContext(ctx, "nft", "-j", "list", "table", "inet", table)
@@ -695,7 +727,7 @@ func capacityOverBudgetStartup(t *testing.T, sourceURL string) {
 	// once in the compiled target, not duplicated in literal configuration.
 	// Short, sparse addresses fit the source-object limit but their nft prefix
 	// expressions exceed native input capacity after compilation.
-	const count = 900_000
+	const count = 1_800_000
 	cfg, err := config.Parse([]byte(`version: 1
 geo:
   country_provider: ripestat

@@ -47,10 +47,10 @@ func TestNFTCapacityChargesReusedNativeIdentityOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := pair.check(maxNFTInput, budget); err != nil {
+		if err := pair.check(maxNativeInputBytes, budget); err != nil {
 			t.Fatalf("same identity failed single-generation budget: %v", err)
 		}
-		if err := pair.check(maxNFTInput, budget-1); err == nil {
+		if err := pair.check(maxNativeInputBytes, budget-1); err == nil {
 			t.Fatal("inventory accepted one byte above its budget")
 		}
 	}
@@ -61,7 +61,7 @@ func TestNFTCapacityChargesReusedNativeIdentityOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	var capacity *CapacityError
-	err = pair.check(maxNFTInput, budget)
+	err = pair.check(maxNativeInputBytes, budget)
 	if !errors.As(fmt.Errorf("wrapped: %w", errors.Join(errors.New("other cause"), err)), &capacity) || capacity.RequiredBytes <= budget || capacity.LimitBytes != budget || capacity.StaticGenerations != 2 || capacity.RecoveryRetryable() {
 		t.Fatalf("distinct transition lost bounded capacity diagnostic: %+v %v", capacity, err)
 	}
@@ -108,7 +108,7 @@ func TestNFTCapacityAccountsIndependentStaticAndDynamicIdentity(t *testing.T) {
 	budget := one.tables[target.Table].estimate()
 	copy := capacityClone(target)
 	shared, err := validateNFTCapacity(t.Context(), target, copy, projection)
-	if err != nil || shared.check(maxNFTInput, budget) != nil {
+	if err != nil || shared.check(maxNativeInputBytes, budget) != nil {
 		t.Fatalf("shared static/dynamic identity charged twice: %v", err)
 	}
 	copy.Generation = testGenB
@@ -180,15 +180,15 @@ func TestNFTCapacityIncludesRetainedLiveLeases(t *testing.T) {
 	// Existing native JSON plus one element-command allowance must fit without
 	// applying the command-to-inventory expansion factor a second time.
 	observedBudget := before + int64(len(encoded)) + 1024
-	if err := capacity.check(maxNFTInput, observedBudget); err != nil {
+	if err := capacity.check(maxNativeInputBytes, observedBudget); err != nil {
 		t.Fatalf("already-native leases charged representation expansion twice: %v", err)
 	}
 	var boundary *CapacityError
-	if err := capacity.check(maxNFTInput, observedBudget-1); !errors.As(err, &boundary) || boundary.Scope != "inventory" {
+	if err := capacity.check(maxNativeInputBytes, observedBudget-1); !errors.As(err, &boundary) || boundary.Scope != "inventory" {
 		t.Fatalf("observed inventory exceeded its finite budget: %v", err)
 	}
 	var exceeded *CapacityError
-	if err := capacity.check(maxNFTInput, before); !errors.As(err, &exceeded) || exceeded.DynamicGenerations != 2 {
+	if err := capacity.check(maxNativeInputBytes, before); !errors.As(err, &exceeded) || exceeded.DynamicGenerations != 2 {
 		t.Fatalf("old live authority was omitted from transition: %v", err)
 	}
 	// Observing the same retained identity again must not accumulate its cost.
@@ -196,7 +196,7 @@ func TestNFTCapacityIncludesRetainedLiveLeases(t *testing.T) {
 	if err := capacity.observe(t.Context(), target.Table, inventory); err != nil {
 		t.Fatal(err)
 	}
-	if err := capacity.check(maxNFTInput, after); err != nil {
+	if err := capacity.check(maxNativeInputBytes, after); err != nil {
 		t.Fatalf("retained dynamic inventory double counted: %v", err)
 	}
 }

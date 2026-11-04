@@ -33,6 +33,11 @@ type peerNamespace struct {
 
 func newPeerNamespace(t *testing.T) *peerNamespace {
 	t.Helper()
+	return newPeerNamespaceFor(t, 15*time.Minute)
+}
+
+func newPeerNamespaceFor(t *testing.T, lifetime time.Duration) *peerNamespace {
+	t.Helper()
 	// Local OUTPUT rejections deliver their ICMP errors through loopback.
 	// A fresh network namespace starts with lo down.
 	command(t, 10*time.Second, "ip", "link", "set", "lo", "up")
@@ -40,8 +45,10 @@ func newPeerNamespace(t *testing.T) *peerNamespace {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Keep the namespace alive for the isolated harness's full 15-minute budget.
-	proc := exec.Command("unshare", "--net", "--kill-child", "--fork", "sleep", "900")
+	// The peer lifetime must cover its enclosing isolated scenario, including
+	// the longer production-scale lifecycle gate.
+	// #nosec G204 -- fixed namespace/sleep executables with an integer-only fixture lifetime argument.
+	proc := exec.Command("unshare", "--net", "--kill-child", "--fork", "sleep", strconv.FormatInt(int64(lifetime/time.Second), 10))
 	if err := proc.Start(); err != nil {
 		t.Fatalf("start peer network namespace: %v", err)
 	}

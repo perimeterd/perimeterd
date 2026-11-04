@@ -311,7 +311,7 @@ func TestRunPermanentRecoveryFailsBeforeReadingYAML(t *testing.T) {
 	if err := store.Prepare(active, active); err != nil {
 		t.Fatal(err)
 	}
-	capacity := &firewall.CapacityError{RequiredBytes: 200, LimitBytes: 100}
+	capacity := &firewall.CapacityError{Backend: "iptables", Resource: "ipsets", Scope: "inventory", RequiredBytes: 200, LimitBytes: 100}
 	backend := &recordingBackend{applyErr: capacity, applyFailures: 2}
 	var logs bytes.Buffer
 	err := Run(context.Background(), Options{
@@ -322,11 +322,47 @@ func TestRunPermanentRecoveryFailsBeforeReadingYAML(t *testing.T) {
 	if !errors.Is(err, capacity) || backend.applyFailures != 1 {
 		t.Fatalf("startup did not stop at first capacity failure: %v, remaining=%d", err, backend.applyFailures)
 	}
-	if !strings.Contains(logs.String(), `"required_bytes":200`) || !strings.Contains(logs.String(), `"limit_bytes":100`) {
+	if !strings.Contains(logs.String(), `"required_bytes":200`) || !strings.Contains(logs.String(), `"limit_bytes":100`) ||
+		!strings.Contains(logs.String(), `"backend":"iptables"`) || !strings.Contains(logs.String(), `"resource":"ipsets"`) || !strings.Contains(logs.String(), `"scope":"inventory"`) {
 		t.Fatalf("early capacity log lacks actionable dimensions: %s", logs.String())
 	}
 	view, err := store.Read()
 	if err != nil || view.Active == nil || view.Active.ID != active.ID || view.Journal == nil || view.Journal.Phase != "prepared" {
 		t.Fatalf("failed startup changed durable state: %+v, %v", view, err)
+	}
+}
+
+type initialCapacityBackend struct {
+	recordingBackend
+	err error
+}
+
+func (b *initialCapacityBackend) Preflight(context.Context, *firewall.Target, *firewall.Target, *firewall.DynamicState) error {
+	return b.err
+}
+
+func TestRunInitialCapacityFailureHasSafeNumericDiagnostics(t *testing.T) {
+	for _, resource := range []string{"ipsets", "untrusted-secret-prefix"} {
+		t.Run(resource, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "policy.yaml")
+			writeRunConfig(t, path, runAddress(t), "8.8.8.8/32")
+			capacity := &firewall.CapacityError{Backend: "iptables", Resource: resource, Scope: "inventory", RequiredBytes: 201, LimitBytes: 100}
+			backend := &initialCapacityBackend{err: fmt.Errorf("untrusted-native-secret: %w", capacity)}
+			var logs bytes.Buffer
+			err := Run(t.Context(), Options{
+				ConfigPath: path, StateDir: filepath.Join(dir, "state"), LockPath: filepath.Join(dir, "run", "owner.lock"),
+				Backend: backend, Stderr: &logs, Signals: make(chan os.Signal), Notify: func(string) error { return nil },
+			})
+			if !errors.Is(err, capacity) {
+				t.Fatalf("initial startup lost capacity cause: %v", err)
+			}
+			for _, diagnostic := range []string{logs.String(), err.Error()} {
+				if strings.Contains(diagnostic, "untrusted-") || !strings.Contains(diagnostic, "201") || !strings.Contains(diagnostic, "100") ||
+					!strings.Contains(diagnostic, capacity.SafeResource()) || !strings.Contains(diagnostic, "iptables") || !strings.Contains(diagnostic, "inventory") {
+					t.Fatalf("unsafe or incomplete initial capacity diagnostic: %s", diagnostic)
+				}
+			}
+		})
 	}
 }

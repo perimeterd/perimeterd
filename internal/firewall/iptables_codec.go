@@ -180,12 +180,18 @@ func splitIPTLine(line string) ([]string, []bool, error) {
 }
 
 func parseIPTablesSave(family policy.Family, data []byte) (*iptInventory, error) {
-	if len(data) > maxIPTablesOutput {
-		return nil, errors.New("oversized iptables save")
+	if len(data) > maxNativeOutputBytes {
+		return nil, &CapacityError{Backend: "iptables", Resource: iptRuleResource(family), Scope: "output", RequiredBytes: int64(len(data)), LimitBytes: maxNativeOutputBytes}
 	}
 	result := newIPTInventory()
 	table := ""
+	offset := 0
 	for lineNo, raw := range iptSaveRecords(string(data)) {
+		recordBytes := len(raw)
+		if offset+recordBytes < len(data) {
+			recordBytes++ // Include only a newline actually captured.
+		}
+		offset += recordBytes
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -216,7 +222,7 @@ func parseIPTablesSave(family policy.Family, data []byte) (*iptInventory, error)
 			if _, exists := result.Chains[key]; exists {
 				return nil, errors.New("duplicate chain")
 			}
-			result.Chains[key] = iptObservedChain{iptChainKey: key}
+			result.Chains[key] = iptObservedChain{iptChainKey: key, SerializedBytes: int64(recordBytes)}
 			continue
 		}
 		var packets, byteCount uint64
@@ -257,6 +263,7 @@ func parseIPTablesSave(family policy.Family, data []byte) (*iptInventory, error)
 		rule := iptObservedRule{iptChainKey: key, Args: tokens[2:], Packets: packets, Bytes: byteCount, HasCounters: hasCounters}
 		rule.References = iptRuleReferences(tokens[2:], literals[2:])
 		chain.Rules = append(chain.Rules, rule)
+		chain.SerializedBytes += int64(recordBytes)
 		result.Chains[key] = chain
 		result.Rules = append(result.Rules, rule)
 	}

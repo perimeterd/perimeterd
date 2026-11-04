@@ -138,12 +138,12 @@ func TestIPTablesCapacityPreservesInspectionHeadroom(t *testing.T) {
 	if err := validateIPTCapacity(inventory, expected); err != nil {
 		t.Fatal(err)
 	}
-	inventory.SetBytes = 48 << 20
+	inventory.SetBytes = maxInventoryBudgetBytes
 	if err := validateIPTCapacity(inventory, expected); err == nil {
 		t.Fatal("staging could consume ipset inspection headroom")
 	}
 	inventory.SetBytes = 0
-	inventory.TableBytes[policy.IPv4] = 48 << 20
+	inventory.TableBytes[policy.IPv4] = maxInventoryBudgetBytes
 	if err := validateIPTCapacity(inventory, expected); err == nil {
 		t.Fatal("staging could consume rule inspection headroom")
 	}

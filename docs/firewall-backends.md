@@ -255,18 +255,34 @@ observed size; only projected command JSON receives representation headroom.
 An atomic dynamic replacement reserves the larger normalized old/new cost,
 not their sum.
 
-The coordinated internal nft limits are finite and not YAML settings:
+Both native backends use one finite, package-private limit triplet, not YAML
+settings. Equal byte limits do not imply equal policy capacity:
 
-| Boundary | Limit | Purpose |
+| Boundary | Limit | Scope |
 | --- | --- | --- |
-| Encoded mutation input | 32 MiB (33,554,432 bytes) | Bound each generated native batch. |
-| Per-table inventory budget | 96 MiB (100,663,296 bytes) | Admit the conservative unique-object estimate and bound the observed inventory. |
-| Captured native output | 128 MiB (134,217,728 bytes) | Bound complete inspection output, including representation overhead. |
+| Mutation input | 64 MiB (67,108,864 bytes) | Each native invocation; ipset restore is split on whole command boundaries. |
+| Inventory admission | 256 MiB (268,435,456 bytes) | nftables: unique retained objects per table, including live/projected dynamic contents and representation headroom. iptables: aggregate recorded ipsets, and independently each family's full rule inventory, including foreign rules. |
+| Native output | 384 MiB (402,653,184 bytes) | Each captured stdout/stderr stream; aggregate recorded-ipset and counter capture also remain bounded. |
+
+Native-call deadlines remain backend-specific: nftables is bounded at 120
+seconds; iptables/ipset remains at 30 seconds. Complete admitted sparse nft
+inventories exceeded the former 30-second deadline in
+[native measurements](development.md#shared-db-ip-era-capacity-gate). Source,
+CLI reload, server, and service-manager deadlines are separate and unchanged.
 
 The estimator encodes only small command metadata and counts canonical prefix
 representations in cancellation-aware chunks; it does not marshal full batches
 or allocate element maps to estimate them. These byte limits are not daemon,
-native-child, or kernel RSS guarantees. iptables/ipset limits are unchanged.
+native-child, or kernel RSS guarantees. Two output streams and parsed
+representations can coexist; buffers do not preallocate to these ceilings.
+
+iptables uses its own text-size estimator, not the nft JSON estimator.
+Observed chains are charged once using their complete captured serialized
+bytes, plus any genuinely additional peak staging/active representation.
+Foreign rule bytes and missing attachment additions remain charged.
+In-place ipset updates delete obsolete entries before replacements; resizing
+reserves both old live contents and a newly populated spare. Unlike nft atomic
+replacement, that peak is not `max(old,new)`.
 
 Inspection decodes one native object at a time rather than retaining multiple
 complete JSON envelopes. It still requires a complete, bounded, structurally
@@ -274,11 +290,15 @@ valid inventory and all existing ownership/content/reference checks. Truncation,
 overflow, malformed JSON, missing witnesses, and foreign objects never authorize
 partial-inventory cleanup or mutation.
 
-Capacity failures carry a typed cause with safe numeric required/limit bytes
-and retained static/dynamic generation counts where known. An unchanged retry
-cannot repair them; see [startup recovery diagnostics](operations.md#recovery-before-validation).
-In particular, a retained-generation capacity error does not prove that stale
-kernel objects exist.
+Capacity failures carry a typed cause with allowlisted backend, scope and
+resource categories, safe numeric required/limit bytes, and distinct retained
+static/dynamic generation counts where known. Zero generation counts can mean
+unknown, not an empty inventory. For native output overflow, required bytes are
+the observed lower bound at interruption, not the full discarded output size.
+An unchanged retry cannot repair capacity failure; see
+[startup recovery diagnostics](operations.md#recovery-before-validation).
+A retained-generation capacity error does not prove stale kernel objects exist:
+a first start can exceed a combined static/dynamic budget too.
 
 ## iptables and ipset
 

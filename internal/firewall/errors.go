@@ -2,10 +2,12 @@ package firewall
 
 import "fmt"
 
-// CapacityError rejects an operation before mutation when bounded installation
-// or complete-inventory inspection cannot safely contain its retained objects.
+// CapacityError rejects work when bounded installation or complete inventory
+// inspection cannot safely contain it, including failures found during inspection.
 // It exposes numbers, never targets, prefixes, credentials or native diagnostics.
 type CapacityError struct {
+	Backend            string
+	Resource           string
 	Scope              string
 	RequiredBytes      int64
 	LimitBytes         int64
@@ -14,12 +16,37 @@ type CapacityError struct {
 }
 
 func (e *CapacityError) Error() string {
-	scope := "inventory"
-	switch e.Scope {
-	case "input", "output":
-		scope = e.Scope
+	return fmt.Sprintf("%s backend: %s %s capacity exceeded: required %d bytes, limit %d bytes (%d static generations, %d dynamic generations; zero counts may be unknown)", e.SafeBackend(), e.SafeResource(), e.SafeScope(), e.RequiredBytes, e.LimitBytes, e.StaticGenerations, e.DynamicGenerations)
+}
+
+// SafeBackend returns only local diagnostic categories, never supplied names.
+func (e *CapacityError) SafeBackend() string {
+	switch e.Backend {
+	case "nftables", "iptables":
+		return e.Backend
+	default:
+		return "unknown"
 	}
-	return fmt.Sprintf("nft backend: %s capacity exceeded: required %d bytes, limit %d bytes (%d static generations, %d dynamic generations)", scope, e.RequiredBytes, e.LimitBytes, e.StaticGenerations, e.DynamicGenerations)
+}
+
+// SafeResource returns only local diagnostic categories, never supplied names.
+func (e *CapacityError) SafeResource() string {
+	switch e.Resource {
+	case "nft-table", "ipsets", "ipv4-rules", "ipv6-rules", "native-io":
+		return e.Resource
+	default:
+		return "unknown"
+	}
+}
+
+// SafeScope returns only local diagnostic categories, never supplied names.
+func (e *CapacityError) SafeScope() string {
+	switch e.Scope {
+	case "input", "inventory", "output":
+		return e.Scope
+	default:
+		return "unknown"
+	}
 }
 
 // RecoveryRetryable distinguishes unchanged over-capacity state from transient

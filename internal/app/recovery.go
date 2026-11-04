@@ -87,11 +87,7 @@ func recoveryReporter(ctx context.Context, logger *slog.Logger, notifier *startu
 	return func(err error, attempt int, delay time.Duration) {
 		cause := recoveryCause(err, ctx.Err())
 		attrs := []any{"cause", cause, "attempt", attempt, "retry_delay", delay}
-		var capacity *firewall.CapacityError
-		if errors.As(err, &capacity) {
-			attrs = append(attrs, "required_bytes", capacity.RequiredBytes, "limit_bytes", capacity.LimitBytes,
-				"static_generations", capacity.StaticGenerations, "dynamic_generations", capacity.DynamicGenerations)
-		}
+		attrs = appendCapacityAttrs(attrs, err)
 		logger.Warn("firewall recovery failed", attrs...)
 		if notifier != nil {
 			status := "recovery blocked: " + cause
@@ -103,20 +99,35 @@ func recoveryReporter(ctx context.Context, logger *slog.Logger, notifier *startu
 	}
 }
 
+func appendCapacityAttrs(attrs []any, err error) []any {
+	var capacity *firewall.CapacityError
+	if errors.As(err, &capacity) {
+		attrs = append(attrs, "backend", capacity.SafeBackend(), "resource", capacity.SafeResource(), "scope", capacity.SafeScope(),
+			"required_bytes", capacity.RequiredBytes, "limit_bytes", capacity.LimitBytes,
+			"static_generations", capacity.StaticGenerations, "dynamic_generations", capacity.DynamicGenerations)
+	}
+	return attrs
+}
+
 // startupRecoveryError sanitizes the final CLI diagnostic once, at the process
 // boundary. Unwrap retains native/state causes for errors.Is and errors.As.
 type startupRecoveryError struct {
 	err        error
 	contextErr error
+	initial    bool
 }
 
 func (e *startupRecoveryError) Error() string {
+	prefix := "startup recovery failed: "
+	if e.initial {
+		prefix = "startup failed: "
+	}
 	var capacity *firewall.CapacityError
 	if errors.As(e.err, &capacity) {
-		return fmt.Sprintf("startup recovery failed: firewall capacity exceeded (required_bytes=%d limit_bytes=%d static_generations=%d dynamic_generations=%d)",
-			capacity.RequiredBytes, capacity.LimitBytes, capacity.StaticGenerations, capacity.DynamicGenerations)
+		return fmt.Sprintf("%sfirewall capacity exceeded (backend=%s resource=%s scope=%s required_bytes=%d limit_bytes=%d static_generations=%d dynamic_generations=%d)",
+			prefix, capacity.SafeBackend(), capacity.SafeResource(), capacity.SafeScope(), capacity.RequiredBytes, capacity.LimitBytes, capacity.StaticGenerations, capacity.DynamicGenerations)
 	}
-	return "startup recovery failed: " + recoveryCause(e.err, e.contextErr)
+	return prefix + recoveryCause(e.err, e.contextErr)
 }
 
 func (e *startupRecoveryError) Unwrap() error { return e.err }

@@ -21,7 +21,7 @@ import (
 const (
 	recordVersion  = 2
 	idLength       = 32
-	maxRecordBytes = 16 << 20
+	maxRecordBytes = 32 << 20
 	stateDirMode   = 0o700
 	recordFileMode = 0o600
 )

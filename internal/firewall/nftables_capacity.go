@@ -49,7 +49,7 @@ func validateNFTCapacity(ctx context.Context, previous, candidate *Target, dynam
 			return nil, err
 		}
 	}
-	return capacity, capacity.check(maxNFTInput, maxNFTInventoryBudget)
+	return capacity, capacity.check(maxNativeInputBytes, maxInventoryBudgetBytes)
 }
 
 func collectNFTCapacity(ctx context.Context, targets ...*Target) (*nftCapacity, error) {
@@ -290,10 +290,10 @@ func (c *nftCapacity) observe(ctx context.Context, tableName string, inventory *
 			entry.observedBytes = int64(len(observed.Elem))
 		}
 	}
-	if int64(inventory.sizeBytes) > maxNFTInventoryBudget {
-		return table.capacityError("inventory", int64(inventory.sizeBytes), maxNFTInventoryBudget)
+	if int64(inventory.sizeBytes) > maxInventoryBudgetBytes {
+		return table.capacityError("inventory", int64(inventory.sizeBytes), maxInventoryBudgetBytes)
 	}
-	return c.check(maxNFTInput, maxNFTInventoryBudget)
+	return c.check(maxNativeInputBytes, maxInventoryBudgetBytes)
 }
 
 func (t *nftTableCapacity) estimate() int64 {
@@ -316,19 +316,35 @@ func (t *nftTableCapacity) estimate() int64 {
 }
 
 func (t *nftTableCapacity) capacityError(scope string, required, limit int64) *CapacityError {
-	return &CapacityError{Scope: scope, RequiredBytes: required, LimitBytes: limit, StaticGenerations: len(t.staticIDs), DynamicGenerations: len(t.dynamicIDs)}
+	return &CapacityError{Backend: "nftables", Resource: "nft-table", Scope: scope, RequiredBytes: required, LimitBytes: limit, StaticGenerations: len(t.staticIDs), DynamicGenerations: len(t.dynamicIDs)}
 }
 
 func (c *nftCapacity) check(inputLimit, inventoryLimit int64) error {
+	// Report input before inventory, selecting the largest requirement within a
+	// scope. Tie-breaking counts keep diagnostics stable across map iteration.
+	var failure *CapacityError
+	selectFailure := func(candidate *CapacityError) {
+		if failure == nil || candidate.RequiredBytes > failure.RequiredBytes ||
+			candidate.RequiredBytes == failure.RequiredBytes && (candidate.StaticGenerations > failure.StaticGenerations ||
+				candidate.StaticGenerations == failure.StaticGenerations && candidate.DynamicGenerations > failure.DynamicGenerations) {
+			failure = candidate
+		}
+	}
 	for target, size := range c.inputs {
 		if size > inputLimit {
-			return c.tables[target.Table].capacityError("input", size, inputLimit)
+			selectFailure(c.tables[target.Table].capacityError("input", size, inputLimit))
 		}
+	}
+	if failure != nil {
+		return failure
 	}
 	for _, table := range c.tables {
 		if size := table.estimate(); size > inventoryLimit {
-			return table.capacityError("inventory", size, inventoryLimit)
+			selectFailure(table.capacityError("inventory", size, inventoryLimit))
 		}
+	}
+	if failure != nil {
+		return failure
 	}
 	return nil
 }

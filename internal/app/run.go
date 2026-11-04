@@ -118,10 +118,11 @@ func Run(ctx context.Context, options Options) (resultErr error) {
 		if resultErr != nil && !startupComplete {
 			_ = stopNotifier()
 			cause := recoveryCause(resultErr, startupCtx.Err())
-			bootstrapLogger.Error("startup failed", "cause", cause)
+			bootstrapLogger.Error("startup failed", appendCapacityAttrs([]any{"cause", cause}, resultErr)...)
 			resultErr = errors.Join(resultErr, opts.Notify("STATUS=startup failed: "+cause))
-			if startupRecoveryFailed {
-				resultErr = &startupRecoveryError{err: resultErr, contextErr: startupCtx.Err()}
+			var capacity *firewall.CapacityError
+			if startupRecoveryFailed || errors.As(resultErr, &capacity) {
+				resultErr = &startupRecoveryError{err: resultErr, contextErr: startupCtx.Err(), initial: !startupRecoveryFailed}
 			}
 		}
 	}()

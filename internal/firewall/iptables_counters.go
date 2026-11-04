@@ -27,17 +27,17 @@ func (i *IPTables) SnapshotCounters(ctx context.Context, target *Target) (map[st
 		return nil, err
 	}
 	inventory := newIPTInventory()
-	var outputBytes int
+	var outputBytes int64
 	for _, familyPlan := range target.Families {
 		family := familyPlan.Family
 		output, err := i.run(ctx, familyTool(family, "-save"), []string{"--counters"}, nil)
 		if err != nil {
 			return nil, fmt.Errorf("%s counter snapshot: %w", familyName(family), err)
 		}
-		if len(output) > maxIPTablesOutput-outputBytes {
-			return nil, errors.New("iptables counter snapshot exceeds output limit")
+		outputBytes += int64(len(output))
+		if outputBytes > maxNativeOutputBytes {
+			return nil, &CapacityError{Backend: "iptables", Resource: "native-io", Scope: "output", RequiredBytes: outputBytes, LimitBytes: maxNativeOutputBytes}
 		}
-		outputBytes += len(output)
 		parsed, err := parseIPTablesSave(family, output)
 		if err != nil {
 			return nil, fmt.Errorf("%s counter snapshot: %w", familyName(family), err)

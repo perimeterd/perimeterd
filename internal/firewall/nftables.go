@@ -14,11 +14,7 @@ import (
 	"github.com/perimeterd/perimeterd/internal/policy"
 )
 
-const (
-	maxNFTOutput          = 128 << 20
-	maxNFTInput           = 32 << 20
-	maxNFTInventoryBudget = 96 << 20
-)
+const maxNFTTime = 120 * time.Second
 
 type nftExecutor func(context.Context, []string, []byte) ([]byte, error)
 
@@ -34,7 +30,7 @@ type NFT struct {
 func NewNFT() *NFT { return &NFT{exec: nativeNFTExecutor, retirement: &counterRetirementReporter{}} }
 
 func nativeNFTExecutor(ctx context.Context, args []string, input []byte) ([]byte, error) {
-	return executeNative(ctx, "nft", args, input, maxNFTInput, maxNFTOutput)
+	return executeNative(ctx, "nft", args, input, maxNativeInputBytes, maxNativeOutputBytes)
 }
 
 func validateNFTTarget(target *Target) error {
@@ -47,8 +43,8 @@ func validateNFTTarget(target *Target) error {
 	return nil
 }
 
-func nftInspectionBudget(encodedBytes, commands int) int {
-	return 2*encodedBytes + 1024*commands + 4096
+func nftInspectionBudget(encodedBytes, commands int) int64 {
+	return 2*int64(encodedBytes) + 1024*int64(commands) + 4096
 }
 
 type nftObject struct {
@@ -127,12 +123,15 @@ func (n *NFT) run(ctx context.Context, args []string, input []byte) ([]byte, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	commandCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if len(input) > maxNativeInputBytes {
+		return nil, &CapacityError{Backend: "nftables", Resource: "native-io", Scope: "input", RequiredBytes: int64(len(input)), LimitBytes: maxNativeInputBytes}
+	}
+	commandCtx, cancel := context.WithTimeout(ctx, maxNFTTime)
 	defer cancel()
 	output, err := n.exec(commandCtx, args, input)
 	var overflow *nativeOutputLimitError
 	if errors.As(err, &overflow) {
-		return nil, &CapacityError{Scope: "output", RequiredBytes: int64(overflow.required), LimitBytes: int64(overflow.limit)}
+		return nil, errors.Join(&CapacityError{Backend: "nftables", Resource: "native-io", Scope: "output", RequiredBytes: overflow.required, LimitBytes: int64(overflow.limit)}, err)
 	}
 	return output, err
 }
@@ -142,7 +141,7 @@ func (n *NFT) listTables(ctx context.Context) ([]nftObject, error) {
 	if err != nil {
 		return nil, err
 	}
-	return decodeNFTObjects(ctx, data, maxNFTOutput)
+	return decodeNFTObjects(ctx, data, maxNativeOutputBytes)
 }
 
 func (n *NFT) listTable(ctx context.Context, table string) ([]nftObject, int, error) {
@@ -157,7 +156,7 @@ func (n *NFT) listTable(ctx context.Context, table string) ([]nftObject, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	objects, err := decodeNFTObjects(ctx, data, maxNFTOutput)
+	objects, err := decodeNFTObjects(ctx, data, maxNativeOutputBytes)
 	return objects, len(data), err
 }
 
@@ -256,7 +255,7 @@ func decodeNFTObjects(ctx context.Context, data []byte, limit int) (objects []nf
 		return nil, err
 	}
 	if len(data) > limit {
-		return nil, &CapacityError{Scope: "output", RequiredBytes: int64(len(data)), LimitBytes: int64(limit)}
+		return nil, &CapacityError{Backend: "nftables", Resource: "nft-table", Scope: "output", RequiredBytes: int64(len(data)), LimitBytes: int64(limit)}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.UseNumber()
@@ -764,7 +763,7 @@ func (n *NFT) readWitness(ctx context.Context, target *Target) error {
 	if err != nil {
 		return fmt.Errorf("nft backend: ownership witness read-back: %w", err)
 	}
-	objects, err := decodeNFTObjects(ctx, data, maxNFTOutput)
+	objects, err := decodeNFTObjects(ctx, data, maxNativeOutputBytes)
 	if err != nil {
 		return err
 	}
@@ -903,8 +902,8 @@ func encodeNFTBatch(batch nftBatch) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nft backend: encode batch: %w", err)
 	}
-	if len(data) > maxNFTInput {
-		return nil, &CapacityError{Scope: "input", RequiredBytes: int64(len(data)), LimitBytes: maxNFTInput}
+	if len(data) > maxNativeInputBytes {
+		return nil, &CapacityError{Backend: "nftables", Resource: "nft-table", Scope: "input", RequiredBytes: int64(len(data)), LimitBytes: maxNativeInputBytes}
 	}
 	return data, nil
 }
@@ -976,9 +975,9 @@ func (n *NFT) UpdateDynamic(ctx context.Context, target *Target, desired []polic
 	if err != nil {
 		return err
 	}
-	required := int64(retainedBytes) + int64(nftInspectionBudget(len(data), len(batch.Nftables)))
-	if required > maxNFTInventoryBudget {
-		return &CapacityError{Scope: "inventory", RequiredBytes: required, LimitBytes: maxNFTInventoryBudget, StaticGenerations: 1, DynamicGenerations: 1}
+	required := int64(retainedBytes) + nftInspectionBudget(len(data), len(batch.Nftables))
+	if required > maxInventoryBudgetBytes {
+		return &CapacityError{Backend: "nftables", Resource: "nft-table", Scope: "inventory", RequiredBytes: required, LimitBytes: maxInventoryBudgetBytes, StaticGenerations: 1, DynamicGenerations: 1}
 	}
 	_, err = n.run(ctx, []string{"-j", "-f", "-"}, data)
 	return err
@@ -992,7 +991,7 @@ func (n *NFT) Retire(ctx context.Context, previous, candidate *Target) error {
 	if err != nil {
 		return err
 	}
-	if err := capacity.check(maxNFTInput, maxNFTInventoryBudget); err != nil {
+	if err := capacity.check(maxNativeInputBytes, maxInventoryBudgetBytes); err != nil {
 		return err
 	}
 	// A nil candidate is the committed empty-state retirement. A nil previous
@@ -1136,7 +1135,7 @@ func (n *NFT) Cleanup(ctx context.Context, targets []*Target) error {
 	if err != nil {
 		return err
 	}
-	if err := capacity.check(maxNFTInput, maxNFTInventoryBudget); err != nil {
+	if err := capacity.check(maxNativeInputBytes, maxInventoryBudgetBytes); err != nil {
 		return err
 	}
 	byTable := make(map[string][]*Target)

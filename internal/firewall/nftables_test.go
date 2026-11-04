@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/netip"
 	"reflect"
@@ -610,8 +611,9 @@ func TestCaptureLimitCannotBeBypassedByIOCopy(t *testing.T) {
 	// LimitReader hides strings.Reader.WriteTo, exercising io.Copy's destination
 	// ReaderFrom path if bytes.Buffer is accidentally embedded again.
 	source := io.LimitReader(strings.NewReader(strings.Repeat("x", 64)), 64)
-	if _, err := io.Copy(&buffer, source); err == nil {
-		t.Fatal("output capture accepted bytes beyond its limit")
+	var capacity *CapacityError
+	if _, err := io.Copy(&buffer, source); !errors.As(err, &capacity) || capacity.Scope != "output" || capacity.RequiredBytes != 64 || capacity.LimitBytes != 16 {
+		t.Fatalf("output capture lost bounded numeric overflow: %+v %v", capacity, err)
 	}
 	if len(buffer.Bytes()) > buffer.limit {
 		t.Fatal("output capture retained bytes beyond its limit")
@@ -627,7 +629,7 @@ func TestOversizedTargetRejectedBeforeNativeCommands(t *testing.T) {
 		},
 	}
 	base := netip.MustParseAddr("2600:1234:5678:9abc:def0:1234:1234:1000").As16()
-	for index := uint32(0); index < 600000; index++ {
+	for index := uint32(0); index < 1300000; index++ {
 		address := base
 		binary.BigEndian.PutUint32(address[12:], 0x12341000+index*2)
 		cfg.Global.Blocklist = append(cfg.Global.Blocklist, netip.PrefixFrom(netip.AddrFrom16(address), 128))
@@ -644,11 +646,12 @@ func TestOversizedTargetRejectedBeforeNativeCommands(t *testing.T) {
 		t.Fatal("oversized target reached native execution")
 		return nil, nil
 	}}
-	if err := backend.Preflight(context.Background(), nil, target, nil); err == nil {
-		t.Fatal("oversized target passed preflight")
-	}
-	if err := backend.Apply(context.Background(), nil, target, nil); err == nil {
-		t.Fatal("oversized target passed direct apply")
+	for _, operation := range []func(context.Context, *Target, *Target, *DynamicState) error{backend.Preflight, backend.Apply} {
+		var capacity *CapacityError
+		if err := operation(t.Context(), nil, target, nil); !errors.As(err, &capacity) ||
+			capacity.Backend != "nftables" || capacity.Scope != "input" || capacity.RequiredBytes <= capacity.LimitBytes {
+			t.Fatalf("oversized target lost numeric input rejection: %+v %v", capacity, err)
+		}
 	}
 }
 

@@ -16,9 +16,7 @@ import (
 )
 
 const (
-	maxIPTablesInput  = 16 << 20
-	maxIPTablesOutput = 64 << 20
-	maxIPTablesTime   = 30 * time.Second
+	maxIPTablesTime = 30 * time.Second
 )
 
 type iptablesExecutor func(context.Context, string, []string, []byte) ([]byte, error)
@@ -40,7 +38,7 @@ func NewIPTables(progress FamilyProgress) *IPTables {
 }
 
 func nativeIPTablesExecutor(ctx context.Context, command string, args []string, input []byte) ([]byte, error) {
-	return executeNative(ctx, command, args, input, maxIPTablesInput, maxIPTablesOutput)
+	return executeNative(ctx, command, args, input, maxNativeInputBytes, maxNativeOutputBytes)
 }
 
 func (i *IPTables) run(ctx context.Context, command string, args []string, input []byte) ([]byte, error) {
@@ -50,12 +48,17 @@ func (i *IPTables) run(ctx context.Context, command string, args []string, input
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(input) > maxIPTablesInput {
-		return nil, errors.New("iptables input exceeds limit")
+	if len(input) > maxNativeInputBytes {
+		return nil, &CapacityError{Backend: "iptables", Resource: "native-io", Scope: "input", RequiredBytes: int64(len(input)), LimitBytes: maxNativeInputBytes}
 	}
 	callCtx, cancel := context.WithTimeout(ctx, maxIPTablesTime)
 	defer cancel()
-	return i.exec(callCtx, command, args, input)
+	output, err := i.exec(callCtx, command, args, input)
+	var overflow *nativeOutputLimitError
+	if errors.As(err, &overflow) {
+		return nil, errors.Join(&CapacityError{Backend: "iptables", Resource: "native-io", Scope: "output", RequiredBytes: overflow.required, LimitBytes: int64(overflow.limit)}, err)
+	}
+	return output, err
 }
 
 func parseIPTablesVariant(value []byte) (string, error) {
@@ -103,6 +106,17 @@ func familyTool(family policy.Family, suffix string) string {
 		return "iptables" + suffix
 	}
 	return "ip6tables" + suffix
+}
+
+func iptRuleResource(family policy.Family) string {
+	switch family {
+	case policy.IPv4:
+		return "ipv4-rules"
+	case policy.IPv6:
+		return "ipv6-rules"
+	default:
+		return "unknown"
+	}
 }
 
 func (i *IPTables) restore(ctx context.Context, family policy.Family, lines []string) error {
@@ -253,12 +267,20 @@ func appendDynamicIPSet(input *strings.Builder, set iptSet, inventory *iptInvent
 // ipset restore is already non-transactional. Bound each invocation while
 // preserving command order, including population before a resize swap.
 func (i *IPTables) restoreSets(ctx context.Context, input string) error {
+	return i.restoreSetsBounded(ctx, input, maxNativeInputBytes)
+}
+
+func (i *IPTables) restoreSetsBounded(ctx context.Context, input string, limit int) error {
 	for input != "" {
-		size := min(len(input), maxIPTablesInput)
+		size := min(len(input), limit)
 		if size < len(input) {
 			size = strings.LastIndexByte(input[:size], '\n') + 1
 			if size == 0 {
-				return errors.New("ipset command exceeds input limit")
+				required := strings.IndexByte(input, '\n') + 1
+				if required == 0 {
+					required = len(input)
+				}
+				return &CapacityError{Backend: "iptables", Resource: "ipsets", Scope: "input", RequiredBytes: int64(required), LimitBytes: int64(limit)}
 			}
 		}
 		if _, err := i.run(ctx, "ipset", []string{"restore"}, []byte(input[:size])); err != nil {
@@ -463,7 +485,13 @@ func (i *IPTables) UpdateDynamic(ctx context.Context, target *Target, prefixes [
 		return err
 	}
 	now := time.Now()
-	var input strings.Builder
+	// Target validation permits one dynamic set per family. Retain only those
+	// small plans until admission; rejected updates need no restore encoding.
+	var updates [2]struct {
+		set     iptSet
+		desired map[string]uint64
+	}
+	updateCount := 0
 	for _, family := range []policy.Family{policy.IPv4, policy.IPv6} {
 		model := expected.models[target][family]
 		for _, set := range model.Sets {
@@ -485,13 +513,21 @@ func (i *IPTables) UpdateDynamic(ctx context.Context, target *Target, prefixes [
 			spare := set
 			spare.Name = iptDynamicSpareName(set.Name)
 			expected.sets[spare.Name] = spare
-			if err := appendDynamicIPSet(&input, set, inventory, desired); err != nil {
-				return err
-			}
+			updates[updateCount].set = set
+			updates[updateCount].desired = desired
+			updateCount++
 		}
 	}
 	if err := validateIPTCapacity(inventory, expected); err != nil {
 		return err
+	}
+	var input strings.Builder
+	for index := range updateCount {
+		update := &updates[index]
+		if err := appendDynamicIPSet(&input, update.set, inventory, update.desired); err != nil {
+			return err
+		}
+		update.desired = nil
 	}
 	return i.restoreSets(ctx, input.String())
 }

@@ -44,6 +44,11 @@ func TestMain(m *testing.M) {
 // the child verifies that its namespace differs from the caller's namespace.
 func runIsolated(t *testing.T, testName, scenario string) []byte {
 	t.Helper()
+	return runIsolatedFor(t, testName, scenario, 15*time.Minute)
+}
+
+func runIsolatedFor(t *testing.T, testName, scenario string, timeout time.Duration) []byte {
+	t.Helper()
 	parentNet, err := os.Readlink("/proc/self/ns/net")
 	if err != nil {
 		t.Fatalf("read parent network namespace: %v", err)
@@ -53,7 +58,7 @@ func runIsolated(t *testing.T, testName, scenario string) []byte {
 		t.Fatalf("read parent mount namespace: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	args := []string{"--kill-child", "--mount", "--mount-proc", "--net", "--pid", "--fork"}
 	// Root already has the required privileges. A new user namespace would lose
