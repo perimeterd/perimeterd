@@ -212,7 +212,31 @@ Run the opt-in native gate separately:
 make test-e2e
 # If user namespaces are unavailable or legacy /proc inventory is inaccessible:
 make test-e2e E2E_SUDO=sudo
+# Match the CI core shard:
+E2E_SKIP='^TestE2EDBIPCapacity$' make test-e2e E2E_SUDO=sudo
+# Run one complete capacity backend:
+E2E_RUN='^TestE2EDBIPCapacity$/^nftables$' make test-e2e E2E_SUDO=sudo
 ```
+
+`E2E_RUN` and `E2E_SKIP` forward Go's test run/skip selectors. Both default
+to empty, so plain `make test-e2e` still runs the complete native suite.
+Selectors are passed literally, including `$/` between test and backend
+patterns; the environment-variable examples need no Make-specific escaping.
+
+CI uses separate runners for the core suite and each DB-IP capacity backend:
+
+| Shard | Selection | Job timeout, minutes |
+| --- | --- | ---: |
+| core | Everything except `TestE2EDBIPCapacity` | 90 |
+| capacity-nftables | `TestE2EDBIPCapacity/nftables` | 150 |
+| capacity-iptables-legacy | `TestE2EDBIPCapacity/iptables-legacy` | 90 |
+| capacity-iptables-nft | `TestE2EDBIPCapacity/iptables-nft` | 90 |
+
+The measured nft capacity lifecycle alone exceeds 90 minutes. Its CI deadline
+allows the existing two-hour isolated scenario plus setup/compilation; native
+command deadlines and workload sizes are unchanged. Matrix fail-fast is
+disabled so one backend failure does not cancel coverage of the others.
+
 
 The target first builds the binary, then checks for `nft`, `ip`, `ipset`,
 `unshare`, `nsenter`, `iptables-nft`, `ip6tables-nft`, `iptables-legacy`, and
@@ -233,7 +257,7 @@ It exercises real CLI lifecycle, IPv4/IPv6 TCP/UDP packets, reloads, kernel
 counters, ownership collisions, and interrupted transactions, and never
 applies test rules to the development host's firewall. Tagged E2E sources are
 formatted and linted by the ordinary gates but execute only through opt-in
-native/Docker targets. CI runs the native gate in a separate Linux job.
+native/Docker targets. CI runs the native gate in dedicated Linux shards.
 
 Normal daemon shutdown must exit successfully through the shared lifecycle
 helper, including when the process exited before cleanup began. Crash scenarios
@@ -1730,9 +1754,12 @@ reusable gate of the release workflow on main pushes and stable tags:
   `coverage.out`.
 - `gohawk (amd64)` runs `make gohawk` as a blocking core-analysis gate.
 - `build` runs `make build` for both `GOARCH=amd64` and `GOARCH=arm64`.
-- `privileged firewall E2E` installs the namespace prerequisites and runs
-  `E2E_SUDO=sudo make test-e2e`, covering the nftables and both iptables tool
-  families selected by the suite.
+- `privileged firewall E2E` remains the required aggregate check. It succeeds
+  only if every native shard succeeds; failure, cancellation or skipping of
+  the native matrix fails the aggregate. The shards install the namespace
+  prerequisites and use the same `E2E_SUDO=sudo make test-e2e` entrypoint with
+  the [native gate selectors](#native-namespace-gate) above. No capacity backend
+  is omitted, and the default local target still runs the complete suite.
 - `real CrowdSec LAPI compatibility` runs `make test-crowdsec` against the
   digest-pinned v1.8.1 container.
 - `isolated Docker coexistence` provisions the checksum-pinned Docker 29.8.1

@@ -22,6 +22,9 @@ LDFLAGS := -s -w -X '$(MODULE)/internal/buildinfo.Version=$(VERSION)' -X '$(MODU
 GO_SOURCES := $(GO) list -tags=e2e,crowdsec -f '{{range .GoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .TestGoFiles}}{{$$.Dir}}/{{.}} {{end}}{{range .XTestGoFiles}}{{$$.Dir}}/{{.}} {{end}}' ./...
 E2E_TEST_BINARY := bin/perimeterd-e2e
 E2E_SUDO ?=
+# Literal Go test regexes; the recipe uses value to preserve "$/" anchors.
+E2E_RUN ?=
+E2E_SKIP ?=
 CROWDSEC_CONTAINER_RUNTIME ?= docker
 DOCKER_TEST_BINDIR ?=
 ZITI_TEST_BINARY ?=
@@ -91,7 +94,7 @@ build-e2e: build
 	$(GO) test -tags 'linux e2e' -c -o "$(E2E_TEST_BINARY)" ./tests/e2e
 
 test-e2e: build-e2e
-	$(E2E_SUDO) env PERIMETERD_E2E=1 E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.count=1
+	$(E2E_SUDO) env PERIMETERD_E2E=1 E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.count=1 -test.run '$(value E2E_RUN)' -test.skip '$(value E2E_SKIP)'
 
 test-crowdsec:
 		command -v "$(CROWDSEC_CONTAINER_RUNTIME)" >/dev/null 2>&1 || { \
