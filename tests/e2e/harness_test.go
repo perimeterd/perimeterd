@@ -76,16 +76,42 @@ func runIsolatedFor(t *testing.T, testName, scenario string, timeout time.Durati
 		"PERIMETERD_E2E_PARENT_NETNS="+parentNet,
 		"PERIMETERD_E2E_PARENT_MNTNS="+parentMount,
 	)
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			t.Fatalf("isolated %s timed out: %v\n%s", scenario, ctx.Err(), output.String())
-		}
-		t.Fatalf("isolated %s failed: %v\n%s", scenario, err, output.String())
+	spool, err := os.CreateTemp("", "perimeterd-e2e-output-*")
+	if err != nil {
+		t.Fatalf("create isolated output spool: %v", err)
 	}
-	return output.Bytes()
+	defer func() { _ = os.Remove(spool.Name()) }()
+	defer func() { _ = spool.Close() }()
+	output := &e2eChildOutput{spool: spool, progress: emitE2EPhase}
+	cmd.Stdout = e2eChildStream{output: output, stream: 0}
+	cmd.Stderr = e2eChildStream{output: output, stream: 1}
+	backend := ""
+	switch scenario {
+	case "nftables", "iptables-legacy", "iptables-nft", "legacy", "nft":
+		backend = scenario
+	}
+	started := time.Now()
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Scenario: testName + "/" + scenario, Phase: "namespace", Event: "namespace_start"})
+	runErr := cmd.Run()
+	outcome := "success"
+	if runErr != nil {
+		outcome = "failure"
+		if ctx.Err() != nil {
+			outcome = "timeout"
+		}
+	}
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Scenario: testName + "/" + scenario, Phase: "namespace", Event: "namespace_end", Outcome: outcome, WallNS: time.Since(started).Nanoseconds()})
+	if runErr != nil {
+		if ctx.Err() != nil {
+			t.Fatalf("isolated %s timed out: %v\nbounded child diagnostic tail (%d bytes):\n%s", scenario, ctx.Err(), len(output.tail), output.tail)
+		}
+		t.Fatalf("isolated %s failed: %v\nbounded child diagnostic tail (%d bytes):\n%s", scenario, runErr, len(output.tail), output.tail)
+	}
+	evidence, err := output.evidence()
+	if err != nil {
+		t.Fatalf("read complete isolated output: %v", err)
+	}
+	return evidence
 }
 
 func requireIsolatedChild(t *testing.T) {

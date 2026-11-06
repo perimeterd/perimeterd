@@ -121,7 +121,15 @@ jobs:
         include:
           - shard: core
             run: ""
-            skip: ^TestE2EDBIPCapacity$
+            skip: ^TestE2E(DBIPCapacity|NFTProductionCapacity|CrowdSecNFTInventoryCapacity|CrowdSecIPSetProjectionCapacity|CrowdSecNativeScale)$
+            timeout: 90
+          - shard: historical-nft
+            run: ^TestE2E(NFTProductionCapacity|CrowdSecNFTInventoryCapacity)$
+            skip: ""
+            timeout: 90
+          - shard: dynamic-scale
+            run: ^TestE2ECrowdSec(IPSetProjectionCapacity|NativeScale)$
+            skip: ""
             timeout: 90
           - shard: capacity-nftables
             run: ^TestE2EDBIPCapacity$/^nftables$
@@ -138,6 +146,7 @@ jobs:
     env:
       E2E_RUN: ${{ matrix.run }}
       E2E_SKIP: ${{ matrix.skip }}
+      E2E_PHASE_DIR: ${{ github.workspace }}/artifacts/e2e/${{ matrix.shard }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -157,8 +166,28 @@ jobs:
           sudo modprobe xt_set
           sudo modprobe iptable_filter
           sudo modprobe ip6table_filter
+      - name: Prepare phase artifacts
+        run: |
+          mkdir -p "$E2E_PHASE_DIR"
+          echo "E2E_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
       - name: Run isolated kernel E2E
         run: E2E_SUDO=sudo make test-e2e
+      - name: Require completed native work
+        run: python3 scripts/e2e-phases.py "$E2E_PHASE_DIR" --require-native
+      - name: Summarize native phases
+        if: ${{ always() }}
+        continue-on-error: true
+        run: python3 scripts/e2e-phases.py "$E2E_PHASE_DIR" --summary "$E2E_PHASE_DIR/summary.json" --started-at "${E2E_STARTED_AT:-}"
+      - name: Upload small native phase artifacts
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-phases-${{ matrix.shard }}
+          path: |
+            artifacts/e2e/${{ matrix.shard }}/*.jsonl
+            artifacts/e2e/${{ matrix.shard }}/summary.json
+          if-no-files-found: warn
 
   e2e:
     name: privileged firewall E2E

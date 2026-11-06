@@ -783,7 +783,7 @@ func TestE2EIPTablesGeo(t *testing.T) {
 
 	configPath := tempConfig(t, "iptables-geo")
 	writeIPTablesGeoConfig(t, configPath)
-	fixture := &geoFixtureTransport{started: time.Now(), validFor: 8 * time.Second}
+	fixture := &geoFixtureTransport{started: time.Now(), validFor: 20 * time.Minute}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -795,7 +795,7 @@ func TestE2EIPTablesGeo(t *testing.T) {
 			StateDir:     "/var/lib/perimeterd",
 			LockPath:     "/run/perimeterd/owner.lock",
 			SourceClient: &http.Client{Transport: fixture},
-			Stderr:       os.Stderr,
+			Stderr:       io.MultiWriter(os.Stderr, &fixture.output),
 			Notify: func(message string) error {
 				if strings.Contains(message, "READY=1") {
 					readyOnce.Do(func() { close(ready) })

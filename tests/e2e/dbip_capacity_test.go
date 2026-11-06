@@ -4,7 +4,6 @@ package e2e
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -184,6 +182,7 @@ func dbipCapacityOversized(until time.Time) crowdsec.Batch {
 
 func (f *dbipCapacitySources) projection(t *testing.T) []policy.TimedPrefix {
 	t.Helper()
+	started := time.Now()
 	f.mu.Lock()
 	batch := capacityfixture.DBIPBatch(f.count, f.offset, f.until)
 	if f.deletePeers {
@@ -194,7 +193,9 @@ func (f *dbipCapacitySources) projection(t *testing.T) []policy.TimedPrefix {
 	if err := store.Apply(batch, 1, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	return store.Projection(time.Now())
+	projection := store.Projection(time.Now())
+	recordE2EPhase(t, e2ePhaseRecord{Profile: "dbip-euro-atlantic", Phase: "projection-oracle", Event: "comparison", Outcome: "success", ProjectedMemberships: len(projection), DurationNS: time.Since(started).Nanoseconds()})
+	return projection
 }
 
 func dbipCapacityRejection(t *testing.T, output string, backend string) *firewall.CapacityError {
@@ -230,14 +231,23 @@ func dbipCapacityRejection(t *testing.T, output string, backend string) *firewal
 	return nil
 }
 
-func dbipCapacityState(t *testing.T, live bool, wantDynamic int) *state.Revision {
+func beginDBIPPhase(t *testing.T, backend, phase string) time.Time {
+	t.Helper()
+	started := time.Now()
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "phase_start", Timestamp: started})
+	return started
+}
+
+func dbipCapacityState(t *testing.T, live bool, wantDynamic int, phase string) (*state.Revision, *nativePhaseSnapshot) {
 	t.Helper()
 	if wantDynamic < 0 {
 		t.Fatal("negative expected projection")
-		return nil
+		return nil, nil
 	}
+	waitStarted := time.Now()
 	want := uint64(wantDynamic)
 	var revision *state.Revision
+	var acknowledged control.StatusResult
 	dbipCapacityWait(t, "DB-IP acknowledged static and dynamic revision", func() bool {
 		status := largeCrowdStatus(t)
 		if !status.Successful() || status.Applied.Details == nil || status.Applied.Details.CrowdSec.Counts == nil {
@@ -254,61 +264,52 @@ func dbipCapacityState(t *testing.T, live bool, wantDynamic int) *state.Revision
 			return false
 		}
 		revision = capacityReadRevision(t)
+		acknowledged = status
 		return status.Applied.Revision == revision.ID
 	})
+	total, counts := capacityfixture.Memberships(revision.Target.Families)
+	recordE2EPhase(t, e2ePhaseRecord{Backend: revision.Target.Backend(), Profile: "dbip-euro-atlantic", Phase: phase, Event: "acknowledged", Outcome: "success", StaticMemberships: total, ProjectedMemberships: wantDynamic, StaticGeneration: revision.Target.Generation, DynamicGeneration: revision.Target.DynamicGeneration, DurationNS: time.Since(waitStarted).Nanoseconds()})
 	if !live {
 		if err := capacityfixture.ValidateDBIP(revision.Target.Families); err != nil {
 			t.Fatal(err)
 		}
 	}
-	assertNativeProjectionCount(t, revision.Target, wantDynamic)
-	total, counts := capacityfixture.Memberships(revision.Target.Families)
-	t.Logf("revision=%s static-generation=%s dynamic-generation=%s unique-static-memberships=%d per-set=%v projected-dynamic=%d", revision.ID, revision.Target.Generation, revision.Target.DynamicGeneration, total, counts, wantDynamic)
+	snapshot := captureNativePhase(t, revision.Target, phase, true)
+	comparisonStarted := time.Now()
+	assertSnapshotProjectionCount(t, snapshot, wantDynamic)
 	expected := 0
 	for _, family := range revision.Target.Families {
 		expected += len(family.Sets)
 	}
 	if revision.Target.Backend() == "iptables" {
 		expected++ // The deliberately foreign set.
-		names := strings.Fields(string(command(t, 10*time.Second, "ipset", "list", "-name")))
-		if len(names) != expected {
-			t.Fatalf("obsolete generations or resize spares remain: sets=%d want=%d", len(names), expected)
+		if len(snapshot.sets) != expected {
+			t.Fatalf("obsolete generations or resize spares remain: sets=%d want=%d", len(snapshot.sets), expected)
 		}
-	} else if actual := capacityNativeReferences(t, revision.Target, false); actual != expected {
-		t.Fatalf("obsolete native sets remain: sets=%d want=%d", actual, expected)
+	} else {
+		actual, err := snapshotNativeReferences(snapshot, revision.Target, false)
+		if err != nil || actual != expected {
+			t.Fatalf("native references/orphan sets: sets=%d want=%d (%v)", actual, expected, err)
+		}
 	}
-	return revision
+	afterCapture := dbipCapacityStatus(t)
+	if afterCapture.Applied.Revision != revision.ID || afterCapture.Applied.ConfigEpoch != acknowledged.Applied.ConfigEpoch ||
+		afterCapture.Applied.Details.CrowdSec.Epoch != acknowledged.Applied.Details.CrowdSec.Epoch ||
+		afterCapture.Applied.Details.CrowdSec.Operation != acknowledged.Applied.Details.CrowdSec.Operation {
+		t.Fatalf("authority changed during native phase observation; snapshot cannot be reused: revision=%s/%s config-epoch=%d/%d crowd-epoch=%d/%d operation=%d/%d",
+			revision.ID, afterCapture.Applied.Revision, acknowledged.Applied.ConfigEpoch, afterCapture.Applied.ConfigEpoch,
+			acknowledged.Applied.Details.CrowdSec.Epoch, afterCapture.Applied.Details.CrowdSec.Epoch,
+			acknowledged.Applied.Details.CrowdSec.Operation, afterCapture.Applied.Details.CrowdSec.Operation)
+	}
+	recordE2EPhase(t, e2ePhaseRecord{Backend: revision.Target.Backend(), Profile: "dbip-euro-atlantic", Phase: phase, Event: "comparison", Outcome: "success", StaticMemberships: total, ProjectedMemberships: wantDynamic, DurationNS: time.Since(comparisonStarted).Nanoseconds()})
+	t.Logf("revision=%s static-generation=%s dynamic-generation=%s unique-static-memberships=%d per-set=%v projected-dynamic=%d", revision.ID, revision.Target.Generation, revision.Target.DynamicGeneration, total, counts, wantDynamic)
+	return revision, snapshot
 }
 
-func dbipCapacityMeasure(t *testing.T, daemon *daemonProcess, target *firewall.Target, phase string, started time.Time) {
+func dbipCapacityMeasure(t *testing.T, daemon *daemonProcess, target *firewall.Target, phase string, started time.Time, snapshot *nativePhaseSnapshot) {
 	t.Helper()
-	if target.Backend() == "nftables" {
-		capacityMeasure(t, daemon, target.Table, phase, started)
-	} else {
-		for _, invocation := range [][]string{{"ipset", "save"}, {"iptables-save", "-c"}, {"ip6tables-save", "-c"}} {
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			// #nosec G204 -- fixed local native inventory command vectors.
-			cmd := exec.CommandContext(ctx, invocation[0], invocation[1:]...)
-			data, err := cmd.Output()
-			cancel()
-			if err != nil {
-				t.Fatalf("phase=%s complete inventory %s: %v", phase, invocation[0], err)
-			}
-			usage := cmd.ProcessState.SysUsage().(*syscall.Rusage)
-			t.Logf("phase=%s scope=%s complete-inventory-bytes=%d child-user=%s child-system=%s child-maxrss-kib=%d wall=%s", phase, invocation[0], len(data), cmd.ProcessState.UserTime(), cmd.ProcessState.SystemTime(), usage.Maxrss, time.Since(started))
-		}
-		if daemon != nil {
-			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", daemon.cmd.Process.Pid))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for line := range strings.SplitSeq(string(data), "\n") {
-				if strings.HasPrefix(line, "VmHWM:") {
-					t.Logf("phase=%s daemon-%s (cumulative process peak, not kernel memory)", phase, line)
-				}
-			}
-		}
-	}
+	defer snapshot.release()
+	measureNativePhase(t, daemon, target, phase, started, snapshot)
 	store, err := state.Open("/var/lib/perimeterd", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -324,11 +325,21 @@ func dbipCapacityMeasure(t *testing.T, daemon *daemonProcess, target *firewall.T
 			dynamicIDs[revision.Target.DynamicGeneration] = true
 		}
 	}
+	total, _ := capacityfixture.Memberships(target.Families)
+	recordE2EPhase(t, e2ePhaseRecord{Backend: target.Backend(), Profile: "dbip-euro-atlantic", Phase: phase, Event: "phase_end", Outcome: "success", StaticMemberships: total, StaticGeneration: target.Generation, DynamicGeneration: target.DynamicGeneration, StaticGenerations: len(staticIDs), DynamicGenerations: len(dynamicIDs), WallNS: time.Since(started).Nanoseconds()})
 	t.Logf("phase=%s retained-revisions=%d static-generations=%d dynamic-generations=%d journal=%+v wall=%s", phase, len(view.Revisions), len(staticIDs), len(dynamicIDs), view.Journal, time.Since(started))
 }
 
-func dbipCapacityPackets(t *testing.T, peer *peerNamespace, banned bool) {
+func dbipCapacityPackets(t *testing.T, peer *peerNamespace, banned bool, phase string) {
 	t.Helper()
+	started := time.Now()
+	defer func() {
+		outcome := "success"
+		if t.Failed() {
+			outcome = "failure"
+		}
+		recordE2EPhase(t, e2ePhaseRecord{Backend: os.Getenv(e2eScenario), Profile: "dbip-euro-atlantic", Phase: phase, Event: "packets", Outcome: outcome, DurationNS: time.Since(started).Nanoseconds()})
+	}()
 	capacityPackets(t, peer, true, banned, false)
 	for _, network := range []string{"udp4", "udp6"} {
 		for _, subnet := range []string{"20", "22", "23"} {
@@ -357,17 +368,19 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, backend := range []string{"nftables", "iptables-legacy", "iptables-nft"} {
 			t.Run(backend, func(t *testing.T) {
-				t.Logf("%s", runIsolatedFor(t, "TestE2EDBIPCapacity", backend, dbipCapacityLifetime))
+				runIsolatedFor(t, "TestE2EDBIPCapacity", backend, dbipCapacityLifetime)
 			})
 		}
 		return
 	}
 	requireIsolatedChild(t)
+	setupStarted := time.Now()
 	prepareMounts(t)
 	if err := syscall.Mount("", "/var/lib", "", syscall.MS_REMOUNT, "size=3072m"); err != nil {
 		t.Fatal(err)
 	}
 	backend := os.Getenv(e2eScenario)
+	phase := "fixture-setup"
 	if strings.HasPrefix(backend, "iptables-") {
 		installIPTablesTools(t, strings.TrimPrefix(backend, "iptables-"))
 		backend = "iptables"
@@ -388,10 +401,15 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	if backend == "nftables" {
 		command(t, 10*time.Second, "nft", "add", "table", "inet", "capacity_foreign")
 	}
-	foreign := func() {
+	foreign := func(snapshot *nativePhaseSnapshot) {
 		if backend == "iptables" {
-			assertIPTablesForeign(t, "v4")
-			assertIPTablesForeign(t, "v6")
+			if snapshot == nil {
+				assertIPTablesForeign(t, "v4")
+				assertIPTablesForeign(t, "v6")
+			} else {
+				assertSnapshotForeignIPTables(t, snapshot, "v4")
+				assertSnapshotForeignIPTables(t, snapshot, "v6")
+			}
 			command(t, 10*time.Second, "ipset", "test", "capacity_foreign", "203.0.113.99")
 		} else {
 			command(t, 10*time.Second, "nft", "list", "table", "inet", "capacity_foreign")
@@ -434,9 +452,15 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	}
 	var daemon *daemonProcess
 	start := func() *daemonProcess {
-		return startDaemonCommand(t, capacityCommand(path, server.URL), "DB-IP capacity daemon", func() bool { return activeRevision() != "" }, 15*time.Minute)
+		actionStarted := time.Now()
+		recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "action_start"})
+		process := startDaemonCommand(t, capacityCommand(path, server.URL), "DB-IP capacity daemon", func() bool { return activeRevision() != "" }, 15*time.Minute)
+		recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "process_ready", Outcome: "success", DurationNS: time.Since(actionStarted).Nanoseconds()})
+		return process
 	}
 	reload := func() {
+		actionStarted := time.Now()
+		recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "action_start"})
 		before := largeCrowdStatus(t)
 		if !before.Successful() {
 			dbipCapacityWait(t, "coherent pre-reload configuration epoch", func() bool {
@@ -463,12 +487,14 @@ func TestE2EDBIPCapacity(t *testing.T) {
 			}
 			return true
 		})
+		recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "action_acknowledged", Outcome: "success", DurationNS: time.Since(actionStarted).Nanoseconds()})
 	}
-	started := time.Now()
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "setup", Outcome: "success", DurationNS: time.Since(setupStarted).Nanoseconds()})
+	phase = "incident-first-start"
+	started := beginDBIPPhase(t, backend, phase)
 	write(false, "drop")
 	daemon = start()
-	initial := dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans)
-	dbipCapacityMeasure(t, daemon, initial.Target, "incident-first-start", started)
+	initial, snapshot := dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans, phase)
 	if !live {
 		// No OUTPUT hook in incident case: outside-group egress is not filtered.
 		if backend == "iptables" {
@@ -477,17 +503,20 @@ func TestE2EDBIPCapacity(t *testing.T) {
 		probeIngress(t, peer, "tcp4", "8.22.0.1:22", "drop", "tcp")
 		probeIngress(t, peer, "udp4", "8.20.0.1:22", "success", "udp")
 	}
-	started = time.Now()
+	dbipCapacityMeasure(t, daemon, initial.Target, phase, started, snapshot)
+	phase = "explicit-bidirectional"
+	started = beginDBIPPhase(t, backend, phase)
 	write(true, "drop")
 	reload()
-	current := dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans)
+	current, snapshot := dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans, phase)
 	if !live {
-		dbipCapacityPackets(t, peer, true)
+		dbipCapacityPackets(t, peer, true, phase)
 	}
-	dbipCapacityMeasure(t, daemon, current.Target, "explicit-bidirectional", started)
-	started = time.Now()
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
+	phase = "unchanged-policy-authority-reload"
+	started = beginDBIPPhase(t, backend, phase)
 	reload()
-	unchanged := dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans)
+	unchanged, snapshot := dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans, phase)
 	if backend == "nftables" {
 		if unchanged.Target.Generation != current.Target.Generation || unchanged.Target.DynamicGeneration != current.Target.DynamicGeneration {
 			t.Fatal("unchanged nft reload replaced shared identities")
@@ -500,8 +529,9 @@ func TestE2EDBIPCapacity(t *testing.T) {
 			t.Fatal("iptables reload reused obsolete LAPI authority identity")
 		}
 	}
-	dbipCapacityMeasure(t, daemon, unchanged.Target, "unchanged-policy-authority-reload", started)
-	started = time.Now()
+	dbipCapacityMeasure(t, daemon, unchanged.Target, phase, started, snapshot)
+	phase = "changed-country-refresh"
+	started = beginDBIPPhase(t, backend, phase)
 	fixture.mu.Lock()
 	fixture.refresh = true
 	fixture.mu.Unlock()
@@ -542,43 +572,46 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	refreshInterval = "1h"
 	write(true, "drop")
 	reload()
-	current = dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans)
+	current, snapshot = dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans, phase)
 	if !live {
-		dbipCapacityPackets(t, peer, true)
+		dbipCapacityPackets(t, peer, true, phase)
 	}
-	dbipCapacityMeasure(t, daemon, current.Target, "changed-country-refresh", started)
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
 	// Delete peer bans, replace sparse memberships in place, and renew deadlines.
-	started = time.Now()
+	phase = "in-place-delete-replace-renew"
+	started = beginDBIPPhase(t, backend, phase)
 	fixture.mu.Lock()
 	fixture.deletePeers = true
 	fixture.offset = 1000
 	fixture.until = fixture.until.Add(time.Hour)
 	fixture.serial++
 	fixture.mu.Unlock()
-	current = dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans-2)
-	assertNativeProjection(t, current.Target, fixture.projection(t), started)
+	current, snapshot = dbipCapacityState(t, live, capacityfixture.DBIPProjectedBans-2, phase)
+	assertNativeProjection(t, current.Target, fixture.projection(t), started, snapshot)
 	if !live {
-		dbipCapacityPackets(t, peer, false)
+		dbipCapacityPackets(t, peer, false, phase)
 	}
-	dbipCapacityMeasure(t, daemon, current.Target, "in-place-delete-replace-renew", started)
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
 	// Doubling each family's projection crosses the original ipset maxelem and
 	// therefore requires a populated resize spare, not just an in-place delta.
-	started = time.Now()
+	phase = "growth-resize-spare-retired"
+	started = beginDBIPPhase(t, backend, phase)
 	retainedUpdatedAfter := started
 	fixture.mu.Lock()
 	fixture.count = 300000
 	fixture.deletePeers = false
 	fixture.serial++
 	fixture.mu.Unlock()
-	current = dbipCapacityState(t, live, 300000)
+	current, snapshot = dbipCapacityState(t, live, 300000, phase)
 	if !live {
-		dbipCapacityPackets(t, peer, true)
+		dbipCapacityPackets(t, peer, true, phase)
 	}
-	dbipCapacityMeasure(t, daemon, current.Target, "growth-resize-spare-retired", started)
-	foreign()
+	foreign(snapshot)
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
 	// Existing native capacity cases retain direct preflight coverage. Here the
 	// running daemon must resolve, stage and reject a real LAPI authority.
-	started = time.Now()
+	phase = "rejected-candidate-preserved"
+	started = beginDBIPPhase(t, backend, phase)
 	beforeRejected := dbipCapacityStatus(t)
 	previousAuthority := beforeRejected.Applied.Details.CrowdSec
 	previousProjection := fixture.projection(t)
@@ -602,6 +635,8 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	fixture.rejectedBytes = 0
 	fixture.mu.Unlock()
 	write(true, "drop")
+	rejectionStarted := time.Now()
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "action_start"})
 	daemon.reload(t)
 	var capacity *firewall.CapacityError
 	dbipCapacityWait(t, "daemon numeric native capacity rejection", func() bool {
@@ -613,22 +648,30 @@ func TestE2EDBIPCapacity(t *testing.T) {
 		capacity = dbipCapacityRejection(t, daemon.output.String()[logOffset:], backend)
 		return capacity != nil
 	})
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "action_rejected", Outcome: "success", DurationNS: time.Since(rejectionStarted).Nanoseconds()})
 	fixture.mu.Lock()
 	responseBytes := fixture.rejectedBytes
 	fixture.mu.Unlock()
 	if responseBytes <= 0 || responseBytes >= 256<<20 {
 		t.Fatalf("oversized native candidate did not fit the real source fence: bytes=%d", responseBytes)
 	}
-	preserved := dbipCapacityState(t, live, 300000)
+	// Rejection restarts the retained authenticated client with a full sync.
+	// Its native apply can outlast an inventory read; await the fresh, valid
+	// authority epoch before opening the immutable post-rejection observation.
+	resumeStarted := time.Now()
+	dbipCapacityWait(t, "retained CrowdSec full synchronization acknowledgement", func() bool {
+		status := largeCrowdStatus(t)
+		return status.Successful() && status.Applied.Details != nil &&
+			status.Applied.Details.CrowdSec.Epoch > previousAuthority.Epoch &&
+			status.Applied.Details.CrowdSec.Validity == "valid"
+	})
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "source_acknowledged", Outcome: "success", DurationNS: time.Since(resumeStarted).Nanoseconds()})
+	preserved, snapshot := dbipCapacityState(t, live, 300000, phase)
 	afterRejected := dbipCapacityStatus(t)
 	authority := afterRejected.Applied.Details.CrowdSec
-	// nft can resume the old LAPI client under a fresh epoch after rejecting
-	// staged authority. Operation ordering is meaningful within an epoch only;
-	// durable selection and exact native contents below prove what survived.
 	if preserved.ID != current.ID || !reflect.DeepEqual(preserved.Target, current.Target) ||
 		afterRejected.Applied.ConfigEpoch != beforeRejected.Applied.ConfigEpoch ||
-		authority.Epoch < previousAuthority.Epoch || authority.Validity != "valid" ||
-		(authority.Epoch == previousAuthority.Epoch && authority.Operation < previousAuthority.Operation) {
+		authority.Epoch <= previousAuthority.Epoch || authority.Validity != "valid" {
 		t.Fatalf("rejected candidate changed durable or acknowledged authority: revision=%s/%s target-equal=%t config-epoch=%d/%d crowd-before=%+v crowd-after=%+v", current.ID, preserved.ID, reflect.DeepEqual(preserved.Target, current.Target), beforeRejected.Applied.ConfigEpoch, afterRejected.Applied.ConfigEpoch, previousAuthority, authority)
 	}
 	rejectionStore, err := state.Open("/var/lib/perimeterd", nil)
@@ -639,14 +682,16 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	if err != nil || rejectedView.Journal != nil || rejectedView.Active == nil || rejectedView.Active.ID != current.ID {
 		t.Fatalf("rejection left unsafe durable authority/journal: %+v (%v)", rejectedView, err)
 	}
-	assertNativeProjection(t, current.Target, previousProjection, retainedUpdatedAfter)
+	assertNativeProjection(t, current.Target, previousProjection, retainedUpdatedAfter, snapshot)
 	t.Logf("phase=over-budget-daemon-candidate backend=%s resource=%s scope=%s required=%d limit=%d source-bytes=%d source-decisions=%d projected-prefixes=%d durable-envelope-bytes=%d retained-revision=%s retained-crowd-epoch=%d", capacity.Backend, capacity.Resource, capacity.Scope, capacity.RequiredBytes, capacity.LimitBytes, responseBytes, 2*65536, 65*65536, len(record), preserved.ID, authority.Epoch)
-	foreign()
+	recordE2EPhase(t, e2ePhaseRecord{Backend: backend, Profile: "dbip-euro-atlantic", Phase: phase, Event: "capacity_rejected", Outcome: "success", Resource: capacity.Resource, CapacityScope: capacity.Scope, RequiredBytes: capacity.RequiredBytes, LimitBytes: capacity.LimitBytes, ProjectedMemberships: 65 * 65536, StaticGeneration: current.Target.Generation, DynamicGeneration: current.Target.DynamicGeneration})
+	foreign(snapshot)
 	if !live {
-		dbipCapacityPackets(t, peer, true)
+		dbipCapacityPackets(t, peer, true, phase)
 	}
-	dbipCapacityMeasure(t, daemon, current.Target, "rejected-candidate-preserved", started)
-	started = time.Now()
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
+	phase = "later-admissible-source-and-config"
+	started = beginDBIPPhase(t, backend, phase)
 	fixture.mu.Lock()
 	fixture.offset += 1000
 	fixture.until = fixture.until.Add(time.Hour)
@@ -654,21 +699,22 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	fixture.mu.Unlock()
 	write(true, "drop")
 	reload()
-	current = dbipCapacityState(t, live, 300000)
+	current, snapshot = dbipCapacityState(t, live, 300000, phase)
 	admitted := dbipCapacityStatus(t)
 	if admitted.Applied.Details.CrowdSec.Epoch <= authority.Epoch || admitted.Applied.Revision == preserved.ID {
 		t.Fatalf("later changed source authority was not acknowledged: %+v", admitted.Applied)
 	}
-	assertNativeProjection(t, current.Target, fixture.projection(t), started)
+	assertNativeProjection(t, current.Target, fixture.projection(t), started, snapshot)
 	if !live {
-		dbipCapacityPackets(t, peer, true)
+		dbipCapacityPackets(t, peer, true, phase)
 	}
-	dbipCapacityMeasure(t, daemon, current.Target, "later-admissible-source-and-config", started)
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
 	daemon.stop(t)
-	started = time.Now()
+	phase = "clean-restart"
+	started = beginDBIPPhase(t, backend, phase)
 	daemon = start()
-	current = dbipCapacityState(t, live, 300000)
-	dbipCapacityMeasure(t, daemon, current.Target, "clean-restart", started)
+	current, snapshot = dbipCapacityState(t, live, 300000, phase)
+	dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
 	daemon.stop(t)
 	// Exercise durable same-ID preparation and native partially switched state,
 	// then distinct-generation preparation and partial family switching.
@@ -682,20 +728,21 @@ func TestE2EDBIPCapacity(t *testing.T) {
 			prepared = "after-prepare"
 		}
 		for _, checkpoint := range []string{prepared, partial} {
-			started = time.Now()
+			phase = fmt.Sprintf("interrupted-distinct-%t-%s", distinct, strings.ReplaceAll(checkpoint, ":", "-"))
+			started = beginDBIPPhase(t, backend, phase)
 			if distinct {
 				write(true, "reject")
 			}
 			crashCheckpoint := checkpoint
-			phase := ""
+			journalPhase := ""
 			if !distinct && backend == "nftables" && checkpoint == partial {
 				// Recover does not emit normal apply's after-switch hook. Its
 				// durable switched-phase checkpoint follows the same-ID native
 				// apply and still precedes recovery commit/retirement.
 				crashCheckpoint = "journal:after-dir-sync"
-				phase = "switched"
+				journalPhase = "switched"
 			}
-			extra := []string{"PERIMETERD_CAPACITY_CRASH=" + crashCheckpoint, "PERIMETERD_CAPACITY_CRASH_PHASE=" + phase}
+			extra := []string{"PERIMETERD_CAPACITY_CRASH=" + crashCheckpoint, "PERIMETERD_CAPACITY_CRASH_PHASE=" + journalPhase}
 			if distinct {
 				extra = append(extra, "PERIMETERD_CAPACITY_CRASH_DISTINCT=1")
 			}
@@ -723,15 +770,18 @@ func TestE2EDBIPCapacity(t *testing.T) {
 			// already-materialized names. Measure complete coexistence below;
 			// actual recovery validates both durable targets before mutation.
 			t.Logf("phase=interrupted distinct-request=%t checkpoint=%s native-checkpoint=%s journal-phase=%s previous=%s candidate=%s", distinct, checkpoint, crashCheckpoint, view.Journal.Phase, view.Journal.Previous, view.Journal.Candidate)
-			dbipCapacityMeasure(t, nil, candidate.Target, fmt.Sprintf("interrupted-distinct-%t-%s", distinct, checkpoint), started)
+			snapshot = captureNativePhase(t, candidate.Target, phase, true)
+			dbipCapacityMeasure(t, nil, candidate.Target, phase, started, snapshot)
+			phase = fmt.Sprintf("recovered-distinct-%t-%s", distinct, strings.ReplaceAll(checkpoint, ":", "-"))
+			started = beginDBIPPhase(t, backend, phase)
 			write(true, "drop")
 			daemon = start()
-			current = dbipCapacityState(t, live, 300000)
+			current, snapshot = dbipCapacityState(t, live, 300000, phase)
 			if !live {
-				dbipCapacityPackets(t, peer, true)
+				dbipCapacityPackets(t, peer, true, phase)
 			}
-			dbipCapacityMeasure(t, daemon, current.Target, fmt.Sprintf("recovered-distinct-%t-%s", distinct, checkpoint), started)
-			foreign()
+			foreign(snapshot)
+			dbipCapacityMeasure(t, daemon, current.Target, phase, started, snapshot)
 			daemon.stop(t)
 		}
 	}
@@ -745,7 +795,7 @@ func TestE2EDBIPCapacity(t *testing.T) {
 	if err != nil || view.Active != nil || view.Journal != nil {
 		t.Fatalf("cleanup retained active authority or journal: %+v (%v)", view, err)
 	}
-	foreign()
+	foreign(nil)
 	if backend == "iptables" {
 		waitNoIPTablesOwned(t, "v4", "v6")
 		if names := strings.Fields(string(command(t, 10*time.Second, "ipset", "list", "-name"))); len(names) != 1 || names[0] != "capacity_foreign" {

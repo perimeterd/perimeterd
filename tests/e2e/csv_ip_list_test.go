@@ -55,7 +55,7 @@ func TestE2ECSVIPLists(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, scenario := range []string{"nftables", "iptables-legacy", "iptables-nft"} {
 			t.Run(scenario, func(t *testing.T) {
-				t.Logf("%s", runIsolated(t, "TestE2ECSVIPLists", scenario))
+				runIsolated(t, "TestE2ECSVIPLists", scenario)
 			})
 		}
 		return

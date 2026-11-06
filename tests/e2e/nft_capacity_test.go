@@ -256,8 +256,9 @@ func capacityReadRevision(t *testing.T) *state.Revision {
 	return &revision.Payload
 }
 
-func capacityAssertState(t *testing.T, ssh bool) *state.Revision {
+func capacityAssertState(t *testing.T, ssh bool, phase string) (*state.Revision, *nativePhaseSnapshot) {
 	t.Helper()
+	waitStarted := time.Now()
 	var revision *state.Revision
 	deadline := time.Now().Add(3 * time.Minute)
 	for {
@@ -284,64 +285,26 @@ func capacityAssertState(t *testing.T, ssh bool) *state.Revision {
 	if err := capacityfixture.ValidateShared(revision.Target.Families, ssh); err != nil {
 		t.Fatal(err)
 	}
-	capacityAssertStatusAndNative(t, revision, false)
+	recordE2EPhase(t, e2ePhaseRecord{Backend: "nftables", Profile: "historical-production", Phase: phase, Event: "acknowledged", Outcome: "success", StaticMemberships: total, StaticGeneration: revision.Target.Generation, DynamicGeneration: revision.Target.DynamicGeneration, DurationNS: time.Since(waitStarted).Nanoseconds()})
+	snapshot := captureNativePhase(t, revision.Target, phase, false)
+	capacityAssertStatusAndNative(t, revision, false, snapshot)
 	t.Logf("applied=%s static-generation=%s dynamic-generation=%s memberships=%d per-set=%v", revision.ID, revision.Target.Generation, revision.Target.DynamicGeneration, total, counts)
-	return revision
+	return revision, snapshot
 }
 
-func capacityMeasure(t *testing.T, daemon *daemonProcess, table, phase string, started time.Time) {
+func beginCapacityPhase(t *testing.T, phase string) time.Time {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	// #nosec G204 -- table comes from the fixed local fixture in verified private namespaces.
-	cmd := exec.CommandContext(ctx, "nft", "-j", "list", "table", "inet", table)
-	inventory, err := cmd.Output()
-	if err != nil {
-		t.Fatal(err)
-	}
-	usage := cmd.ProcessState.SysUsage().(*syscall.Rusage)
-	var envelope struct {
-		Nftables []struct {
-			Set *struct {
-				Flags []string          `json:"flags"`
-				Elem  []json.RawMessage `json:"elem"`
-			} `json:"set"`
-		} `json:"nftables"`
-	}
-	if err := json.Unmarshal(inventory, &envelope); err != nil {
-		t.Fatal(err)
-	}
-	projection := 0
-	for _, object := range envelope.Nftables {
-		if object.Set != nil {
-			for _, flag := range object.Set.Flags {
-				if flag == "timeout" {
-					projection += len(object.Set.Elem)
-				}
-			}
-		}
-	}
-	t.Logf("phase=%s wall=%s native-inventory-bytes=%d actual-native-dynamic-elements=%d inspection-user=%s inspection-system=%s inspection-maxrss-kib=%d", phase, time.Since(started), len(inventory), projection, cmd.ProcessState.UserTime(), cmd.ProcessState.SystemTime(), usage.Maxrss)
-	t.Log("inspection child rusage maxrss may include inherited pre-exec fixture-generator RSS; daemon VmHWM below is sampled after exec")
-	if daemon != nil {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", daemon.cmd.Process.Pid))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "VmHWM:") {
-				t.Logf("phase=%s daemon-only-%s (fixture generator is separate parent process)", phase, line)
-			}
-		}
-		data, err = os.ReadFile(fmt.Sprintf("/proc/%d/stat", daemon.cmd.Process.Pid))
-		if err != nil {
-			t.Fatal(err)
-		}
-		fields := strings.Fields(string(data))
-		if len(fields) > 14 {
-			t.Logf("phase=%s daemon-user-ticks=%s daemon-system-ticks=%s", phase, fields[13], fields[14])
-		}
-	}
+	started := time.Now()
+	recordE2EPhase(t, e2ePhaseRecord{Backend: "nftables", Profile: "historical-production", Phase: phase, Event: "phase_start", Timestamp: started})
+	return started
+}
+
+func capacityMeasure(t *testing.T, daemon *daemonProcess, target *firewall.Target, phase string, started time.Time, snapshot *nativePhaseSnapshot) {
+	t.Helper()
+	defer snapshot.release()
+	measureNativePhase(t, daemon, target, phase, started, snapshot)
+	total, _ := capacityfixture.Memberships(target.Families)
+	recordE2EPhase(t, e2ePhaseRecord{Backend: "nftables", Profile: "historical-production", Phase: phase, Event: "phase_end", Outcome: "success", StaticMemberships: total, StaticGeneration: target.Generation, DynamicGeneration: target.DynamicGeneration, WallNS: time.Since(started).Nanoseconds()})
 }
 
 func capacityPackets(t *testing.T, peer *peerNamespace, ssh, banned, udpSSH bool) {
@@ -382,7 +345,7 @@ func capacityPackets(t *testing.T, peer *peerNamespace, ssh, banned, udpSSH bool
 
 func TestE2ENFTProductionCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		t.Logf("%s", runIsolated(t, "TestE2ENFTProductionCapacity", "nftables"))
+		runIsolated(t, "TestE2ENFTProductionCapacity", "nftables")
 		return
 	}
 	requireIsolatedChild(t)
@@ -407,12 +370,14 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("fixture-generator-maxrss-kib=%d user=%v system=%v", generatorUsage.Maxrss, generatorUsage.Utime, generatorUsage.Stime)
+	recordE2EPhase(t, e2ePhaseRecord{Backend: "nftables", Profile: "historical-production", Phase: "fixture-setup", Event: "setup", Outcome: "success", DurationNS: time.Since(generatorStarted).Nanoseconds()})
 	configPath := tempConfig(t, "production-capacity")
 	key := filepath.Join(t.TempDir(), "fixture.key")
 	if err := os.WriteFile(key, []byte(crowdFixtureKey), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	table := fmt.Sprintf("production_capacity_%d", os.Getpid())
+	phase := "fixture-setup"
 	write := func(ssh bool) {
 		text := strings.Replace(capacityfixture.YAML(table, server.URL, key, ssh), "refresh_interval: 1h", "refresh_interval: 1m\n  refresh_jitter: 1ns", 1)
 		text = strings.Replace(text, "geo:\n", "geo:\n  country_provider: ripestat\n", 1)
@@ -422,6 +387,8 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	}
 	failFile := filepath.Join(t.TempDir(), "fail-after-switch")
 	start := func(extra ...string) *daemonProcess {
+		actionStarted := time.Now()
+		recordE2EPhase(t, e2ePhaseRecord{Backend: "nftables", Profile: "historical-production", Phase: phase, Event: "action_start"})
 		extra = append(extra, "PERIMETERD_CAPACITY_FAIL_FILE="+failFile)
 		daemon := startDaemonCommand(t, capacityCommand(configPath, server.URL, extra...), "production capacity daemon", func() bool { return activeRevision() != "" }, 3*time.Minute)
 		fixture.mu.Lock()
@@ -431,24 +398,30 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 			waitCrowdPacket(t, peer, "tcp4", "8.22.0.1:18884", "success")
 			waitCrowdPacket(t, peer, "tcp6", "[2600:22::1]:18884", "success")
 		}
+		recordE2EPhase(t, e2ePhaseRecord{Backend: "nftables", Profile: "historical-production", Phase: phase, Event: "action_acknowledged", Outcome: "success", DurationNS: time.Since(actionStarted).Nanoseconds()})
 		return daemon
 	}
-	started := time.Now()
+	phase = "recorded-unshared-recovery"
+	started := beginCapacityPhase(t, phase)
 	write(true)
-	historical := capacityStageHistorical(t, configPath, server.URL, peer)
-	capacityMeasure(t, nil, table, "recorded-unshared-recovery", started)
+	historical, snapshot := capacityStageHistorical(t, configPath, server.URL, peer)
+	capacityMeasure(t, nil, snapshot.target, phase, started, snapshot)
+	phase = "recorded-unshared-to-shared"
+	started = beginCapacityPhase(t, phase)
 	daemon := start()
-	migrated := capacityAssertState(t, true)
+	migrated, snapshot := capacityAssertState(t, true, phase)
 	if migrated.Target.Generation == historical.Target.Generation {
 		t.Fatal("normal startup did not migrate the recorded unshared generation")
 	}
-	capacityMeasure(t, daemon, table, "recorded-unshared-to-shared", started)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	capacityPackets(t, peer, true, true, true)
+	phase = "initial"
+	started = beginCapacityPhase(t, phase)
 	write(false)
 	previousInitial := activeRevision()
 	initialOutput := command(t, 180*time.Second, e2eBinary(t), "reload")
 	assertReloadAcknowledgement(t, previousInitial, reloadConfigDigest(t, configPath), initialOutput)
-	initial := capacityAssertState(t, false)
+	initial, snapshot := capacityAssertState(t, false, phase)
 	fixture.mu.Lock()
 	size := fixture.bytes
 	fixture.mu.Unlock()
@@ -461,24 +434,26 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 		t.Fatalf("unique live decision counts=%+v", counts)
 	}
 	t.Logf("full-LAPI-bytes=%d unique-live-IDs=%d IPv4-IDs=%d IPv6-IDs=%d (not a native prefix count)", size, counts.IPv4+counts.IPv6, counts.IPv4, counts.IPv6)
-	capacityMeasure(t, daemon, table, "initial", started)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	t.Logf("exact shared geo savings=%d memberships (historical pair=%d shared=%d; unrelated=%d)", capacityfixture.GeoMemberships, 2*capacityfixture.GeoMemberships, capacityfixture.GeoMemberships, capacityfixture.UnrelatedMemberships)
 	capacityPackets(t, peer, false, true, false)
 
-	started = time.Now()
+	phase = "add-ssh"
+	started = beginCapacityPhase(t, phase)
 	before := activeRevision()
 	write(true)
 	output := command(t, 180*time.Second, e2eBinary(t), "reload", "--expect-config-sha256", reloadConfigDigest(t, configPath))
 	assertReloadAcknowledgement(t, before, reloadConfigDigest(t, configPath), output)
-	withSSH := capacityAssertState(t, true)
+	withSSH, snapshot := capacityAssertState(t, true, phase)
 	if withSSH.Target.Generation == initial.Target.Generation {
 		t.Fatal("SSH reload did not create distinct static generation")
 	}
-	capacityMeasure(t, daemon, table, "add-ssh", started)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	capacityPackets(t, peer, true, true, true)
 
 	// Change only egress's effective membership, leaving ingress and SSH intact.
-	started = time.Now()
+	phase = "split-egress-only"
+	started = beginCapacityPhase(t, phase)
 	beforeSplitStatus := capacityReadyStatus(t)
 	baseText, err := os.ReadFile(configPath) // #nosec G304 -- private namespace policy fixture.
 	if err != nil {
@@ -498,13 +473,13 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	output = command(t, 180*time.Second, e2eBinary(t), "reload")
 	assertReloadAcknowledgement(t, before, reloadConfigDigest(t, configPath), output)
 	split := capacityReadRevision(t)
-	capacityAssertSplit(t, split)
+	snapshot = capacityAssertSplit(t, split)
 	splitStatus := capacityReadyStatus(t)
 	if !reflect.DeepEqual(splitStatus.Applied.Details.PrefixCounts, beforeSplitStatus.Applied.Details.PrefixCounts) ||
 		!reflect.DeepEqual(splitStatus.Applied.Details.CrowdSec.Counts, beforeSplitStatus.Applied.Details.CrowdSec.Counts) {
 		t.Fatal("geo sharing split changed source or live decision accounting")
 	}
-	capacityMeasure(t, daemon, table, "split-egress-only", started)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	for _, network := range []string{"tcp4", "tcp6"} {
 		host, remote := "8.20.0.1:18885", "8.20.0.2:18886"
 		if network == "tcp6" {
@@ -513,19 +488,22 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 		probeIngress(t, peer, network, host, "success", "tcp")
 		probeEgress(t, peer, network, remote, "drop", "tcp")
 	}
-	started = time.Now()
+	phase = "merge-egress"
+	started = beginCapacityPhase(t, phase)
 	if err := os.WriteFile(configPath, baseText, 0o600); err != nil { // #nosec G703 -- restores the private namespace policy fixture.
 		t.Fatal(err)
 	}
 	before = activeRevision()
 	output = command(t, 180*time.Second, e2eBinary(t), "reload")
 	assertReloadAcknowledgement(t, before, reloadConfigDigest(t, configPath), output)
-	withSSH = capacityAssertState(t, true)
-	capacityMeasure(t, daemon, table, "merge-egress", started)
+	withSSH, snapshot = capacityAssertState(t, true, phase)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	capacityPackets(t, peer, true, true, true)
 
 	// A failure after the actual native switch must roll back the previous
 	// acknowledged shared representation, including its live CrowdSec leases.
+	phase = "post-switch-rollback"
+	started = beginCapacityPhase(t, phase)
 	beforeRollback := capacityReadRevision(t)
 	if err := os.WriteFile(configPath, []byte(splitText), 0o600); err != nil { // #nosec G703 -- private namespace rollback fixture.
 		t.Fatal(err)
@@ -537,27 +515,29 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	if output, err := rollbackCmd.CombinedOutput(); err == nil {
 		t.Fatalf("post-switch failed reload was acknowledged: %s", output)
 	}
-	afterRollback := capacityAssertState(t, true)
+	afterRollback, snapshot := capacityAssertState(t, true, phase)
 	if afterRollback.ID != beforeRollback.ID || !reflect.DeepEqual(afterRollback.Target, beforeRollback.Target) {
 		t.Fatal("failed reload changed acknowledged shared target")
 	}
 	capacityPackets(t, peer, true, true, true)
-	capacityMeasure(t, daemon, table, "post-switch-rollback", time.Now())
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	if err := os.WriteFile(configPath, baseText, 0o600); err != nil { // #nosec G703 -- restores the private namespace policy fixture.
 		t.Fatal(err)
 	}
 
-	started = time.Now()
+	phase = "unchanged"
+	started = beginCapacityPhase(t, phase)
 	before = activeRevision()
 	output = command(t, 180*time.Second, e2eBinary(t), "reload")
 	assertReloadAcknowledgement(t, before, reloadConfigDigest(t, configPath), output)
-	unchanged := capacityAssertState(t, true)
+	unchanged, snapshot := capacityAssertState(t, true, phase)
 	if unchanged.Target.Generation != withSSH.Target.Generation {
 		t.Fatal("unchanged reload replaced static generation")
 	}
-	capacityMeasure(t, daemon, table, "unchanged", started)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 
-	started = time.Now()
+	phase = "country-refresh"
+	started = beginCapacityPhase(t, phase)
 	fixture.mu.Lock()
 	fixture.refresh = true
 	fixture.mu.Unlock()
@@ -573,20 +553,22 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	if refreshed == nil || refreshed.Target.Generation == unchanged.Target.Generation {
 		t.Fatal("country refresh never acknowledged a distinct static generation")
 	}
-	capacityAssertState(t, true)
-	capacityMeasure(t, daemon, table, "country-refresh", started)
+	_, snapshot = capacityAssertState(t, true, phase)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 
+	phase = "dynamic-delete"
+	started = beginCapacityPhase(t, phase)
 	fixture.mu.Lock()
 	fixture.deletePeers = true
 	fixture.mu.Unlock()
 	waitCrowdPacket(t, peer, "tcp4", "8.22.0.1:18883", "success")
 	waitCrowdPacket(t, peer, "tcp6", "[2600:22::1]:18883", "success")
-	afterDynamic := capacityAssertState(t, true)
+	afterDynamic, snapshot := capacityAssertState(t, true, phase)
 	if afterDynamic.Target.Generation != refreshed.Target.Generation {
 		t.Fatal("independent dynamic change replaced static generation")
 	}
 	capacityPackets(t, peer, true, false, true)
-	capacityMeasure(t, daemon, table, "dynamic-delete", time.Now())
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	daemon.stop(t)
 
 	// A normal restart creates its own exact same-ID prepared journal before
@@ -606,11 +588,12 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	if view.Journal == nil || view.Journal.Phase != "prepared" || view.Journal.Previous != view.Active.ID || view.Journal.Candidate != view.Active.ID || view.Journal.PreviousManifest != view.Journal.CandidateManifest || len(view.Journal.Revisions) != 1 {
 		t.Fatalf("not exact production journal: %+v", view.Journal)
 	}
-	started = time.Now()
+	phase = "same-ID-recovery"
+	started = beginCapacityPhase(t, phase)
 	daemon = start()
-	capacityAssertState(t, true)
+	_, snapshot = capacityAssertState(t, true, phase)
 	capacityPackets(t, peer, true, false, true)
-	capacityMeasure(t, daemon, table, "same-ID-recovery", started)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	daemon.stop(t)
 
 	// A genuine changed static target is interrupted after durable preparation;
@@ -639,9 +622,12 @@ func TestE2ENFTProductionCapacity(t *testing.T) {
 	if err := os.WriteFile(configPath, text, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	phase = "distinct-ID-recovery"
+	started = beginCapacityPhase(t, phase)
 	daemon = start()
-	capacityAssertState(t, true)
+	_, snapshot = capacityAssertState(t, true, phase)
 	capacityPackets(t, peer, true, false, true)
+	capacityMeasure(t, daemon, snapshot.target, phase, started, snapshot)
 	daemon.stop(t)
 
 	capacityNativeFailureCases(t, configPath, server.URL, start)
@@ -667,7 +653,8 @@ func capacityNativeFailureCases(t *testing.T, configPath, sourceURL string, star
 	}
 	started := time.Now()
 	daemon := start(path)
-	capacityAssertState(t, true)
+	_, snapshot := capacityAssertState(t, true, "transient-native-failure")
+	defer snapshot.release()
 	if strings.Contains(daemon.output.String(), "SECRET-HOSTILE-NATIVE-DIAGNOSTIC") {
 		t.Fatal("early recovery leaked native diagnostic")
 	}

@@ -320,7 +320,7 @@ func dbipNativeSummaryUnchanged(t *testing.T, before []control.StatusSource) {
 func TestE2EDBIPNative(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, backend := range []string{"nftables", "iptables-legacy", "iptables-nft"} {
-			t.Run(backend, func(t *testing.T) { t.Logf("%s", runIsolated(t, "TestE2EDBIPNative", backend)) })
+			t.Run(backend, func(t *testing.T) { runIsolated(t, "TestE2EDBIPNative", backend) })
 		}
 		return
 	}

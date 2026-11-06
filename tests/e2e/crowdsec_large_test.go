@@ -102,7 +102,7 @@ func largeCrowdStatus(t *testing.T) control.StatusResult {
 
 func TestE2ECrowdSecLargeSnapshot(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		t.Logf("%s", runIsolated(t, "TestE2ECrowdSecLargeSnapshot", "nftables"))
+		runIsolated(t, "TestE2ECrowdSecLargeSnapshot", "nftables")
 		return
 	}
 	requireIsolatedChild(t)

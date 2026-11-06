@@ -24,7 +24,7 @@ import (
 
 func TestE2ENFTMissingWitnessRefused(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		t.Logf("%s", runIsolated(t, "TestE2ENFTMissingWitnessRefused", "missing-witness"))
+		runIsolated(t, "TestE2ENFTMissingWitnessRefused", "missing-witness")
 		return
 	}
 	requireIsolatedChild(t)
@@ -65,7 +65,7 @@ func TestE2ENFTMissingWitnessRefused(t *testing.T) {
 
 func TestE2EOldStateRecordVersionRefused(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		t.Logf("%s", runIsolated(t, "TestE2EOldStateRecordVersionRefused", "old-state-record"))
+		runIsolated(t, "TestE2EOldStateRecordVersionRefused", "old-state-record")
 		return
 	}
 	requireIsolatedChild(t)

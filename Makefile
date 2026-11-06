@@ -25,6 +25,8 @@ E2E_SUDO ?=
 # Literal Go test regexes; the recipe uses value to preserve "$/" anchors.
 E2E_RUN ?=
 E2E_SKIP ?=
+# Optional small JSONL phase artifacts; empty preserves unrestricted local runs.
+E2E_PHASE_DIR ?=
 CROWDSEC_CONTAINER_RUNTIME ?= docker
 DOCKER_TEST_BINDIR ?=
 ZITI_TEST_BINARY ?=
@@ -94,7 +96,8 @@ build-e2e: build
 	$(GO) test -tags 'linux e2e' -c -o "$(E2E_TEST_BINARY)" ./tests/e2e
 
 test-e2e: build-e2e
-	$(E2E_SUDO) env PERIMETERD_E2E=1 E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.count=1 -test.run '$(value E2E_RUN)' -test.skip '$(value E2E_SKIP)'
+	@if [ -n "$(value E2E_PHASE_DIR)" ]; then mkdir -p "$(abspath $(E2E_PHASE_DIR))"; fi
+	$(E2E_SUDO) env PERIMETERD_E2E=1 PERIMETERD_E2E_PHASE_DIR="$(if $(E2E_PHASE_DIR),$(abspath $(E2E_PHASE_DIR)))" E2E_BINARY="$(abspath $(BINARY))" "$(abspath $(E2E_TEST_BINARY))" -test.v -test.count=1 -test.run '$(value E2E_RUN)' -test.skip '$(value E2E_SKIP)'
 
 test-crowdsec:
 		command -v "$(CROWDSEC_CONTAINER_RUNTIME)" >/dev/null 2>&1 || { \

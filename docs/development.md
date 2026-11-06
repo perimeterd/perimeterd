@@ -213,9 +213,11 @@ make test-e2e
 # If user namespaces are unavailable or legacy /proc inventory is inaccessible:
 make test-e2e E2E_SUDO=sudo
 # Match the CI core shard:
-E2E_SKIP='^TestE2EDBIPCapacity$' make test-e2e E2E_SUDO=sudo
+E2E_SKIP='^TestE2E(DBIPCapacity|NFTProductionCapacity|CrowdSecNFTInventoryCapacity|CrowdSecIPSetProjectionCapacity|CrowdSecNativeScale)$' make test-e2e E2E_SUDO=sudo
 # Run one complete capacity backend:
 E2E_RUN='^TestE2EDBIPCapacity$/^nftables$' make test-e2e E2E_SUDO=sudo
+# Preserve small phase artifacts during a local run:
+E2E_PHASE_DIR=artifacts/e2e/local make test-e2e E2E_SUDO=sudo
 ```
 
 `E2E_RUN` and `E2E_SKIP` forward Go's test run/skip selectors. Both default
@@ -223,11 +225,13 @@ to empty, so plain `make test-e2e` still runs the complete native suite.
 Selectors are passed literally, including `$/` between test and backend
 patterns; the environment-variable examples need no Make-specific escaping.
 
-CI uses separate runners for the core suite and each DB-IP capacity backend:
+CI uses six disjoint native shards; helper-only regressions run in core once:
 
 | Shard | Selection | Job timeout, minutes |
 | --- | --- | ---: |
-| core | Everything except `TestE2EDBIPCapacity` | 90 |
+| core | All remaining policy/lifecycle tests and helper regressions | 90 |
+| historical-nft | `TestE2ENFTProductionCapacity` and `TestE2ECrowdSecNFTInventoryCapacity` | 90 |
+| dynamic-scale | `TestE2ECrowdSecIPSetProjectionCapacity` and `TestE2ECrowdSecNativeScale` | 90 |
 | capacity-nftables | `TestE2EDBIPCapacity/nftables` | 150 |
 | capacity-iptables-legacy | `TestE2EDBIPCapacity/iptables-legacy` | 90 |
 | capacity-iptables-nft | `TestE2EDBIPCapacity/iptables-nft` | 90 |
@@ -236,6 +240,13 @@ The measured nft capacity lifecycle alone exceeds 90 minutes. Its CI deadline
 allows the existing two-hour isolated scenario plus setup/compilation; native
 command deadlines and workload sizes are unchanged. Matrix fail-fast is
 disabled so one backend failure does not cancel coverage of the others.
+
+`privileged firewall E2E` remains the mandatory aggregate and requires exact
+matrix success. Each shard also rejects empty/helper-only native execution
+from its completed namespace records, even if Go's selector exits zero.
+PR, push/release and reusable-workflow routing use the same matrix. Extra
+runners trade setup/runner minutes and possible queueing for elapsed time;
+the matrix is not a claim of measured hosted speedup.
 
 
 The target first builds the binary, then checks for `nft`, `ip`, `ipset`,
@@ -266,6 +277,140 @@ configuration to become durably selected, candidate-correlated rejection
 evidence, or changed packet behavior; a request starting is not proof that its
 candidate finished. Keep bounded quiet windows for absence assertions and real
 lease-expiry waits, not fixed sleeps standing in for reload completion.
+
+#### Phase observations and evidence
+
+The namespace runner streams only short `PERIMETERD_E2E_PHASE` JSON records,
+not nested Go test control lines, inventories, prefixes, credentials or LAPI
+bodies. It synchronizes stdout/stderr, preserves complete semantic output in
+a private spool, and keeps a separate 64 KiB diagnostic tail for failure.
+Successful output is not replayed. Namespace exit/cancellation still relies
+on PID-namespace init and `unshare --kill-child`; the real cancellation smoke
+checks that a live descendant's Unix connection closes.
+
+An acknowledged stable DB-IP phase owns one complete parsed snapshot: one
+owned nft table, or one complete `ipset save` plus both family rule inventories.
+Count/spare checks, set references, exact membership/leases and measurements
+reuse that observation. Static nft element arrays are not retained as generic
+JSON trees. The capture's original timestamps bound lease comparison; another
+reload, source change, restart, interruption or cleanup requires another
+capture. Revision/config epoch/source epoch/operation changes during capture
+fail validation instead of silently reusing stale data. After rejection, the
+retained client's fresh, valid full-sync epoch must be acknowledged before
+capture; the rejection log alone is not completion. The phase releases its
+parsed inventory before the next
+mutation. Foreign rule checks retain explicit native `-C` checks as well as
+their complete family inventory; ipsets do not substitute for rule evidence.
+
+Records separate setup, operation acknowledgement, packet probes, native
+capture, decode, comparison and phase end. `E2E_PHASE_DIR` enables metadata-only
+JSONL files readable after `sudo`; Make creates the output directory before
+privilege escalation so local summaries can also be written unprivileged.
+CI uploads these records and a small summary on success/failure/cancellation
+where possible. Upload/summary cannot replace the primary result; missing
+mandatory native evidence still fails the shard.
+Summarize local records with:
+
+```sh
+python3 scripts/e2e-phases.py artifacts/e2e/local --require-native \
+  --summary artifacts/e2e/local/summary.json
+```
+
+Recorded subphase times can overlap; do not sum them as shard elapsed time.
+Use job timestamps for runner minutes/critical path and include setup, cache
+state and queueing separately. Process `VmHWM` is cumulative, not phase
+allocation; inspection-child `rusage` can inherit pre-exec parent peaks.
+
+Local matched measurements (2026-11-05) used the same Fedora x86-64 workstation,
+kernel `7.2.11-200.fc44.x86_64`, Go 1.27.3, nft 1.1.6, ipset 7.24/protocol 7
+and iptables 1.8.11. Baseline commit:
+`62e487647f89b51a424ac148517f04ef412ea`; optimized code was the uncommitted
+runtime change on that commit. Each disposable namespace contained 892,659
+normalized static memberships and 150,000 timed memberships. Builds/module
+caches were warm. The bounded comparison included count/reference checks,
+exact membership/leases and measurement, not the entire lifecycle.
+
+| Backend | Stable phase before (s) | Stable phase after (s) | Complete captures after | Captured bytes after |
+| --- | ---: | ---: | --- | ---: |
+| nftables | 147.514 | 38.079 | One owned table | 60,880,230 |
+| iptables-legacy | 4.482 | 3.031 | One ipset inventory + two family rule inventories | 60,107,188 |
+| iptables-nft | 4.372 | 3.124 | One ipset inventory + two family rule inventories | 60,107,220 |
+
+Execve-only tracing independently counted four complete nft table dumps before
+and one after during that stable phase; each dump was approximately 60.88 MB.
+Both nft comparisons used the same tracing setup. Traced iptables startup
+exceeded its existing startup bound, so the comparable iptables measurements
+above are untraced; their baseline command counts were not externally measured.
+The remaining nft capture alone took 35.293 s, with 0.323 s decode and
+0.058 s exact comparison: native serialization/kernel inspection remains the
+dominant measured cost, not expected-projection construction.
+
+These are local observations, not hosted critical-path or memory improvements:
+
+| nft process cumulative `VmHWM` | Before (KiB) | After (KiB) |
+| --- | ---: | ---: |
+| E2E parent | 527,100 | 592,908 |
+| Daemon | 1,552,696 | 2,089,176 |
+
+The higher nft peaks remain a risk; a single cumulative sample does not
+attribute allocations or establish a memory win. Local serial shard time
+cannot establish hosted queue time, parallel critical path or total runner
+minutes including setup. Current hosted comparison requires an authenticated
+GitHub session and a pushed ref; neither was available on this workstation.
+
+Final `make verify`, `make test-race` and `make support-check` passed with
+`GOTOOLCHAIN=auto`, including workflow lint and 91 release/helper tests.
+Focused comparator, snapshot and output regressions also passed under `-race`.
+
+The complete mandatory local qualification passed, including every existing
+large recovery checkpoint. Successful shard invocations on that workstation:
+
+| Shard | Local wall time (minutes) |
+| --- | ---: |
+| core | 22.960 |
+| historical-nft | 32.725 |
+| dynamic-scale | 2.685 |
+| capacity-nftables | 79.460 |
+| capacity-iptables-legacy | 23.838 |
+| capacity-iptables-nft | 22.035 |
+
+These serial invocations span two verification runs, include Make/build work,
+and exclude hosted setup/queueing; they are not a hosted parallel critical-path
+comparison. All three capacity backends were rerun in full after the first nft
+run caught the retained-client resynchronization race. Final records show 17
+stable observations per backend, each with exactly one nft-table capture or
+one ipset plus two family-rule captures. Real daemon rejection, exact renewal/
+replacement, later admission and all restarts/recoveries passed.
+
+The real namespace cancellation smoke, completed malformed-refresh checks,
+all three OpenZiti/private-LAPI backends and both Docker coexistence backends
+also passed. Real-LAPI compatibility, packaging and systemd gates retain their
+existing workflow contracts; their separate unchanged harnesses were not rerun.
+
+#### Coverage retained by runtime optimization
+
+No full-scale native case or recovery/backend combination was removed.
+Only the pure comparator fixture was compacted; all native volume witnesses
+remain mandatory on PRs and releases.
+
+| Property / oracle | Retained test or helper | Scale-sensitive witness |
+| --- | --- | --- |
+| Equal-count wrong membership and stale renewal, both encodings/families | `TestNativeProjectionValidation` | Four mixed-family retained/removed/introduced/renewed entries; native exact comparison remains below |
+| Complete membership, finite expiry, unexpected timed sets/spares, capture age | `checkSnapshotProjection`, `TestNativeProjectionParsing`, `TestNativePhaseSnapshotObservation` | DB-IP replacement has 149,998 exact members; growth and retained/admissible authority have 300,000 |
+| Complete inventory, shared references and orphan retirement | `dbipCapacityState`, `snapshotNativeReferences` | 892,659 static memberships; distinct/reused generation identities and coexistence |
+| Daemon budget rejection, durable/native authority, later changed admission | `TestE2EDBIPCapacity` | Real 131,072-decision LAPI snapshot expands to 4,259,840 timed pieces; source/durable fences checked separately |
+| Large restart and same/distinct-ID prepared/partial-switch recovery | `TestE2EDBIPCapacity` | Full static data and live 300,000-ban projection on all three backends; every prior checkpoint retained |
+| Historical unshared-to-shared migration and coexistence | `TestE2ENFTProductionCapacity` | Recorded identity, expanded historical data, live authority and actual switch/recovery |
+| Empty attached growth, renewal, disjoint IPv6 replacement, mapped residuals and nil/empty API distinctions | `TestE2ECrowdSecNativeScale` | 100,000-member updates on all backends; both-family packet behavior |
+| Overlapping authority, populated spare/maxelem, chunked initial/clear/reinstall | `TestE2ECrowdSecIPSetProjectionCapacity` | 400,000 decisions yield one million native IPv6 prefixes; two-million desired rejection preserves every old member |
+| Retained nft inventory boundary and observed timed state | `TestE2ECrowdSecNFTInventoryCapacity` | Supported/over-budget native populations and separate static/dynamic fit proofs unchanged |
+| Completed malformed refresh, then prior packet enforcement | `TestE2EGeo`, `TestE2EIPTablesGeo` | Explicit malformed switch and bounded completed-rejection/fallback evidence replace the blind sleep; all packet outcomes retained |
+
+The sparse expected projection still uses the production CrowdSec store:
+the matched local 150,000-member oracle took 128–154 ms versus tens of seconds
+per nft capture. That did not justify another projection implementation.
+No uncertain transition equivalence was used to remove a volume witness, and
+packet probes remain serial to preserve their DROP/REJECT timing semantics.
 
 Acknowledgement regressions use channels/checkpoints to hold native apply and
 publication, replace a file after its read, supersede staging with another request
@@ -1498,8 +1643,13 @@ equivalent JSON payload would be admitted by LAPI.
 
 Each native profile reports only the phases it reaches: authority admission,
 activation preflight/apply, unchanged renewal, cold reconnect, and geo-refresh
-preflight/apply/retire/reconcile (including nil dynamic activation). Native
-capacity rejection stops that profile; later dependent phases are not
+preflight/apply/retire/reconcile (including nil dynamic activation). Completed
+measurements stream through the namespace runner as `PERIMETERD_E2E_PHASE` JSON
+records with `event=measurement`, the backend/frontend, profile, phase,
+`duration_ns`, and static/source-decision/projected counts. Successful reporting
+does not depend on replaying child `t.Log` output.
+
+Native capacity rejection stops that profile; later dependent phases are not
 exercised. Native phase timings have no performance assertions. The native
 input/inspection budgets and capacity errors are correctness boundaries, not
 implicit timing or throughput targets.

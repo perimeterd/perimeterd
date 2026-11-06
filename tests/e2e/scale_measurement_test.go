@@ -125,7 +125,7 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, backend := range []string{"nftables", "iptables-legacy", "iptables-nft"} {
 			t.Run(backend, func(t *testing.T) {
-				t.Logf("%s", runIsolated(t, "TestE2ECrowdSecNativeMeasurement", backend))
+				runIsolated(t, "TestE2ECrowdSecNativeMeasurement", backend)
 			})
 		}
 		return
@@ -133,7 +133,8 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 
 	requireIsolatedChild(t)
 	prepareMounts(t)
-	backendName := os.Getenv(e2eScenario)
+	backendScenario := os.Getenv(e2eScenario)
+	backendName := backendScenario
 	if strings.HasPrefix(backendName, "iptables-") {
 		installIPTablesTools(t, strings.TrimPrefix(backendName, "iptables-"))
 		backendName = "iptables"
@@ -162,7 +163,15 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 				t.Fatal(err)
 			}
 			projection := store.Projection(started)
-			t.Logf("profile=%s backend=%s authority=accepted decisions=%d projected-prefixes=%d", profile.name, backendName, profile.decisions, len(projection))
+			report := func(phase string, started time.Time, projected int) {
+				recordE2EPhase(t, e2ePhaseRecord{
+					Backend: backendScenario, Profile: profile.name, Phase: phase,
+					Event: "measurement", Outcome: "success",
+					StaticMemberships: int(profile.geoPrefixes), SourceDecisions: len(startup.New),
+					ProjectedMemberships: projected, DurationNS: time.Since(started).Nanoseconds(),
+				})
+			}
+			report("authority-admission", started, len(projection))
 			dynamic := &firewall.DynamicState{Prefixes: projection}
 			target := nativeMeasurementTarget(t, backendName, profile.geoPrefixes, 0, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", nil)
 
@@ -170,21 +179,21 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			if err := backend.Preflight(ctx, nil, target, dynamic); err != nil {
 				t.Fatalf("profile=%s backend=%s admission=error phase=activation-preflight elapsed=%s: %v", profile.name, backendName, time.Since(preflightStarted), err)
 			}
-			t.Logf("profile=%s backend=%s admission=accepted phase=activation-preflight elapsed=%s", profile.name, backendName, time.Since(preflightStarted))
+			report("activation-preflight", preflightStarted, len(projection))
 
 			owned = append(owned, target)
 			applyStarted := time.Now()
 			if err := backend.Apply(ctx, nil, target, dynamic); err != nil {
 				t.Fatalf("profile=%s backend=%s execution=error phase=activation-apply elapsed=%s: %v", profile.name, backendName, time.Since(applyStarted), err)
 			}
-			t.Logf("profile=%s backend=%s execution=accepted phase=activation-apply elapsed=%s", profile.name, backendName, time.Since(applyStarted))
+			report("activation-apply", applyStarted, len(projection))
 
 			// Renewal writes the exact unchanged source projection and deadlines.
 			renewalStarted := time.Now()
 			if err := backend.UpdateDynamic(ctx, target, projection); err != nil {
 				t.Fatalf("profile=%s backend=%s execution=error phase=renewal elapsed=%s: %v", profile.name, backendName, time.Since(renewalStarted), err)
 			}
-			t.Logf("profile=%s backend=%s execution=accepted phase=renewal elapsed=%s prefixes=%d", profile.name, backendName, time.Since(renewalStarted), len(projection))
+			report("renewal", renewalStarted, len(projection))
 
 			reconnected := crowdsec.NewStore("native-measurement", 2)
 			reconnectStarted := time.Now()
@@ -195,7 +204,7 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			if err := backend.UpdateDynamic(ctx, target, reconnectedProjection); err != nil {
 				t.Fatalf("profile=%s backend=%s execution=error phase=cold-reconnect elapsed=%s: %v", profile.name, backendName, time.Since(reconnectStarted), err)
 			}
-			t.Logf("profile=%s backend=%s execution=accepted phase=cold-reconnect elapsed=%s prefixes=%d", profile.name, backendName, time.Since(reconnectStarted), len(reconnectedProjection))
+			report("cold-reconnect", reconnectStarted, len(reconnectedProjection))
 
 			// A geo refresh changes the static source target. Admission receives
 			// the live CrowdSec projection, while activation is nil so existing
@@ -205,26 +214,26 @@ func TestE2ECrowdSecNativeMeasurement(t *testing.T) {
 			if err := backend.Preflight(ctx, target, refreshedTarget, dynamic); err != nil {
 				t.Fatalf("profile=%s backend=%s admission=error phase=geo-refresh-preflight elapsed=%s: %v", profile.name, backendName, time.Since(refreshPreflightStarted), err)
 			}
-			t.Logf("profile=%s backend=%s admission=accepted phase=geo-refresh-preflight elapsed=%s", profile.name, backendName, time.Since(refreshPreflightStarted))
+			report("geo-refresh-preflight", refreshPreflightStarted, len(projection))
 
 			owned = append(owned, refreshedTarget)
 			refreshApplyStarted := time.Now()
 			if err := backend.Apply(ctx, target, refreshedTarget, nil); err != nil {
 				t.Fatalf("profile=%s backend=%s execution=error phase=geo-refresh-apply elapsed=%s: %v", profile.name, backendName, time.Since(refreshApplyStarted), err)
 			}
-			t.Logf("profile=%s backend=%s execution=accepted phase=geo-refresh-apply elapsed=%s", profile.name, backendName, time.Since(refreshApplyStarted))
+			report("geo-refresh-apply", refreshApplyStarted, len(projection))
 			retireStarted := time.Now()
 			if err := backend.Retire(ctx, target, refreshedTarget); err != nil {
 				t.Fatalf("profile=%s backend=%s execution=error phase=geo-refresh-retire elapsed=%s: %v", profile.name, backendName, time.Since(retireStarted), err)
 			}
-			t.Logf("profile=%s backend=%s execution=accepted phase=geo-refresh-retire elapsed=%s", profile.name, backendName, time.Since(retireStarted))
+			report("geo-refresh-retire", retireStarted, len(projection))
 			target = refreshedTarget
 
 			refreshReconcileStarted := time.Now()
 			if err := backend.UpdateDynamic(ctx, target, projection); err != nil {
 				t.Fatalf("profile=%s backend=%s execution=error phase=geo-refresh-reconcile elapsed=%s: %v", profile.name, backendName, time.Since(refreshReconcileStarted), err)
 			}
-			t.Logf("profile=%s backend=%s execution=accepted phase=geo-refresh-reconcile elapsed=%s", profile.name, backendName, time.Since(refreshReconcileStarted))
+			report("geo-refresh-reconcile", refreshReconcileStarted, len(projection))
 		})
 	}
 }

@@ -384,7 +384,7 @@ func isolateDockerSecurityFS(t *testing.T) {
 // policy. It exercises the isolation boundary even on hosts without AppArmor.
 func TestE2EDockerSecurityIsolation(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		t.Logf("%s", runIsolated(t, "TestE2EDockerSecurityIsolation", "securityfs"))
+		runIsolated(t, "TestE2EDockerSecurityIsolation", "securityfs")
 		return
 	}
 	requireIsolatedChild(t)

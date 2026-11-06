@@ -34,7 +34,7 @@ func TestE2EDockerCoexistence(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, variant := range []string{"nft", "legacy"} {
 			t.Run(variant, func(t *testing.T) {
-				t.Logf("%s", runIsolated(t, "TestE2EDockerCoexistence", variant))
+				runIsolated(t, "TestE2EDockerCoexistence", variant)
 			})
 		}
 		return

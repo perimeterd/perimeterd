@@ -18,8 +18,7 @@ func TestE2EAcknowledgedReload(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, backend := range []string{"nftables", "nft", "legacy"} {
 			t.Run(backend, func(t *testing.T) {
-				output := runIsolated(t, "TestE2EAcknowledgedReload", backend)
-				t.Logf("%s", output)
+				runIsolated(t, "TestE2EAcknowledgedReload", backend)
 			})
 		}
 		return

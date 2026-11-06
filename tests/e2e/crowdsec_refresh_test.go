@@ -94,7 +94,7 @@ func (s *refreshCapacitySources) RoundTrip(request *http.Request) (*http.Respons
 
 func TestE2ECrowdSecGeoRefreshCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
-		t.Logf("%s", runIsolated(t, "TestE2ECrowdSecGeoRefreshCapacity", "nftables"))
+		runIsolated(t, "TestE2ECrowdSecGeoRefreshCapacity", "nftables")
 		return
 	}
 	requireIsolatedChild(t)

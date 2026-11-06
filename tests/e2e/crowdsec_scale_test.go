@@ -5,14 +5,11 @@ package e2e
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
 	"os"
-	"os/exec"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -68,63 +65,9 @@ func largeNativeProjection(ipv6 bool) []policy.TimedPrefix {
 // Exactly two timeout sets also proves successful resizing removed its spare.
 func assertNativeProjectionCount(t *testing.T, target *firewall.Target, want int) {
 	t.Helper()
-	count, sets := 0, 0
-	if target.Backend() == "nftables" {
-		var response struct {
-			NFTables []struct {
-				Set *struct {
-					Flags    []string          `json:"flags"`
-					Elements []json.RawMessage `json:"elem"`
-				} `json:"set"`
-			} `json:"nftables"`
-		}
-		// Bound diagnostic capture separately; the daemon's own finite native
-		// deadline is exercised by subsequent production lifecycle operations.
-		started := time.Now()
-		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
-		defer cancel()
-		// #nosec G204 -- fixed nft executable; validated fixture table is one argv value, never shell input.
-		cmd := exec.CommandContext(ctx, "nft", "-j", "list", "table", "inet", target.Table)
-		output, err := cmd.Output()
-		if cmd.ProcessState != nil {
-			usage := cmd.ProcessState.SysUsage().(*syscall.Rusage)
-			t.Logf("complete nft inspection wall=%s bytes=%d child-user=%s child-system=%s child-maxrss-kib=%d", time.Since(started), len(output), cmd.ProcessState.UserTime(), cmd.ProcessState.SystemTime(), usage.Maxrss)
-		}
-		if err != nil {
-			t.Fatalf("complete nft inspection failed after %s: %v", time.Since(started), err)
-		}
-		if err := json.Unmarshal(output, &response); err != nil {
-			t.Fatal(err)
-		}
-		for _, row := range response.NFTables {
-			if row.Set != nil {
-				for _, flag := range row.Set.Flags {
-					if flag == "timeout" {
-						sets++
-						count += len(row.Set.Elements)
-					}
-				}
-			}
-		}
-	} else {
-		timed := make(map[string]bool)
-		for line := range strings.SplitSeq(string(command(t, 30*time.Second, "ipset", "save")), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 3 {
-				continue
-			}
-			if fields[0] == "create" && strings.Contains(line, " timeout ") {
-				timed[fields[1]] = true
-				sets++
-			}
-			if fields[0] == "add" && timed[fields[1]] {
-				count++
-			}
-		}
-	}
-	if count != want || sets != 2 {
-		t.Fatalf("native projection has %d entries across %d timeout sets, want %d entries in two live sets", count, sets, want)
-	}
+	snapshot := captureNativePhase(t, target, "projection-count", false)
+	defer snapshot.release()
+	assertSnapshotProjectionCount(t, snapshot, want)
 }
 
 func TestE2ECrowdSecNativeScale(t *testing.T) {
@@ -233,7 +176,7 @@ func TestE2ECrowdSecNFTInventoryCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, scenario := range []string{"supported", "over-budget"} {
 			t.Run(scenario, func(t *testing.T) {
-				t.Logf("%s", runIsolatedFor(t, "TestE2ECrowdSecNFTInventoryCapacity", scenario, 45*time.Minute))
+				runIsolatedFor(t, "TestE2ECrowdSecNFTInventoryCapacity", scenario, 45*time.Minute)
 			})
 		}
 		return
@@ -468,7 +411,7 @@ func TestE2ECrowdSecIPSetInterruptedWrites(t *testing.T) {
 func TestE2ECrowdSecIPSetProjectionCapacity(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, kind := range []string{"legacy", "nft"} {
-			t.Run(kind, func(t *testing.T) { t.Logf("%s", runIsolated(t, "TestE2ECrowdSecIPSetProjectionCapacity", kind)) })
+			t.Run(kind, func(t *testing.T) { runIsolated(t, "TestE2ECrowdSecIPSetProjectionCapacity", kind) })
 		}
 		return
 	}

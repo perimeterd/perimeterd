@@ -255,7 +255,7 @@ func TestE2EStatusCompiledSets(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, backend := range []string{"nftables", "iptables-legacy", "iptables-nft"} {
 			t.Run(backend, func(t *testing.T) {
-				t.Logf("%s", runIsolated(t, "TestE2EStatusCompiledSets", backend))
+				runIsolated(t, "TestE2EStatusCompiledSets", backend)
 			})
 		}
 		return

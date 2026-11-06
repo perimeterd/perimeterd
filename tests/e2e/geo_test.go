@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,11 +27,13 @@ const (
 )
 
 type geoFixtureTransport struct {
-	started   time.Time
-	validFor  time.Duration
-	country   atomic.Bool
-	asn       atomic.Bool
-	malformed atomic.Bool
+	started         time.Time
+	validFor        time.Duration
+	country         atomic.Bool
+	asn             atomic.Bool
+	malformed       atomic.Bool
+	rejectResponses atomic.Bool
+	output          lockedBuffer
 }
 
 func (f *geoFixtureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -61,7 +64,7 @@ func (f *geoFixtureTransport) RoundTrip(request *http.Request) (*http.Response, 
 	} else {
 		return nil, fmt.Errorf("unexpected RIPEstat endpoint %q", request.URL.Path)
 	}
-	if time.Since(f.started) >= f.validFor {
+	if f.rejectResponses.Load() || time.Since(f.started) >= f.validFor {
 		f.malformed.Store(true)
 		body = `{"status":"error"}`
 	}
@@ -89,8 +92,8 @@ func writeGeoConfig(t *testing.T, path, table string) {
 func geoConfigYAML(table string) string {
 	return fmt.Sprintf(`version: 1
 logging:
-  level: error
-  format: text
+  level: warn
+  format: json
 metrics:
   listen: ""
 global:
@@ -206,7 +209,7 @@ func TestE2EGeo(t *testing.T) {
 	table := fmt.Sprintf("pde2e_geo_%d", os.Getpid())
 	configPath := tempConfig(t, "geo")
 	writeGeoConfig(t, configPath, table)
-	fixture := &geoFixtureTransport{started: time.Now(), validFor: 8 * time.Second}
+	fixture := &geoFixtureTransport{started: time.Now(), validFor: 20 * time.Minute}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -215,7 +218,7 @@ func TestE2EGeo(t *testing.T) {
 			StateDir:       "/var/lib/perimeterd",
 			LockPath:       "/run/perimeterd/owner.lock",
 			SourceClient:   &http.Client{Transport: fixture},
-			Stderr:         io.Discard,
+			Stderr:         &fixture.output,
 			Notify:         func(string) error { return nil },
 			StartupTimeout: 2 * time.Minute,
 		})
@@ -277,12 +280,35 @@ func exerciseGeoPackets(t *testing.T, peer *peerNamespace, fixture *geoFixtureTr
 	probeIngress(t, peer, "udp4", fixtureExcludedIPv4Host+":18082", "success", "udp")
 	probeEgress(t, peer, "tcp4", fixtureExcludedIPv4Peer+":18081", "success", "tcp")
 
-	// The scheduled refresh now receives malformed responses. The committed
-	// source manifest and nftables target remain active rather than becoming an
-	// empty or partial policy.
-	time.Sleep(10 * time.Second)
-	if !fixture.malformed.Load() {
-		t.Fatal("scheduled refresh did not exercise malformed fixture response")
+	// Switch only after proving the committed policy's packet behavior. A
+	// request reaching the malformed fixture is not enough: wait until the
+	// daemon has processed that response and completed rejection/fallback.
+	logOffset := len(fixture.output.String())
+	fixture.rejectResponses.Store(true)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		completed := false
+		for line := range strings.Lines(fixture.output.String()[logOffset:]) {
+			var record struct {
+				Message string `json:"msg"`
+				Refresh bool   `json:"refresh"`
+			}
+			if json.Unmarshal([]byte(line), &record) != nil {
+				continue
+			}
+			if (record.Message == "candidate resolution failed" && record.Refresh) ||
+				record.Message == "using committed source snapshot after refresh failure" {
+				completed = true
+				break
+			}
+		}
+		if fixture.malformed.Load() && completed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduled malformed refresh rejection did not complete: response=%t\n%s", fixture.malformed.Load(), fixture.output.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	probeIngress(t, peer, "udp4", fixtureIPv4Host+":18082", "reject", "udp")
 	probeEgress(t, peer, "tcp4", fixtureIPv4Peer+":18081", "reject", "tcp")

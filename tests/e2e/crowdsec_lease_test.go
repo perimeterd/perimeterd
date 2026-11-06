@@ -188,25 +188,15 @@ func assertNativeCrowdLease(t *testing.T, target *firewall.Target, ceiling int64
 	}
 }
 
-// assertNativeProjection inspects the complete native inventory after an
-// acknowledged update. Relative native grants are calculated before encoding
-// and executing the write, so expiry validation includes that measured window
-// as well as the read window and whole-second rounding. The bounded windows
-// cannot hide the fixture's one-hour renewal. Capped authority exposes only
-// its finite native grant; the fixture renews below that cap.
-func assertNativeProjection(t *testing.T, target *firewall.Target, desired []policy.TimedPrefix, updatedAfter time.Time) {
+// assertNativeProjection reuses the phase's complete observation, including its
+// original lease clock. No command or timestamp is regenerated during checking.
+func assertNativeProjection(t *testing.T, target *firewall.Target, desired []policy.TimedPrefix, updatedAfter time.Time, snapshot *nativePhaseSnapshot) {
 	t.Helper()
 	started := time.Now()
-	var data []byte
-	if target.Backend() == "nftables" {
-		data = command(t, 3*time.Minute, "nft", "-j", "list", "table", "inet", target.Table)
-	} else {
-		data = command(t, 3*time.Minute, "ipset", "save")
+	if err := checkSnapshotProjection(target, desired, snapshot, updatedAfter); err != nil {
+		t.Fatalf("native projection inspection: %v", err)
 	}
-	finished := time.Now()
-	if err := checkNativeProjection(target, desired, data, started, finished, updatedAfter); err != nil {
-		t.Fatalf("native projection inspection (%s, %d bytes): %v", finished.Sub(started), len(data), err)
-	}
+	recordE2EPhase(t, e2ePhaseRecord{Backend: target.Backend(), Profile: "native", Phase: snapshot.phase, Event: "comparison", Outcome: "success", ProjectedMemberships: len(desired), DurationNS: time.Since(started).Nanoseconds()})
 }
 
 type nativeProjectionInterval struct {
@@ -292,6 +282,19 @@ func nativeProjectionNames(target *firewall.Target) map[string]bool {
 }
 
 func checkNativeProjection(target *firewall.Target, desired []policy.TimedPrefix, data []byte, started, finished, updatedAfter time.Time) error {
+	snapshot, err := decodeNativePhase(target.Backend(), data, started, finished)
+	if err != nil {
+		return err
+	}
+	defer snapshot.release()
+	return checkSnapshotProjection(target, desired, snapshot, updatedAfter)
+}
+
+func checkSnapshotProjection(target *firewall.Target, desired []policy.TimedPrefix, snapshot *nativePhaseSnapshot, updatedAfter time.Time) error {
+	if snapshot == nil || snapshot.released || snapshot.backend != target.Backend() {
+		return fmt.Errorf("native phase snapshot is unavailable")
+	}
+	started, finished := snapshot.started, snapshot.finished
 	if finished.Before(started) || finished.Sub(started) > 3*time.Minute {
 		return fmt.Errorf("invalid or unbounded native inspection window")
 	}
@@ -335,92 +338,16 @@ func checkNativeProjection(target *firewall.Target, desired []policy.TimedPrefix
 		delete(remaining, member)
 		return nil
 	}
-	if target.Backend() == "nftables" {
-		var response struct {
-			NFTables []struct {
-				Set *struct {
-					Name     string            `json:"name"`
-					Flags    []string          `json:"flags"`
-					Elements []json.RawMessage `json:"elem"`
-				} `json:"set"`
-			} `json:"nftables"`
+	for name, set := range snapshot.sets {
+		if !set.Timed {
+			continue
 		}
-		if err := json.Unmarshal(data, &response); err != nil {
-			return err
+		if _, known := names[name]; !known || seenSets[name] {
+			return fmt.Errorf("unexpected or duplicate native timed set %q", name)
 		}
-		for _, row := range response.NFTables {
-			if row.Set == nil {
-				continue
-			}
-			set := row.Set
-			timed := false
-			for _, flag := range set.Flags {
-				timed = timed || flag == "timeout"
-			}
-			if !timed {
-				continue
-			}
-			if _, known := names[set.Name]; !known || seenSets[set.Name] {
-				return fmt.Errorf("unexpected or duplicate timed nft set %q", set.Name)
-			}
-			seenSets[set.Name] = true
-			for _, raw := range set.Elements {
-				var item struct {
-					Element struct {
-						Value   json.RawMessage `json:"val"`
-						Timeout int64           `json:"timeout"`
-						Expires int64           `json:"expires"`
-					} `json:"elem"`
-				}
-				if err := json.Unmarshal(raw, &item); err != nil {
-					return err
-				}
-				if item.Element.Timeout <= 0 || item.Element.Timeout > 86400 || item.Element.Expires > item.Element.Timeout {
-					return fmt.Errorf("invalid nft timeout/expiry: %s", raw)
-				}
-				member, err := nativeProjectionNFTMember(item.Element.Value)
-				if err != nil {
-					return err
-				}
-				if err := observe(set.Name, member, item.Element.Expires); err != nil {
-					return err
-				}
-			}
-		}
-	} else {
-		for line := range strings.SplitSeq(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 3 {
-				continue
-			}
-			if fields[0] == "create" {
-				timed := false
-				for _, field := range fields[3:] {
-					timed = timed || field == "timeout"
-				}
-				if !timed {
-					continue
-				}
-				if _, known := names[fields[1]]; !known || seenSets[fields[1]] {
-					return fmt.Errorf("unexpected or duplicate timed ipset %q", fields[1])
-				}
-				seenSets[fields[1]] = true
-			}
-			if fields[0] != "add" || !seenSets[fields[1]] {
-				continue
-			}
-			if len(fields) != 5 || fields[3] != "timeout" {
-				return fmt.Errorf("malformed timed ipset member: %s", line)
-			}
-			seconds, err := strconv.ParseInt(fields[4], 10, 64)
-			if err != nil {
-				return err
-			}
-			member, err := nativeProjectionMember(fields[2])
-			if err != nil {
-				return err
-			}
-			if err := observe(fields[1], member, seconds); err != nil {
+		seenSets[name] = true
+		for _, member := range set.Members {
+			if err := observe(name, member.interval, member.remaining); err != nil {
 				return err
 			}
 		}
@@ -439,20 +366,20 @@ func TestNativeProjectionValidation(t *testing.T) {
 	finished := started.Add(1500 * time.Millisecond)
 	oldDeadline := started.Add(12 * time.Hour)
 	newDeadline := oldDeadline.Add(time.Hour)
-	// Match the reported false positive exactly: deleting the two peers
-	// leaves 149998 old members, but does not install 1000 replacements.
-	const count = 149998
-	old := make([]policy.TimedPrefix, count)
-	for index := range old {
-		address := netip.AddrFrom4([4]byte{11, byte(index >> 16), byte(index >> 8), byte(index)})
-		old[index] = policy.TimedPrefix{Prefix: netip.PrefixFrom(address, 32), Deadline: oldDeadline}
+	// Both families retain renewed members while replacing other members at
+	// equal cardinality. Dataset size cannot distinguish these failures; the
+	// full-size native gates separately exercise complete inventory comparison.
+	old := []policy.TimedPrefix{
+		{Prefix: netip.MustParsePrefix("192.0.2.1/32"), Deadline: oldDeadline},
+		{Prefix: netip.MustParsePrefix("192.0.2.2/32"), Deadline: oldDeadline},
+		{Prefix: netip.MustParsePrefix("2001:db8::1/128"), Deadline: oldDeadline},
+		{Prefix: netip.MustParsePrefix("2001:db8::2/128"), Deadline: oldDeadline},
 	}
-	desired := append([]policy.TimedPrefix(nil), old...)
-	for index := range desired {
-		desired[index].Deadline = newDeadline
-		if index < 1000 {
-			desired[index].Prefix = netip.PrefixFrom(netip.AddrFrom4([4]byte{12, 0, byte(index >> 8), byte(index)}), 32)
-		}
+	desired := []policy.TimedPrefix{
+		{Prefix: old[0].Prefix, Deadline: newDeadline},
+		{Prefix: netip.MustParsePrefix("192.0.2.3/32"), Deadline: newDeadline},
+		{Prefix: old[2].Prefix, Deadline: newDeadline},
+		{Prefix: netip.MustParsePrefix("2001:db8::3/128"), Deadline: newDeadline},
 	}
 	for _, backend := range []string{"nftables", "iptables"} {
 		t.Run(backend, func(t *testing.T) {
@@ -460,25 +387,28 @@ func TestNativeProjectionValidation(t *testing.T) {
 			for _, scenario := range []struct {
 				name   string
 				actual []policy.TimedPrefix
-				want   string
+				stale  bool
+				reject bool
 			}{
 				{name: "exact-renewed-projection", actual: desired},
-				{name: "same-count-deleted-peers-without-replacements", actual: old, want: "unexpected or duplicate native member"},
-				{name: "correct-membership-stale-leases", actual: desired, want: "deadline mismatch"},
+				{name: "same-count-wrong-membership", actual: old, reject: true},
+				{name: "same-count-wrong-ipv4-membership", actual: []policy.TimedPrefix{old[0], old[1], desired[2], desired[3]}, reject: true},
+				{name: "same-count-wrong-ipv6-membership", actual: []policy.TimedPrefix{desired[0], desired[1], old[2], old[3]}, reject: true},
+				{name: "correct-membership-stale-leases", actual: desired, stale: true, reject: true},
 			} {
 				t.Run(scenario.name, func(t *testing.T) {
 					seconds := int64(13*60*60 - 1)
-					if scenario.want == "deadline mismatch" {
+					if scenario.stale {
 						seconds = 12*60*60 - 1
 					}
 					data := nativeProjectionFixture(target, scenario.actual, seconds)
 					err := checkNativeProjection(target, desired, data, started, finished, started)
-					if scenario.want == "" {
+					if !scenario.reject {
 						if err != nil {
 							t.Fatal(err)
 						}
-					} else if err == nil || !strings.Contains(err.Error(), scenario.want) {
-						t.Fatalf("wanted %q rejection, got %v", scenario.want, err)
+					} else if err == nil {
+						t.Fatal("invalid native projection accepted")
 					}
 				})
 			}

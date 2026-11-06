@@ -417,7 +417,7 @@ func sharedPolicyPackets(t *testing.T, peer *peerNamespace, egress4, egress6 str
 func TestE2ESharedPolicyLifecycle(t *testing.T) {
 	if os.Getenv(e2eChildEnv) != "1" {
 		for _, backend := range []string{"nftables", "nft", "legacy"} {
-			t.Run(backend, func(t *testing.T) { t.Logf("%s", runIsolated(t, "TestE2ESharedPolicyLifecycle", backend)) })
+			t.Run(backend, func(t *testing.T) { runIsolated(t, "TestE2ESharedPolicyLifecycle", backend) })
 		}
 		return
 	}

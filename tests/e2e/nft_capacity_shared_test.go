@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -26,7 +25,7 @@ import (
 // The recorded target supplies historical rule/object identity. Only the three
 // explicitly known geo fields are expanded from deterministic source data; this
 // is not an alternate compiler for obsolete representations.
-func capacityStageHistorical(t *testing.T, configPath, sourceURL string, peer *peerNamespace) *state.Revision {
+func capacityStageHistorical(t *testing.T, configPath, sourceURL string, peer *peerNamespace) (*state.Revision, *nativePhaseSnapshot) {
 	t.Helper()
 	data, err := os.ReadFile(configPath) // #nosec G304 -- fixed private namespace policy fixture.
 	if err != nil {
@@ -146,11 +145,18 @@ func capacityStageHistorical(t *testing.T, configPath, sourceURL string, peer *p
 	if view.Journal == nil || view.Journal.Previous != revision.ID || view.Journal.Candidate == revision.ID {
 		t.Fatalf("missing interrupted native old/new transition: %+v", view.Journal)
 	}
-	capacityNativeReferences(t, target, true)
-	capacityNativeReferences(t, view.Revisions[view.Journal.Candidate].Target, false)
+	observed := captureNativePhase(t, target, "recorded-unshared-recovery", false)
+	for _, reference := range []struct {
+		target   *firewall.Target
+		separate bool
+	}{{target, true}, {view.Revisions[view.Journal.Candidate].Target, false}} {
+		if _, err := snapshotNativeReferences(observed, reference.target, reference.separate); err != nil {
+			t.Fatal(err)
+		}
+	}
 	capacityPackets(t, peer, true, true, true)
 	t.Logf("recorded historical recovery memberships=%d; prepared old=%s new=%s", total, target.Generation, view.Revisions[view.Journal.Candidate].Target.Generation)
-	return revision
+	return revision, observed
 }
 
 func capacityReadyStatus(t *testing.T) control.StatusResult {
@@ -163,7 +169,7 @@ func capacityReadyStatus(t *testing.T) control.StatusResult {
 	return status
 }
 
-func capacityAssertStatusAndNative(t *testing.T, revision *state.Revision, split bool) {
+func capacityAssertStatusAndNative(t *testing.T, revision *state.Revision, split bool, snapshot *nativePhaseSnapshot) {
 	t.Helper()
 	status := capacityReadyStatus(t)
 	total, counts := capacityfixture.Memberships(revision.Target.Families)
@@ -225,8 +231,8 @@ func capacityAssertStatusAndNative(t *testing.T, revision *state.Revision, split
 	for _, family := range revision.Target.Families {
 		expectedSets += len(family.Sets)
 	}
-	if actual := capacityNativeReferences(t, revision.Target, split); actual != expectedSets {
-		t.Fatalf("native retained orphan sets: actual=%d active=%d", actual, expectedSets)
+	if actual, err := snapshotNativeReferences(snapshot, revision.Target, split); err != nil || actual != expectedSets {
+		t.Fatalf("native retained orphan sets/references: active=%d (%v)", expectedSets, err)
 	}
 }
 
@@ -234,65 +240,16 @@ func capacityAssertStatusAndNative(t *testing.T, revision *state.Revision, split
 // generation paths, rather than assuming a geo ID suffix names its consumer.
 func capacityNativeReferences(t *testing.T, target *firewall.Target, separate bool) int {
 	t.Helper()
-	output := command(t, 3*time.Minute, "nft", "-j", "list", "table", "inet", target.Table)
-	var envelope struct {
-		Nftables []map[string]json.RawMessage `json:"nftables"`
-	}
-	if err := json.Unmarshal(output, &envelope); err != nil {
+	snapshot := captureNativePhase(t, target, "native-references", false)
+	defer snapshot.release()
+	count, err := snapshotNativeReferences(snapshot, target, separate)
+	if err != nil {
 		t.Fatal(err)
 	}
-	sets := map[string]bool{}
-	rules := map[string][]byte{}
-	for _, object := range envelope.Nftables {
-		if data := object["set"]; data != nil {
-			var set struct {
-				Name string            `json:"name"`
-				Elem []json.RawMessage `json:"elem"`
-			}
-			if err := json.Unmarshal(data, &set); err != nil {
-				t.Fatal(err)
-			}
-			sets[set.Name] = true
-		}
-		if data := object["rule"]; data != nil {
-			var rule struct {
-				Chain string `json:"chain"`
-			}
-			if err := json.Unmarshal(data, &rule); err != nil {
-				t.Fatal(err)
-			}
-			rules[rule.Chain] = append(rules[rule.Chain], data...)
-		}
-	}
-	for _, family := range []string{"v4", "v6"} {
-		var ingress, egress string
-		for chain, data := range rules {
-			if !strings.Contains(chain, target.Generation) || !strings.Contains(chain, "path_"+family+"_") {
-				continue
-			}
-			for name := range sets {
-				if !strings.Contains(name, target.Generation) || !strings.Contains(name, "geo_") || strings.Contains(name, "ssh") || strings.Contains(name, "eligible") {
-					continue
-				}
-				if strings.Contains(string(data), "@"+name+"\"") {
-					if strings.HasSuffix(chain, "_ingress") {
-						ingress = name
-					}
-					if strings.HasSuffix(chain, "_egress") {
-						egress = name
-					}
-				}
-			}
-		}
-		if ingress == "" || egress == "" || ((ingress != egress) != separate) {
-			t.Fatalf("native %s refs ingress=%s egress=%s separate=%t", family, ingress, egress, separate)
-		}
-		t.Logf("native family=%s ingress-ref=%s egress-ref=%s separate=%t", family, ingress, egress, separate)
-	}
-	return len(sets)
+	return count
 }
 
-func capacityAssertSplit(t *testing.T, revision *state.Revision) {
+func capacityAssertSplit(t *testing.T, revision *state.Revision) *nativePhaseSnapshot {
 	t.Helper()
 	total, counts := capacityfixture.Memberships(revision.Target.Families)
 	want := 2*capacityfixture.GeoMemberships + capacityfixture.UnrelatedMemberships + 4 - 2
@@ -310,5 +267,7 @@ func capacityAssertSplit(t *testing.T, revision *state.Revision) {
 			t.Fatalf("only egress may change on split: %v", counts)
 		}
 	}
-	capacityAssertStatusAndNative(t, revision, true)
+	snapshot := captureNativePhase(t, revision.Target, "split-egress-only", false)
+	capacityAssertStatusAndNative(t, revision, true, snapshot)
+	return snapshot
 }
