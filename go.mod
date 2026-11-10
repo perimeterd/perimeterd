@@ -6,8 +6,8 @@ require (
 	github.com/crowdsecurity/crowdsec v1.8.2
 	github.com/crowdsecurity/go-cs-bouncer v0.0.21
 	github.com/go-openapi/runtime v0.33.4
-	github.com/openziti/identity v1.0.144
-	github.com/openziti/sdk-golang v1.8.2
+	github.com/openziti/identity v1.0.145
+	github.com/openziti/sdk-golang v1.9.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/sirupsen/logrus v1.10.2
 	go.yaml.in/yaml/v4 v4.0.0
@@ -204,8 +204,9 @@ require (
 	github.com/nunnatsa/ginkgolinter v0.24.0 // indirect
 	github.com/oklog/ulid/v2 v2.1.2 // indirect
 	github.com/openziti/channel/v4 v4.3.13 // indirect
+	github.com/openziti/channel/v5 v5.0.10 // indirect
 	github.com/openziti/edge-api v0.36.1 // indirect
-	github.com/openziti/foundation/v2 v2.0.105 // indirect
+	github.com/openziti/foundation/v2 v2.0.106 // indirect
 	github.com/openziti/metrics v1.4.5 // indirect
 	github.com/openziti/secretstream v0.1.53 // indirect
 	github.com/openziti/transport/v2 v2.0.225 // indirect
